@@ -11,6 +11,7 @@ def list_matches(
     team: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    has_score: Optional[str] = None,  # "true" = results only, "false" = fixtures only
     limit: int = 50,
     offset: int = 0
 ):
@@ -40,7 +41,14 @@ def list_matches(
         query += " AND m.match_date >= %s"; params.append(date_from)
     if date_to:
         query += " AND m.match_date <= %s"; params.append(date_to)
-    query += " ORDER BY m.match_date DESC LIMIT %s OFFSET %s"
+    if has_score == "true":
+        query += " AND m.home_score IS NOT NULL"
+        query += " ORDER BY m.match_date DESC LIMIT %s OFFSET %s"
+    elif has_score == "false":
+        query += " AND m.home_score IS NULL"
+        query += " ORDER BY m.match_date ASC LIMIT %s OFFSET %s"
+    else:
+        query += " ORDER BY m.match_date DESC LIMIT %s OFFSET %s"
     params += [limit, offset]
     cur.execute(query, params)
     rows = cur.fetchall()
