@@ -56,18 +56,19 @@ CORS_ORIGINS = [
     "http://localhost:4000",
     "https://localhost:5173",
     "https://football-analytics-eight.vercel.app",
+    "https://plusone-frontend-mu.vercel.app",
 ]
 
 # Regex covers:
-#   - localhost on any port over http or https  (dev)
-#   - Any *.vercel.app deployment               (Vercel previews & prod)
-#   - Any *.onrender.com service                (Render deployments)
-#   - Any *.railway.app service                 (Railway deployments)
+#   - localhost on any port over http or https           (dev)
+#   - Any *.vercel.app deployment (including previews)   (Vercel)
+#   - Any *.onrender.com service                         (Render)
+#   - Any *.railway.app service (including *.up.railway) (Railway)
 CORS_ORIGIN_REGEX = (
     r"https?://localhost(:\d+)?"
-    r"|https://[a-z0-9-]+\.vercel\.app"
+    r"|https://[a-z0-9-]+(?:\.[a-z0-9-]+)*\.vercel\.app"
     r"|https://[a-z0-9-]+\.onrender\.com"
-    r"|https://[a-z0-9-]+\.railway\.app"
+    r"|https://[a-z0-9-]+(?:\.up)?\.railway\.app"
 )
 
 app.add_middleware(
