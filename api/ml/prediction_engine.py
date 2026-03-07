@@ -1,0 +1,410 @@
+"""
+Prediction Engine for PlusOne
+==================================
+Singleton-style engine that:
+  1. Trains on ALL historical matches from the database
+  2. Predicts match outcomes with rich, detailed output
+  3. Persists trained model to disk (survives API restarts)
+  4. Auto-loads saved model on startup if present
+"""
+
+import os
+import time
+from database import get_connection
+from ml.feature_engineering import (
+    build_match_features,
+    build_training_dataset,
+    compute_h2h,
+)
+from ml.ml_models import EnsemblePredictor
+
+# ─── Singleton state ──────────────────────────────────────────────────────────
+
+_engine: EnsemblePredictor = None
+_meta = {
+    "trained_at": None,
+    "n_samples": 0,
+    "train_accuracy": None,
+    "cv_accuracy": None,
+    "errors": 0,
+    "feature_names": [],
+}
+
+OUTCOME_LABELS = {0: "Home Win", 1: "Draw", 2: "Away Win"}
+
+
+def _get_engine() -> EnsemblePredictor:
+    global _engine
+    if _engine is None:
+        loaded = EnsemblePredictor.load()
+        if loaded and loaded.is_trained:
+            _engine = loaded
+            _meta["n_samples"]      = loaded.n_samples
+            _meta["train_accuracy"] = loaded.train_accuracy
+            _meta["cv_accuracy"]    = loaded.cv_accuracy
+            _meta["feature_names"]  = loaded.feature_names_ or []
+    return _engine
+
+
+# ─── Training ─────────────────────────────────────────────────────────────────
+
+def train_model():
+    """
+    Pull all completed matches from the database, build 70+ feature vectors,
+    train the XGBoost+RandomForest ensemble, and save to disk.
+
+    This may take 30-120 seconds depending on data size.
+    Returns a status dict with: success, matches_trained, train_accuracy,
+    cv_accuracy, errors_skipped, elapsed_seconds, n_features.
+    """
+    global _engine, _meta
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        t0 = time.time()
+        X, y, match_ids, errors = build_training_dataset(cur, skip_errors=True)
+        conn.close()
+
+        if len(X) < 20:
+            return {
+                "success": False,
+                "error": f"Not enough training data. Found {len(X)} completed matches — need at least 20.",
+                "matches_found": len(X),
+            }
+
+        model = EnsemblePredictor()
+
+        conn3 = get_connection()
+        cur3  = conn3.cursor()
+        feat_names = []
+        try:
+            cur3.execute("""
+                SELECT m.id, m.home_team_id, m.away_team_id, m.league_id, m.season_id
+                FROM matches m
+                WHERE m.home_score IS NOT NULL
+                  AND m.league_id IS NOT NULL AND m.season_id IS NOT NULL
+                LIMIT 1
+            """)
+            sample = cur3.fetchone()
+            if sample:
+                _, feat_names, _, _, _ = build_match_features(
+                    cur3,
+                    sample["home_team_id"],
+                    sample["away_team_id"],
+                    sample["league_id"],
+                    sample["season_id"],
+                )
+        except Exception:
+            pass
+        finally:
+            conn3.close()
+
+        model.train(X, y, feature_names=feat_names or None)
+        model.save()
+
+        _engine = model
+        _meta.update({
+            "trained_at":    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "n_samples":     model.n_samples,
+            "train_accuracy":model.train_accuracy,
+            "cv_accuracy":   model.cv_accuracy,
+            "errors":        errors,
+            "feature_names": model.feature_names_ or [],
+        })
+
+        elapsed = round(time.time() - t0, 1)
+        return {
+            "success": True,
+            "matches_trained":  model.n_samples,
+            "train_accuracy":   round(model.train_accuracy or 0, 4),
+            "cv_accuracy":      round(model.cv_accuracy    or 0, 4),
+            "errors_skipped":   errors,
+            "elapsed_seconds":  elapsed,
+            "n_features":       len(model.feature_names_ or []),
+        }
+    except Exception:
+        conn.close()
+        raise
+
+
+# ─── Prediction ───────────────────────────────────────────────────────────────
+
+def _xg_from_feats(feats: dict) -> float:
+    xg = feats.get("xg_estimate", 0.0)
+    if xg and xg > 0:
+        return round(xg, 2)
+    return round(feats.get("goals_for_pg", feats.get("goals_per90", 1.2)), 2)
+
+
+def _key_factors(home_feats: dict, away_feats: dict,
+                 home_name: str, away_name: str) -> list:
+    factors = []
+
+    def pct_diff(h, a, label, higher_better=True):
+        if h == 0 and a == 0:
+            return
+        diff = h - a
+        if abs(diff) < 0.01:
+            return
+        better = home_name if (diff > 0) == higher_better else away_name
+        worse  = away_name if better == home_name else home_name
+        pct    = abs(round(diff / max(abs(a), abs(h), 0.001) * 100, 1))
+        factors.append(f"{better} {pct}% better {label} than {worse}")
+
+    pct_diff(home_feats.get("goals_per90",           0),
+             away_feats.get("goals_per90",           0), "goals/90")
+    pct_diff(home_feats.get("shots_on_target_per90", 0),
+             away_feats.get("shots_on_target_per90", 0), "shots on target/90")
+    pct_diff(home_feats.get("goals_per_shot",        0),
+             away_feats.get("goals_per_shot",        0), "shot conversion rate")
+
+    pct_diff(home_feats.get("gk_save_pct",        0),
+             away_feats.get("gk_save_pct",        0), "GK save%")
+    pct_diff(home_feats.get("gk_clean_sheets_pct",0),
+             away_feats.get("gk_clean_sheets_pct",0), "clean sheet rate")
+
+    hf = home_feats.get("form_score", 0.5)
+    af = away_feats.get("form_score", 0.5)
+    if abs(hf - af) > 0.1:
+        better = home_name if hf > af else away_name
+        hpts = round(hf * 15)
+        apts = round(af * 15)
+        factors.append(f"{better} better recent form: {hpts}/15 vs {apts}/15 pts (last 5)")
+
+    hp = home_feats.get("prev_rank_norm", 0.5)
+    ap = away_feats.get("prev_rank_norm", 0.5)
+    if abs(hp - ap) > 0.15:
+        better = home_name if hp > ap else away_name
+        factors.append(f"{better} finished significantly higher last season")
+
+    hga = home_feats.get("goals_against_pg", 0)
+    aga = away_feats.get("goals_against_pg", 0)
+    if aga > hga + 0.3:
+        factors.append(f"{away_name} concede {round(aga, 1)} goals/game — vulnerable defence")
+    elif hga > aga + 0.3:
+        factors.append(f"{home_name} concede {round(hga, 1)} goals/game — defensive concern")
+
+    if home_feats.get("attack_dependency") == 1.0:
+        factors.append(f"{home_name} attack heavily reliant on one player (>40% of goals)")
+    if away_feats.get("attack_dependency") == 1.0:
+        factors.append(f"{away_name} attack heavily reliant on one player (>40% of goals)")
+
+    h_blank = home_feats.get("blank_rate", 0)
+    a_blank = away_feats.get("blank_rate", 0)
+    if h_blank > 0.35: factors.append(f"{home_name} struggles to score (blanked in {int(h_blank*100)}% of games)")
+    if a_blank > 0.35: factors.append(f"{away_name} struggles to score (blanked in {int(a_blank*100)}% of games)")
+
+    h_blowout = home_feats.get("blowout_rate", 0)
+    a_blowout = away_feats.get("blowout_rate", 0)
+    if h_blowout > 0.25: factors.append(f"{home_name} has high explosive potential (3+ goals in {int(h_blowout*100)}% of games)")
+    if a_blowout > 0.25: factors.append(f"{away_name} has high explosive potential (3+ goals in {int(a_blowout*100)}% of games)")
+
+    h_collapse = home_feats.get("defensive_collapse_rate", 0)
+    a_collapse = away_feats.get("defensive_collapse_rate", 0)
+    if h_collapse > 0.25: factors.append(f"{home_name} prone to defensive collapse (conceded 3+ in {int(h_collapse*100)}% of games)")
+    if a_collapse > 0.25: factors.append(f"{away_name} prone to defensive collapse (conceded 3+ in {int(a_collapse*100)}% of games)")
+
+    pct_diff(home_feats.get("squad_depth_scorers", 0),
+             away_feats.get("squad_depth_scorers", 0), "squad scoring depth")
+
+    hp_pos = home_feats.get("possession", 50)
+    ap_pos = away_feats.get("possession", 50)
+    if abs(hp_pos - ap_pos) > 5:
+        dom = home_name if hp_pos > ap_pos else away_name
+        factors.append(f"{dom} dominates possession ({round(max(hp_pos,ap_pos),1)}% avg)")
+
+    return factors[:6]
+
+
+def predict_match(home_team_id: int, away_team_id: int,
+                  league_id: int, season_id: int) -> dict:
+    """
+    Full rich prediction for one match. Returns comprehensive output dict with:
+    - probabilities (home_win, draw, away_win)
+    - predicted_outcome + confidence + confidence_score
+    - expected_goals (home_xg, away_xg, predicted_score)
+    - key_factors (human-readable list of deciding factors)
+    - team_comparison (attack, defence, form, possession, etc.)
+    - h2h head-to-head history
+    - top_features from XGBoost feature importances
+    - model_info (n_trained_on, cv_accuracy, trained_at)
+    """
+    engine = _get_engine()
+    if engine is None or not engine.is_trained:
+        return {"error": "Model not trained. POST /api/predictions/train first."}
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)",
+                    (home_team_id, away_team_id))
+        name_map = {r["id"]: r["name"] for r in cur.fetchall()}
+        home_name = name_map.get(home_team_id, f"Team {home_team_id}")
+        away_name = name_map.get(away_team_id, f"Team {away_team_id}")
+
+        cur.execute("SELECT name FROM leagues WHERE id = %s", (league_id,))
+        lg_row = cur.fetchone()
+        league_name = lg_row["name"] if lg_row else ""
+
+        cur.execute("SELECT name FROM seasons WHERE id = %s", (season_id,))
+        ss_row = cur.fetchone()
+        season_name = ss_row["name"] if ss_row else ""
+
+        fv, feat_names, home_feats, away_feats, h2h = build_match_features(
+            cur, home_team_id, away_team_id, league_id, season_id
+        )
+
+        proba = engine.predict_proba(fv)
+        top_feats = engine.get_top_features(fv, n=6)
+
+        home_xg = _xg_from_feats(home_feats)
+        away_xg = _xg_from_feats(away_feats)
+
+        factors = _key_factors(home_feats, away_feats, home_name, away_name)
+
+        def cmp(feats, venue_key):
+            return {
+                "attack":    round(feats.get("attack_strength",   1.0), 3),
+                "defence":   round(feats.get("defence_strength",  1.0), 3),
+                "form":      round(feats.get(f"{venue_key}_form_score",
+                                             feats.get("form_score", 0.5)), 3),
+                "possession":round(feats.get("possession", 50.0), 1),
+                "goals_pg":  round(feats.get("goals_for_pg", 0.0), 2),
+                "concede_pg":round(feats.get("goals_against_pg", 0.0), 2),
+                "gk_save_pct":round(feats.get("gk_save_pct", 0.0), 1),
+                "shots_ot_pg":round(feats.get("shots_on_target_per90", 0.0), 2),
+                "top_scorer_goals": int(feats.get("top_scorer_goals", 0)),
+                "prev_rank_norm":   round(feats.get("prev_rank_norm", 0.5), 3),
+                "prev_form":        round(feats.get("prev_form_score", 0.5), 3),
+                "blank_rate":       round(feats.get("blank_rate", 0.0), 3),
+                "clean_sheet_rate": round(feats.get("clean_sheet_rate", 0.0), 3),
+            }
+
+        return {
+            "match": {
+                "home_team":  home_name,
+                "away_team":  away_name,
+                "league":     league_name,
+                "season":     season_name,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+            },
+            "probabilities": {
+                "home_win": proba["home_win"],
+                "draw":     proba["draw"],
+                "away_win": proba["away_win"],
+            },
+            "predicted_outcome":  proba["predicted_outcome"],
+            "confidence":         proba["confidence"],
+            "confidence_score":   proba["confidence_score"],
+            "expected_goals": {
+                "home_xg": home_xg,
+                "away_xg": away_xg,
+                "predicted_score": f"{round(home_xg)}-{round(away_xg)}",
+            },
+            "key_factors":    factors,
+            "team_comparison": {
+                "home": cmp(home_feats, "home"),
+                "away": cmp(away_feats, "away"),
+            },
+            "h2h": {
+                "home_wins":  h2h["h2h_home_wins"],
+                "draws":      h2h["h2h_draws"],
+                "away_wins":  h2h["h2h_away_wins"],
+                "home_win_pct": round(h2h["h2h_home_win_pct"], 3),
+                "away_win_pct": round(h2h["h2h_away_win_pct"], 3),
+                "last_5":     h2h["h2h_last_5"],
+            },
+            "top_features": top_feats,
+            "model_info": {
+                "n_trained_on":   _meta.get("n_samples", 0),
+                "cv_accuracy":    _meta.get("cv_accuracy"),
+                "trained_at":     _meta.get("trained_at"),
+            },
+        }
+    finally:
+        conn.close()
+
+
+# ─── Upcoming fixtures ────────────────────────────────────────────────────────
+
+def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
+    """
+    Predict all upcoming (unplayed) fixtures, optionally filtered by league.
+    Returns list of rich prediction dicts, each containing all fields from
+    predict_match() plus fixture_id, match_date, and gameweek.
+    Returns empty list if model is not trained.
+    """
+    engine = _get_engine()
+    if engine is None or not engine.is_trained:
+        return []
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        query = """
+            SELECT m.id, m.home_team_id, m.away_team_id,
+                   m.league_id, m.season_id, m.match_date, m.gameweek
+            FROM matches m
+            WHERE m.home_score IS NULL
+              AND m.match_date >= CURRENT_DATE
+        """
+        params = []
+        if league_id:
+            query += " AND m.league_id = %s"
+            params.append(league_id)
+        query += " ORDER BY m.match_date ASC LIMIT %s"
+        params.append(limit)
+
+        cur.execute(query, params)
+        fixtures = cur.fetchall()
+        conn.close()
+
+        results = []
+        for fx in fixtures:
+            try:
+                pred = predict_match(
+                    fx["home_team_id"],
+                    fx["away_team_id"],
+                    fx["league_id"],
+                    fx["season_id"],
+                )
+                pred["fixture_id"]   = fx["id"]
+                pred["match_date"]   = str(fx["match_date"]) if fx["match_date"] else None
+                pred["gameweek"]     = fx["gameweek"]
+                results.append(pred)
+            except Exception:
+                continue
+        return results
+    except Exception:
+        conn.close()
+        return []
+
+
+# ─── Status ───────────────────────────────────────────────────────────────────
+
+def get_status() -> dict:
+    """
+    Return current model status dict:
+    - model_trained (bool)
+    - trained_at (ISO timestamp or None)
+    - n_samples (int: number of matches trained on)
+    - train_accuracy (float or None)
+    - cv_accuracy (float or None)
+    - n_features (int)
+    - feature_names (first 20, for inspection)
+    """
+    engine = _get_engine()
+    return {
+        "model_trained":   engine is not None and engine.is_trained,
+        "trained_at":      _meta.get("trained_at"),
+        "n_samples":       _meta.get("n_samples", 0),
+        "train_accuracy":  _meta.get("train_accuracy"),
+        "cv_accuracy":     _meta.get("cv_accuracy"),
+        "n_features":      len(_meta.get("feature_names", [])),
+        "feature_names":   _meta.get("feature_names", [])[:20],
+    }
+
+
+# Auto-load on import
+_get_engine()

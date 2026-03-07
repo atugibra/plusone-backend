@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
 
@@ -9,6 +11,25 @@ from routes import leagues, teams, matches, standings, squad_stats, player_stats
 
 load_dotenv()
 
+
+# ─── HTTPS redirect middleware ─────────────────────────────────────────────────
+# Railway/Render terminates TLS at its edge proxy and forwards plain HTTP to the
+# app container. The original scheme is in X-Forwarded-Proto.
+# We redirect any non-HTTPS request to HTTPS so browsers never hit mixed-content.
+# Localhost is excluded so local development still works on http://.
+
+class HTTPSRedirectMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        proto = request.headers.get("x-forwarded-proto", "")
+        host  = request.headers.get("host", "")
+        is_local = host.startswith("localhost") or host.startswith("127.0.0.1")
+        if proto == "http" and not is_local:
+            https_url = str(request.url).replace("http://", "https://", 1)
+            return RedirectResponse(url=https_url, status_code=301)
+        return await call_next(request)
+
+
+# ─── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Football Analytics API",
@@ -20,21 +41,44 @@ app = FastAPI(
     redirect_slashes=False,
 )
 
+# Apply HTTPS redirect before CORS so redirects carry the right headers
+app.add_middleware(HTTPSRedirectMiddleware)
 
-# Allow requests from React dashboard and Chrome extension
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+# IMPORTANT: FastAPI's CORSMiddleware does NOT support glob/wildcard patterns
+# like "https://*.vercel.app" in allow_origins — it does exact string matching.
+# Use allow_origin_regex for real subdomain matching.
+
+CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:4000",
+    "https://localhost:5173",
+    "https://football-analytics-eight.vercel.app",
+]
+
+# Regex covers:
+#   - localhost on any port over http or https  (dev)
+#   - Any *.vercel.app deployment               (Vercel previews & prod)
+#   - Any *.onrender.com service                (Render deployments)
+#   - Any *.railway.app service                 (Railway deployments)
+CORS_ORIGIN_REGEX = (
+    r"https?://localhost(:\d+)?"
+    r"|https://[a-z0-9-]+\.vercel\.app"
+    r"|https://[a-z0-9-]+\.onrender\.com"
+    r"|https://[a-z0-9-]+\.railway\.app"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://localhost:4000",
-        "https://football-analytics-eight.vercel.app",
-        "https://*.vercel.app",
-        "*",
-    ],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["Content-Length"],
+    max_age=600,   # cache preflight for 10 min
 )
 
 

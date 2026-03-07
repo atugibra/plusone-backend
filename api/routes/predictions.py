@@ -1,20 +1,273 @@
 """
-Predictions API - Rule-based match outcome predictor.
-Returns pre-match squad stats (BEFORE panel) + actual match result from DB (AFTER panel).
+Predictions API Route
+======================
+Endpoints:
+  GET  /api/predictions/status      → model status + accuracy
+  POST /api/predictions/train       → train/retrain from all DB history
+  POST /api/predictions/predict     → rich prediction for one matchup (by team IDs)
+  GET  /api/predictions/upcoming    → predict all upcoming fixtures
+  GET  /api/predictions/fixtures    → list upcoming fixtures to pick from
+  POST /api/predictions/generate    → legacy rule-based prediction (by team names)
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
+import ml.prediction_engine as engine
 
 router = APIRouter()
 
 
-class PredictionRequest(BaseModel):
+# ─── Request models ───────────────────────────────────────────────────────────
+
+class TrainRequest(BaseModel):
+    league_id:  Optional[int] = None
+    season_id:  Optional[int] = None
+
+
+class PredictRequest(BaseModel):
+    home_team_id: int
+    away_team_id: int
+    league_id:    int
+    season_id:    int
+
+
+class GenerateRequest(BaseModel):
+    """Legacy rule-based prediction by team name."""
     home_team: str
     away_team: str
     league: Optional[str] = None
+
+
+# ─── ML Routes ────────────────────────────────────────────────────────────────
+
+@router.get("/status")
+def prediction_status():
+    """Return current model status: trained, accuracy, n_samples, n_features."""
+    return engine.get_status()
+
+
+@router.post("/train")
+def train(req: TrainRequest = None):
+    """
+    Train (or retrain) the prediction model on all completed matches in the DB.
+    May take 30-120 seconds depending on data size.
+    """
+    try:
+        result = engine.train_model()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/predict")
+def predict(req: PredictRequest):
+    """
+    Predict the outcome of a specific match by team IDs.
+    Returns rich output: probabilities, xG, key factors, H2H, team comparison.
+    """
+    if req.home_team_id == req.away_team_id:
+        raise HTTPException(status_code=400, detail="Home and away teams must be different.")
+    try:
+        result = engine.predict_match(
+            req.home_team_id,
+            req.away_team_id,
+            req.league_id,
+            req.season_id,
+        )
+        if "error" in result:
+            raise HTTPException(status_code=503, detail=result["error"])
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/upcoming")
+def upcoming_predictions(
+    league_id: Optional[int] = Query(None, description="Filter by league ID"),
+    limit:     int           = Query(50,   description="Max fixtures to predict"),
+):
+    """Predict all upcoming unplayed fixtures, ordered by match date ascending."""
+    try:
+        results = engine.predict_upcoming(league_id=league_id, limit=limit)
+        return {
+            "count":       len(results),
+            "predictions": results,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/fixtures")
+def list_upcoming_fixtures(
+    league_id:  Optional[int] = Query(None),
+    season_id:  Optional[int] = Query(None),
+    limit:      int           = Query(100),
+):
+    """
+    List upcoming unplayed fixtures with team names and IDs.
+    Use this to discover team IDs before calling /predict.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        query = """
+            SELECT m.id, m.match_date, m.gameweek, m.start_time,
+                   ht.id AS home_team_id, ht.name AS home_team,
+                   at.id AS away_team_id, at.name AS away_team,
+                   l.id  AS league_id,   l.name  AS league,
+                   s.id  AS season_id,   s.name  AS season
+            FROM matches m
+            JOIN teams   ht ON ht.id = m.home_team_id
+            JOIN teams   at ON at.id = m.away_team_id
+            JOIN leagues l  ON l.id  = m.league_id
+            JOIN seasons s  ON s.id  = m.season_id
+            WHERE m.home_score IS NULL
+              AND m.match_date >= CURRENT_DATE
+        """
+        params = []
+        if league_id:
+            query += " AND m.league_id = %s"; params.append(league_id)
+        if season_id:
+            query += " AND m.season_id = %s"; params.append(season_id)
+        query += " ORDER BY m.match_date ASC LIMIT %s"
+        params.append(limit)
+
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return {
+            "count":    len(rows),
+            "fixtures": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ─── Historical Results Endpoint ─────────────────────────────────────────────
+
+@router.get("/results")
+def list_prediction_results(
+    league_id:  Optional[int] = Query(None, description="Filter by league ID"),
+    season_id:  Optional[int] = Query(None, description="Filter by season ID"),
+    limit:      int           = Query(30,   description="Number of recent results"),
+):
+    """
+    Return recent completed matches from the DB with real scores.
+    Used by the frontend 'Predictions' page to show past match results.
+    Each row has home/away team, final score, league, match date, and gameweek.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        query = """
+            SELECT m.id, m.match_date, m.gameweek, m.score_raw,
+                   m.home_score, m.away_score,
+                   ht.name AS home_team, at.name AS away_team,
+                   l.name  AS league,    l.id    AS league_id,
+                   s.name  AS season,    s.id    AS season_id
+            FROM matches m
+            JOIN teams   ht ON ht.id = m.home_team_id
+            JOIN teams   at ON at.id = m.away_team_id
+            JOIN leagues l  ON l.id  = m.league_id
+            JOIN seasons s  ON s.id  = m.season_id
+            WHERE m.home_score IS NOT NULL
+        """
+        params = []
+        if league_id:
+            query += " AND m.league_id = %s"; params.append(league_id)
+        if season_id:
+            query += " AND m.season_id = %s"; params.append(season_id)
+        query += " ORDER BY m.match_date DESC LIMIT %s"
+        params.append(limit)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        return {"count": len(rows), "results": [dict(r) for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@router.get("/accuracy")
+def prediction_accuracy_trend(
+    league_id:  Optional[int] = Query(None),
+    season_id:  Optional[int] = Query(None),
+    weeks:      int           = Query(9, description="Number of recent gameweeks"),
+):
+    """
+    Compute accuracy trend grouped by gameweek from real match data.
+    Uses the legacy rule-based engine to score past predictions vs actual results.
+    Returns list of {week, predictions, correct, accuracy} dicts for chart display.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        query = """
+            SELECT m.gameweek,
+                   COUNT(*)                              AS total,
+                   COUNT(CASE
+                     WHEN (m.home_score > m.away_score
+                           AND ls_h.wins::float / NULLIF(ls_h.games,0) >
+                               ls_a.wins::float / NULLIF(ls_a.games,0))
+                       OR (m.away_score > m.home_score
+                           AND ls_a.wins::float / NULLIF(ls_a.games,0) >
+                               ls_h.wins::float / NULLIF(ls_h.games,0))
+                       OR (m.home_score = m.away_score
+                           AND ABS(ls_h.wins::float/NULLIF(ls_h.games,0)
+                                 - ls_a.wins::float/NULLIF(ls_a.games,0)) < 0.05)
+                     THEN 1 END)                        AS correct
+            FROM matches m
+            LEFT JOIN league_standings ls_h
+                   ON ls_h.team_id = m.home_team_id
+                  AND ls_h.league_id = m.league_id
+                  AND ls_h.season_id = m.season_id
+            LEFT JOIN league_standings ls_a
+                   ON ls_a.team_id = m.away_team_id
+                  AND ls_a.league_id = m.league_id
+                  AND ls_a.season_id = m.season_id
+            WHERE m.home_score IS NOT NULL
+              AND m.gameweek IS NOT NULL
+        """
+        params = []
+        if league_id:
+            query += " AND m.league_id = %s"; params.append(league_id)
+        if season_id:
+            query += " AND m.season_id = %s"; params.append(season_id)
+        query += """
+            GROUP BY m.gameweek
+            ORDER BY m.gameweek DESC
+            LIMIT %s
+        """
+        params.append(weeks)
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        trend = []
+        for r in reversed(rows):
+            total   = int(r["total"] or 0)
+            correct = int(r["correct"] or 0)
+            trend.append({
+                "week":        f"GW{r['gameweek']}",
+                "predictions": total,
+                "correct":     correct,
+                "accuracy":    round(correct / total * 100) if total else 0,
+            })
+        return trend
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ─── Legacy Rule-based Route (kept for backward compatibility) ─────────────────
+
+def _safe_div(a, b, default=0.0):
+    try: return float(a) / float(b) if b else default
+    except: return default
 
 
 def _get_team_stats(cur, team_name: str):
@@ -56,11 +309,6 @@ def _get_actual_result(cur, home_team: str, away_team: str):
     return cur.fetchone()
 
 
-def _safe_div(a, b, default=0.0):
-    try: return float(a) / float(b) if b else default
-    except: return default
-
-
 def _compute_probabilities(h_sq, a_sq, h_st, a_st):
     h_gpg = _safe_div(h_sq["goals"] if h_sq else 0, h_sq["games"] if h_sq else 1, 1.2)
     a_gpg = _safe_div(a_sq["goals"] if a_sq else 0, a_sq["games"] if a_sq else 1, 1.0)
@@ -99,7 +347,8 @@ def _fmt_stats(sq, st):
 
 
 @router.post("/generate")
-async def generate_prediction(req: PredictionRequest):
+async def generate_prediction(req: GenerateRequest):
+    """Legacy rule-based endpoint: accepts team names, returns prediction."""
     conn = get_connection()
     cur  = conn.cursor()
     try:
