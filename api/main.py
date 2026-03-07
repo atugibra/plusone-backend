@@ -13,11 +13,6 @@ load_dotenv()
 
 
 # ─── HTTPS redirect middleware ─────────────────────────────────────────────────
-# Railway/Render terminates TLS at its edge proxy and forwards plain HTTP to the
-# app container. The original scheme is in X-Forwarded-Proto.
-# We redirect any non-HTTPS request to HTTPS so browsers never hit mixed-content.
-# Localhost is excluded so local development still works on http://.
-
 class HTTPSRedirectMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         proto = request.headers.get("x-forwarded-proto", "")
@@ -35,9 +30,6 @@ app = FastAPI(
     title="Football Analytics API",
     description="Production API for football data scraped from FBref",
     version="1.0.0",
-    # Railway terminates SSL at its proxy and sends plain HTTP to the app.
-    # Without this, FastAPI redirects /api/leagues → http://…/api/leagues/ (trailing slash),
-    # which browsers block as Mixed Content (page is HTTPS, redirect is HTTP).
     redirect_slashes=False,
 )
 
@@ -46,29 +38,38 @@ app.add_middleware(HTTPSRedirectMiddleware)
 
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
-# IMPORTANT: FastAPI's CORSMiddleware does NOT support glob/wildcard patterns
-# like "https://*.vercel.app" in allow_origins — it does exact string matching.
-# Use allow_origin_regex for real subdomain matching.
+# Explicit origins (exact match) — add every known Vercel deployment URL here.
+# For preview deployments that change per-commit, the regex below handles them.
 
 CORS_ORIGINS = [
+    # ── Local dev ──────────────────────────────────────────────────────────
+    "http://localhost:3000",
+    "http://localhost:4000",
     "http://localhost:5173",
     "http://localhost:5174",
-    "http://localhost:4000",
+    "https://localhost:3000",
     "https://localhost:5173",
+    # ── Production / stable Vercel deployments ─────────────────────────────
     "https://football-analytics-eight.vercel.app",
     "https://plusone-frontend-mu.vercel.app",
+    # ── Current deployment (add new ones here as needed) ───────────────────
+    "https://plusone-frontend-7nnahjruz-atugibras-projects.vercel.app",
+    "https://plusone-frontend-git-main-atugibras-projects.vercel.app",
 ]
 
-# Regex covers:
-#   - localhost on any port over http or https           (dev)
-#   - Any *.vercel.app deployment (including previews)   (Vercel)
-#   - Any *.onrender.com service                         (Render)
-#   - Any *.railway.app service (including *.up.railway) (Railway)
+# Regex catches everything else:
+#   - localhost on any port (http or https)          — dev
+#   - *.vercel.app (all preview + production URLs)   — Vercel
+#   - *.onrender.com                                 — Render
+#   - *.railway.app / *.up.railway.app               — Railway
+#
+# NOTE: Starlette uses re.fullmatch() so the pattern must match the ENTIRE
+# origin string (no need for ^ / $ anchors).
 CORS_ORIGIN_REGEX = (
     r"https?://localhost(:\d+)?"
-    r"|https://[a-z0-9-]+(?:\.[a-z0-9-]+)*\.vercel\.app"
-    r"|https://[a-z0-9-]+\.onrender\.com"
-    r"|https://[a-z0-9-]+(?:\.up)?\.railway\.app"
+    r"|https://[\w-]+(\.[\w-]+)*\.vercel\.app"
+    r"|https://[\w-]+\.onrender\.com"
+    r"|https://[\w-]+(\.up)?\.railway\.app"
 )
 
 app.add_middleware(
@@ -79,11 +80,12 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Length"],
-    max_age=600,   # cache preflight for 10 min
+    max_age=600,
 )
 
 
-# Register all route modules
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
 app.include_router(health.router,       prefix="/api",             tags=["Health"])
 app.include_router(leagues.router,      prefix="/api/leagues",     tags=["Leagues"])
 app.include_router(teams.router,        prefix="/api/teams",       tags=["Teams"])
@@ -102,4 +104,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 4000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
-
