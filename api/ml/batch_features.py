@@ -145,34 +145,39 @@ class DataCache:
         self.season_name: Dict[int, str] = {r["id"]: r["name"] for r in seasons}
 
         # 6. Team venue stats (home/away splits) ──────────────────────────────
-        cur.execute("""
-            SELECT team_id, league_id, season_id, venue,
-                   games, wins, draws, losses, goals_for, goals_against
-            FROM team_venue_stats
-            WHERE games > 0
-        """)
-        # Key: (team_id, season_id, venue)
+        # Wrapped in try/except: if team_venue_stats is empty or missing, we
+        # fall back to the league-average estimates computed above (no crash).
         self.venue_stats: Dict[Tuple, dict] = {}
-        venue_by_league: Dict[Tuple, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
-        for r in cur.fetchall():
-            r = dict(r)
-            self.venue_stats[(r["team_id"], r["season_id"], r["venue"])] = r
-            venue_by_league[(r["league_id"], r["season_id"])][r["venue"]].append(r)
+        try:
+            cur.execute("""
+                SELECT team_id, league_id, season_id, venue,
+                       games, wins, draws, losses, goals_for, goals_against
+                FROM team_venue_stats
+                WHERE games > 0
+            """)
+            venue_by_league: Dict[Tuple, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
+            for r in cur.fetchall():
+                r = dict(r)
+                self.venue_stats[(r["team_id"], r["season_id"], r["venue"])] = r
+                venue_by_league[(r["league_id"], r["season_id"])][r["venue"]].append(r)
 
-        # Overwrite league venue averages with real data
-        for (lid, sid), by_venue in venue_by_league.items():
-            if (lid, sid) not in self.league_avgs:
-                continue
-            for venue, rows in by_venue.items():
-                gf_pgs = [_safe_div(_f(r.get("goals_for")), max(_f(r.get("games")), 1)) for r in rows]
-                ga_pgs = [_safe_div(_f(r.get("goals_against")), max(_f(r.get("games")), 1)) for r in rows]
-                n = len(rows) or 1
-                if venue == "home":
-                    self.league_avgs[(lid, sid)]["avg_home_gf_pg"] = sum(gf_pgs) / n
-                    self.league_avgs[(lid, sid)]["avg_home_ga_pg"] = sum(ga_pgs) / n
-                elif venue == "away":
-                    self.league_avgs[(lid, sid)]["avg_away_gf_pg"] = sum(gf_pgs) / n
-                    self.league_avgs[(lid, sid)]["avg_away_ga_pg"] = sum(ga_pgs) / n
+            # Overwrite league venue averages with real data
+            for (lid, sid), by_venue in venue_by_league.items():
+                if (lid, sid) not in self.league_avgs:
+                    continue
+                for venue, rows in by_venue.items():
+                    gf_pgs = [_safe_div(_f(r.get("goals_for")), max(_f(r.get("games")), 1)) for r in rows]
+                    ga_pgs = [_safe_div(_f(r.get("goals_against")), max(_f(r.get("games")), 1)) for r in rows]
+                    n = len(rows) or 1
+                    if venue == "home":
+                        self.league_avgs[(lid, sid)]["avg_home_gf_pg"] = sum(gf_pgs) / n
+                        self.league_avgs[(lid, sid)]["avg_home_ga_pg"] = sum(ga_pgs) / n
+                    elif venue == "away":
+                        self.league_avgs[(lid, sid)]["avg_away_gf_pg"] = sum(gf_pgs) / n
+                        self.league_avgs[(lid, sid)]["avg_away_ga_pg"] = sum(ga_pgs) / n
+        except Exception as _venue_err:
+            log.warning("team_venue_stats unavailable (%s) — using league-average fallbacks.", _venue_err)
+            self.venue_stats = {}
 
         log.info(
             "DataCache ready: %d standings, %d squad rows, %d player rows, %d matches, %d venue rows.",
