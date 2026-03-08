@@ -17,6 +17,8 @@ from ml.feature_engineering import (
     compute_h2h,
 )
 from ml.ml_models import EnsemblePredictor
+from ml.model_store import save_to_db, load_from_db
+from ml.batch_features import build_training_dataset_fast
 
 # ─── Singleton state ──────────────────────────────────────────────────────────
 
@@ -36,7 +38,10 @@ OUTCOME_LABELS = {0: "Home Win", 1: "Draw", 2: "Away Win"}
 def _get_engine() -> EnsemblePredictor:
     global _engine
     if _engine is None:
-        loaded = EnsemblePredictor.load()
+        # Try Supabase first (survives redeploys), fall back to local disk
+        loaded = load_from_db()
+        if loaded is None:
+            loaded = EnsemblePredictor.load()
         if loaded and loaded.is_trained:
             _engine = loaded
             _meta["n_samples"]      = loaded.n_samples
@@ -62,7 +67,8 @@ def train_model():
     cur  = conn.cursor()
     try:
         t0 = time.time()
-        X, y, match_ids, errors = build_training_dataset(cur, skip_errors=True)
+        # Fast path: bulk-load all tables in ~6 queries, build features in-memory
+        X, y, match_ids, errors = build_training_dataset_fast(cur, skip_errors=True)
         conn.close()
 
         if len(X) < 20:
@@ -100,7 +106,9 @@ def train_model():
             conn3.close()
 
         model.train(X, y, feature_names=feat_names or None)
+        # Save to disk (fast, local backup) AND Supabase (survives redeploys)
         model.save()
+        save_to_db(model)
 
         _engine = model
         _meta.update({
