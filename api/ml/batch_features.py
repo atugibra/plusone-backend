@@ -59,10 +59,21 @@ class DataCache:
         self._load(cur)
 
     def _load(self, cur):
-        log.info("DataCache: bulk-loading all tables…")
+        log.info("DataCache: bulk-loading all tables (memory-capped)…")
 
-        # 1. League standings ─────────────────────────────────────────────────
-        cur.execute("SELECT * FROM league_standings")
+        # Identify the 2 most recent season IDs — we only need recent data.
+        # Older seasons are used for prev_season_form but not for features.
+        cur.execute("SELECT id FROM seasons ORDER BY id DESC LIMIT 2")
+        recent_season_ids = [r["id"] for r in cur.fetchall()]
+        if not recent_season_ids:
+            recent_season_ids = [0]   # safe fallback
+        season_placeholder = ",".join("%s" for _ in recent_season_ids)
+
+        # 1. League standings (current seasons only) ──────────────────────────
+        cur.execute(
+            f"SELECT * FROM league_standings WHERE season_id IN ({season_placeholder})",
+            recent_season_ids,
+        )
         self.standings: Dict[Tuple, dict] = {}
         by_ls: Dict[Tuple, List] = defaultdict(list)
         for r in cur.fetchall():
@@ -95,14 +106,18 @@ class DataCache:
                 "avg_away_ga_pg":  avg_gf * 1.15,
             }
 
-        # 2. Squad stats ──────────────────────────────────────────────────────
-        cur.execute("""
+        # 2. Squad stats (current seasons only) ───────────────────────────────
+        cur.execute(
+            f"""
             SELECT team_id, season_id, split,
                    players_used, avg_age, possession, games, minutes_90s,
                    goals, assists, standard_stats, goalkeeping,
                    shooting, playing_time, misc_stats
             FROM team_squad_stats
-        """)
+            WHERE season_id IN ({season_placeholder})
+            """,
+            recent_season_ids,
+        )
         self.squad: Dict[Tuple, dict] = {}
         for r in cur.fetchall():
             r = dict(r)
@@ -110,34 +125,51 @@ class DataCache:
             if key not in self.squad:
                 self.squad[key] = r
 
-        # 3. Player stats ─────────────────────────────────────────────────────
-        cur.execute("""
-            SELECT team_id, season_id, player_name, goals, assists,
+        # 3. Player stats — top 5 scorers per team only (massive RAM saving) ──
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (team_id, season_id, player_name)
+                   team_id, season_id, player_name, goals, assists,
                    minutes, minutes_90s, age, standard_stats
             FROM player_stats
             WHERE goals IS NOT NULL
-            ORDER BY goals DESC
-        """)
-        self.players: Dict[Tuple, List] = defaultdict(list)
+              AND season_id IN ({season_placeholder})
+            ORDER BY team_id, season_id, player_name, goals DESC
+            """,
+            recent_season_ids,
+        )
+        # Keep only top 5 scorers per (team, season) to cap memory
+        _player_raw: Dict[Tuple, List] = defaultdict(list)
         for r in cur.fetchall():
             r = dict(r)
-            self.players[(r["team_id"], r["season_id"])].append(r)
+            _player_raw[(r["team_id"], r["season_id"])].append(r)
+        self.players: Dict[Tuple, List] = defaultdict(list)
+        for k, rows in _player_raw.items():
+            self.players[k] = sorted(rows, key=lambda x: _f(x.get("goals")),
+                                     reverse=True)[:5]
 
-        # 4. All completed matches ─────────────────────────────────────────────
-        cur.execute("""
+        # 4. Completed matches — last 2 seasons, max 30 per team (for form) ───
+        cur.execute(
+            f"""
             SELECT id, home_team_id, away_team_id, season_id, league_id,
                    home_score, away_score, match_date
             FROM matches
             WHERE home_score IS NOT NULL AND away_score IS NOT NULL
+              AND season_id IN ({season_placeholder})
             ORDER BY match_date DESC
-        """)
+            LIMIT 5000
+            """,
+            recent_season_ids,
+        )
         self.all_matches: List[dict] = [dict(r) for r in cur.fetchall()]
 
-        # Index by team for O(1) form lookups
+        # Index by team — cap at 30 per team to bound memory
         self.matches_by_team: Dict[int, List] = defaultdict(list)
         for m in self.all_matches:
-            self.matches_by_team[m["home_team_id"]].append(m)
-            self.matches_by_team[m["away_team_id"]].append(m)
+            if len(self.matches_by_team[m["home_team_id"]]) < 30:
+                self.matches_by_team[m["home_team_id"]].append(m)
+            if len(self.matches_by_team[m["away_team_id"]]) < 30:
+                self.matches_by_team[m["away_team_id"]].append(m)
 
         # 5. Seasons ──────────────────────────────────────────────────────────
         cur.execute("SELECT id, name FROM seasons")
