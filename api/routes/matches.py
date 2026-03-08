@@ -45,7 +45,10 @@ def list_matches(
         query += " AND m.home_score IS NOT NULL"
         query += " ORDER BY m.match_date DESC LIMIT %s OFFSET %s"
     elif has_score == "false":
-        query += " AND m.home_score IS NULL"
+        # Only show genuinely upcoming fixtures: no score AND date is today or future.
+        # Without the date guard, past matches that were never synced with scores
+        # appear as upcoming fixtures (e.g. Aug 2024 games with home_score IS NULL).
+        query += " AND m.home_score IS NULL AND m.match_date >= CURRENT_DATE"
         query += " ORDER BY m.match_date ASC LIMIT %s OFFSET %s"
     else:
         query += " ORDER BY m.match_date DESC LIMIT %s OFFSET %s"
