@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
 import ml.prediction_engine as engine
+from ml.prediction_engine import predict_upcoming_fast
 
 router = APIRouter()
 
@@ -123,9 +124,9 @@ def upcoming_predictions(
     league_id: Optional[int] = Query(None, description="Filter by league ID"),
     limit:     int           = Query(50,   description="Max fixtures to predict"),
 ):
-    """Predict all upcoming unplayed fixtures, ordered by match date ascending."""
+    """Predict all upcoming unplayed fixtures using the fast bulk-load path."""
     try:
-        results = engine.predict_upcoming(league_id=league_id, limit=limit)
+        results = predict_upcoming_fast(league_id=league_id, limit=limit)
         return {
             "count":       len(results),
             "predictions": results,
