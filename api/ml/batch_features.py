@@ -148,19 +148,19 @@ class DataCache:
             self.players[k] = sorted(rows, key=lambda x: _f(x.get("goals")),
                                      reverse=True)[:5]
 
-        # 4. Completed matches — last 2 seasons, max 30 per team (for form) ───
-        cur.execute(
-            f"""
+        # 4. Completed matches — rolling 2-year window by DATE (not season_id)
+        # Using a date window (not season_id) ensures training always has enough
+        # historical data regardless of how seasons are numbered in the DB.
+        # 5000 row cap keeps memory bounded: ~5000 matches × ~400 bytes ≈ 2 MB.
+        cur.execute("""
             SELECT id, home_team_id, away_team_id, season_id, league_id,
                    home_score, away_score, match_date
             FROM matches
             WHERE home_score IS NOT NULL AND away_score IS NOT NULL
-              AND season_id IN ({season_placeholder})
+              AND match_date >= CURRENT_DATE - INTERVAL '2 years'
             ORDER BY match_date DESC
             LIMIT 5000
-            """,
-            recent_season_ids,
-        )
+        """)
         self.all_matches: List[dict] = [dict(r) for r in cur.fetchall()]
 
         # Index by team — cap at 30 per team to bound memory
