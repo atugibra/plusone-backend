@@ -10,13 +10,17 @@ Endpoints:
   POST /api/predictions/generate    → legacy rule-based prediction (by team names)
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
 import ml.prediction_engine as engine
 
 router = APIRouter()
+
+# Tracks background training state so /status can report errors
+_training_state: dict = {}
+
 
 
 # ─── Request models ───────────────────────────────────────────────────────────
@@ -48,17 +52,37 @@ def prediction_status():
     return engine.get_status()
 
 
-@router.post("/train")
-def train(req: TrainRequest = None):
-    """
-    Train (or retrain) the prediction model on all completed matches in the DB.
-    May take 30-120 seconds depending on data size.
-    """
+def _run_training_in_background():
+    """Run inside FastAPI BackgroundTasks so the HTTP response returns immediately."""
+    global _training_state
+    _training_state = {"status": "running", "started_at": __import__('time').time()}
     try:
         result = engine.train_model()
-        return result
+        _training_state = {"status": "done", "result": result}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        _training_state = {"status": "error", "error": str(e)}
+
+
+@router.post("/train")
+def train(background_tasks: BackgroundTasks, req: TrainRequest = None):
+    """
+    Kick off model training in the background.
+    Returns immediately with 202 — clients should poll /training-status.
+    May take 30-120 seconds depending on data size.
+    """
+    if _training_state.get("status") == "running":
+        return {"started": False, "message": "Training already in progress. Poll /training-status."}
+    background_tasks.add_task(_run_training_in_background)
+    return {"started": True, "message": "Training started in background. Poll /training-status for progress."}
+
+
+@router.get("/training-status")
+def training_status():
+    """Poll this endpoint to check if background training has finished."""
+    state = _training_state
+    if not state:
+        return {"status": "idle", "message": "No training has been triggered yet."}
+    return state
 
 
 @router.post("/predict")
@@ -66,6 +90,7 @@ def predict(req: PredictRequest):
     """
     Predict the outcome of a specific match by team IDs.
     Returns rich output: probabilities, xG, key factors, H2H, team comparison.
+    Returns 422 if the model has not been trained yet.
     """
     if req.home_team_id == req.away_team_id:
         raise HTTPException(status_code=400, detail="Home and away teams must be different.")
@@ -77,7 +102,15 @@ def predict(req: PredictRequest):
             req.season_id,
         )
         if "error" in result:
-            raise HTTPException(status_code=503, detail=result["error"])
+            error_msg = result["error"]
+            # Return 422 for untrained model (not a server fault)
+            if "not trained" in error_msg.lower() or "no model" in error_msg.lower():
+                raise HTTPException(
+                    status_code=422,
+                    detail="Model not trained yet. Click 'Train Model' first, then try again."
+                )
+            # For any other prediction-related error, return 422 as it's likely due to bad input or missing data
+            raise HTTPException(status_code=422, detail=error_msg)
         return result
     except HTTPException:
         raise
