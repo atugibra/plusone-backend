@@ -41,25 +41,52 @@ def _safe_div(num, den, default=0.0):
 def get_league_averages(cur, league_id, season_id):
     """
     Compute per-game averages across the whole league for normalisation.
-    Returns dict with avg_goals_for, avg_goals_against, avg_points_avg, n_teams.
+    Also computes venue-specific averages (home/away) from team_venue_stats.
+    Returns dict with avg_gf_pg, avg_ga_pg, avg_pts_avg, n_teams,
+    plus avg_home_gf_pg, avg_home_ga_pg, avg_away_gf_pg, avg_away_ga_pg.
     """
+    # Overall standings averages
     cur.execute("""
         SELECT
-            AVG(goals_for::float / NULLIF(games, 0))   AS avg_gf_pg,
+            AVG(goals_for::float / NULLIF(games, 0))     AS avg_gf_pg,
             AVG(goals_against::float / NULLIF(games, 0)) AS avg_ga_pg,
-            AVG(points_avg)                             AS avg_pts_avg,
-            COUNT(*)                                    AS n_teams
+            AVG(points_avg)                              AS avg_pts_avg,
+            COUNT(*)                                     AS n_teams
         FROM league_standings
         WHERE league_id = %s AND season_id = %s
     """, (league_id, season_id))
     row = cur.fetchone()
     if not row or not row["n_teams"]:
-        return {"avg_gf_pg": 1.3, "avg_ga_pg": 1.3, "avg_pts_avg": 1.3, "n_teams": 20}
+        return {
+            "avg_gf_pg": 1.35, "avg_ga_pg": 1.35, "avg_pts_avg": 1.35, "n_teams": 20,
+            "avg_home_gf_pg": 1.55, "avg_home_ga_pg": 1.15,
+            "avg_away_gf_pg": 1.15, "avg_away_ga_pg": 1.55,
+        }
+
+    # Venue-specific averages from team_venue_stats
+    cur.execute("""
+        SELECT venue,
+            AVG(goals_for::float / NULLIF(games, 0))     AS avg_gf_pg,
+            AVG(goals_against::float / NULLIF(games, 0)) AS avg_ga_pg
+        FROM team_venue_stats
+        WHERE league_id = %s AND season_id = %s AND games > 0
+        GROUP BY venue
+    """, (league_id, season_id))
+    venue_avgs = {r["venue"]: r for r in cur.fetchall()}
+    h = venue_avgs.get("home", {})
+    a = venue_avgs.get("away", {})
+
+    avg_gf = _f(row["avg_gf_pg"], 1.35)
     return {
-        "avg_gf_pg":   _f(row["avg_gf_pg"],   1.3),
-        "avg_ga_pg":   _f(row["avg_ga_pg"],   1.3),
-        "avg_pts_avg": _f(row["avg_pts_avg"], 1.3),
-        "n_teams":     int(row["n_teams"] or 20),
+        "avg_gf_pg":       avg_gf,
+        "avg_ga_pg":       _f(row["avg_ga_pg"],   avg_gf),
+        "avg_pts_avg":     _f(row["avg_pts_avg"], 1.35),
+        "n_teams":         int(row["n_teams"] or 20),
+        # Venue: home teams score more at home, away teams score less away
+        "avg_home_gf_pg":  _f(h.get("avg_gf_pg"), avg_gf * 1.15),
+        "avg_home_ga_pg":  _f(h.get("avg_ga_pg"), avg_gf * 0.85),
+        "avg_away_gf_pg":  _f(a.get("avg_gf_pg"), avg_gf * 0.85),
+        "avg_away_ga_pg":  _f(a.get("avg_ga_pg"), avg_gf * 1.15),
     }
 
 
@@ -94,7 +121,7 @@ def compute_form(cur, team_id, venue=None, n=5):
     rows = cur.fetchall()
 
     if not rows:
-        return {"form_score": 0.5, "goals_scored_avg": 1.2, "goals_conceded_avg": 1.2,
+        return {"form_score": 0.5, "goals_scored_avg": 1.35, "goals_conceded_avg": 1.35,
                 "win_streak": 0, "results": []}
 
     pts_total = 0
@@ -342,7 +369,7 @@ def build_prev_season_form(cur, team_id):
     """, (team_id, team_id))
     row = cur.fetchone()
     if not row:
-        return {"prev_form_score": 0.5, "prev_gf_pg": 0.0, "prev_ga_pg": 0.0,
+        return {"prev_form_score": 0.5, "prev_gf_pg": 1.35, "prev_ga_pg": 1.35,
                 "prev_match_wins_pct": 0.0}
 
     prev_sid = row["season_id"]
@@ -355,7 +382,7 @@ def build_prev_season_form(cur, team_id):
     """, (team_id, team_id, prev_sid))
     matches = cur.fetchall()
     if not matches:
-        return {"prev_form_score": 0.5, "prev_gf_pg": 0.0, "prev_ga_pg": 0.0,
+        return {"prev_form_score": 0.5, "prev_gf_pg": 1.35, "prev_ga_pg": 1.35,
                 "prev_match_wins_pct": 0.0}
 
     wins = pts = gf_t = ga_t = 0
@@ -440,6 +467,40 @@ def build_scoring_patterns(cur, team_id, season_id):
 
 
 # ─── Main team feature builder ────────────────────────────────────────────────
+
+def build_venue_stats(cur, team_id, season_id):
+    """
+    Fetch per-venue (home/away) goal records from team_venue_stats table.
+    Returns dict with:
+      home_gf_pg, home_ga_pg, home_win_rate, home_games,
+      away_gf_pg, away_ga_pg, away_win_rate, away_games
+    All floats, zero-safe.
+    """
+    cur.execute("""
+        SELECT venue, games, wins, goals_for, goals_against
+        FROM team_venue_stats
+        WHERE team_id = %s AND season_id = %s AND games > 0
+    """, (team_id, season_id))
+    rows = {r["venue"]: r for r in cur.fetchall()}
+
+    def _venue(v, fallback_gf, fallback_ga):
+        r = rows.get(v)
+        if not r:
+            return {f"{v}_gf_pg": fallback_gf, f"{v}_ga_pg": fallback_ga,
+                    f"{v}_win_rate": 0.33, f"{v}_games": 0}
+        g = _f(r["games"]) or 1
+        return {
+            f"{v}_gf_pg":   _safe_div(_f(r["goals_for"]),    g, fallback_gf),
+            f"{v}_ga_pg":   _safe_div(_f(r["goals_against"]), g, fallback_ga),
+            f"{v}_win_rate": _safe_div(_f(r["wins"]),         g, 0.33),
+            f"{v}_games":    _f(r["games"]),
+        }
+
+    result = {}
+    result.update(_venue("home", 1.55, 1.15))   # home teams score more
+    result.update(_venue("away", 1.15, 1.55))   # away teams score less
+    return result
+
 
 def build_team_features(cur, team_id, league_id, season_id, league_avgs=None):
     """
@@ -610,6 +671,10 @@ def build_team_features(cur, team_id, league_id, season_id, league_avgs=None):
     # ── 7. Match-by-match scoring patterns (streakiness, blanks, blowouts) ──
     patterns = build_scoring_patterns(cur, team_id, season_id)
     feats.update(patterns)
+
+    # ── 8. Venue stats (home/away splits from team_venue_stats) ────────────
+    venue = build_venue_stats(cur, team_id, season_id)
+    feats.update(venue)   # adds home_gf_pg, home_ga_pg, away_gf_pg, away_ga_pg, etc.
 
     return feats
 

@@ -82,11 +82,17 @@ class DataCache:
                 ga_pgs.append(_safe_div(_f(t.get("goals_against")), g))
                 pts.append(_f(t.get("points_avg")))
             n = len(teams) or 1
+            avg_gf = sum(gf_pgs) / n if gf_pgs else 1.35
             self.league_avgs[(lid, sid)] = {
-                "avg_gf_pg":   sum(gf_pgs) / n if gf_pgs else 1.3,
-                "avg_ga_pg":   sum(ga_pgs) / n if ga_pgs else 1.3,
-                "avg_pts_avg": sum(pts)    / n if pts    else 1.3,
-                "n_teams":     n,
+                "avg_gf_pg":       avg_gf,
+                "avg_ga_pg":       sum(ga_pgs) / n if ga_pgs else avg_gf,
+                "avg_pts_avg":     sum(pts)    / n if pts    else 1.35,
+                "n_teams":         n,
+                # Venue fallbacks — will be overwritten if team_venue_stats loaded
+                "avg_home_gf_pg":  avg_gf * 1.15,
+                "avg_home_ga_pg":  avg_gf * 0.85,
+                "avg_away_gf_pg":  avg_gf * 0.85,
+                "avg_away_ga_pg":  avg_gf * 1.15,
             }
 
         # 2. Squad stats ──────────────────────────────────────────────────────
@@ -138,10 +144,40 @@ class DataCache:
         seasons = [dict(r) for r in cur.fetchall()]
         self.season_name: Dict[int, str] = {r["id"]: r["name"] for r in seasons}
 
+        # 6. Team venue stats (home/away splits) ──────────────────────────────
+        cur.execute("""
+            SELECT team_id, league_id, season_id, venue,
+                   games, wins, draws, losses, goals_for, goals_against
+            FROM team_venue_stats
+            WHERE games > 0
+        """)
+        # Key: (team_id, season_id, venue)
+        self.venue_stats: Dict[Tuple, dict] = {}
+        venue_by_league: Dict[Tuple, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
+        for r in cur.fetchall():
+            r = dict(r)
+            self.venue_stats[(r["team_id"], r["season_id"], r["venue"])] = r
+            venue_by_league[(r["league_id"], r["season_id"])][r["venue"]].append(r)
+
+        # Overwrite league venue averages with real data
+        for (lid, sid), by_venue in venue_by_league.items():
+            if (lid, sid) not in self.league_avgs:
+                continue
+            for venue, rows in by_venue.items():
+                gf_pgs = [_safe_div(_f(r.get("goals_for")), max(_f(r.get("games")), 1)) for r in rows]
+                ga_pgs = [_safe_div(_f(r.get("goals_against")), max(_f(r.get("games")), 1)) for r in rows]
+                n = len(rows) or 1
+                if venue == "home":
+                    self.league_avgs[(lid, sid)]["avg_home_gf_pg"] = sum(gf_pgs) / n
+                    self.league_avgs[(lid, sid)]["avg_home_ga_pg"] = sum(ga_pgs) / n
+                elif venue == "away":
+                    self.league_avgs[(lid, sid)]["avg_away_gf_pg"] = sum(gf_pgs) / n
+                    self.league_avgs[(lid, sid)]["avg_away_ga_pg"] = sum(ga_pgs) / n
+
         log.info(
-            "DataCache ready: %d standings, %d squad rows, %d player rows, %d matches.",
+            "DataCache ready: %d standings, %d squad rows, %d player rows, %d matches, %d venue rows.",
             len(self.standings), len(self.squad), sum(len(v) for v in self.players.values()),
-            len(self.all_matches),
+            len(self.all_matches), len(self.venue_stats),
         )
 
 
@@ -156,8 +192,8 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n
     matches = matches[:n]
 
     if not matches:
-        return {"form_score": 0.5, "goals_scored_avg": 1.2,
-                "goals_conceded_avg": 1.2, "win_streak": 0, "results": []}
+        return {"form_score": 0.5, "goals_scored_avg": 1.35,
+                "goals_conceded_avg": 1.35, "win_streak": 0, "results": []}
 
     pts_total = gf_total = ga_total = 0
     results, streak, streak_active = [], 0, True
@@ -263,7 +299,7 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
 
 _PREV_ZERO = {
     "prev_rank_norm": 0.5, "prev_points_avg": 0.0, "prev_wins_pct": 0.0,
-    "prev_goals_for_pg": 0.0, "prev_goals_ag_pg": 0.0,
+    "prev_goals_for_pg": 1.35, "prev_goals_ag_pg": 1.35,
     "prev_goal_diff_pg": 0.0, "prev_season_found": 0.0,
 }
 
@@ -299,8 +335,8 @@ def _build_prev_season_features(cache: DataCache, team_id: int, league_id: int) 
 
 
 def _build_prev_season_form(cache: DataCache, team_id: int) -> dict:
-    zero = {"prev_form_score": 0.5, "prev_gf_pg": 0.0,
-            "prev_ga_pg": 0.0, "prev_match_wins_pct": 0.0}
+    zero = {"prev_form_score": 0.5, "prev_gf_pg": 1.35,
+            "prev_ga_pg": 1.35, "prev_match_wins_pct": 0.0}
     # All distinct seasons for this team from match history (desc by name)
     seasons_used = sorted(
         set((m["season_id"], cache.season_name.get(m["season_id"], ""))
@@ -333,6 +369,8 @@ def _build_prev_season_form(cache: DataCache, team_id: int) -> dict:
         "prev_match_wins_pct":  _safe_div(wins, n),
     }
 
+
+# ─── Scoring patterns (in-memory) ─────────────────────────────────────────────
 
 # ─── Scoring patterns (in-memory) ─────────────────────────────────────────────
 
@@ -370,6 +408,34 @@ def _build_scoring_patterns(cache: DataCache, team_id: int, season_id: int) -> d
         "defensive_collapse_rate": _safe_div(collapses,   n),
         "clean_sheet_rate":        _safe_div(clean_sheets, n),
     }
+
+
+# ─── Venue stats (in-memory) ──────────────────────────────────────────────────
+
+def _build_venue_stats(cache: DataCache, team_id: int, season_id: int) -> dict:
+    """
+    Return home/away venue stats from the pre-loaded team_venue_stats cache.
+    Keys: home_gf_pg, home_ga_pg, home_win_rate, home_games,
+          away_gf_pg, away_ga_pg, away_win_rate, away_games
+    """
+    result = {}
+    for venue, fallback_gf, fallback_ga in [
+        ("home", 1.55, 1.15),
+        ("away", 1.15, 1.55),
+    ]:
+        r = cache.venue_stats.get((team_id, season_id, venue))
+        if r:
+            g = _f(r.get("games")) or 1
+            result[f"{venue}_gf_pg"]    = _safe_div(_f(r.get("goals_for")),    g, fallback_gf)
+            result[f"{venue}_ga_pg"]    = _safe_div(_f(r.get("goals_against")), g, fallback_ga)
+            result[f"{venue}_win_rate"] = _safe_div(_f(r.get("wins")),          g, 0.33)
+            result[f"{venue}_games"]    = _f(r.get("games"))
+        else:
+            result[f"{venue}_gf_pg"]    = fallback_gf
+            result[f"{venue}_ga_pg"]    = fallback_ga
+            result[f"{venue}_win_rate"] = 0.33
+            result[f"{venue}_games"]    = 0
+    return result
 
 
 # ─── Full team feature builder (in-memory) ────────────────────────────────────
@@ -518,6 +584,9 @@ def _build_team_features(cache: DataCache, team_id: int,
 
     # 7. Scoring patterns
     feats.update(_build_scoring_patterns(cache, team_id, season_id))
+
+    # 8. Venue stats (home/away splits from team_venue_stats)
+    feats.update(_build_venue_stats(cache, team_id, season_id))
 
     return feats
 

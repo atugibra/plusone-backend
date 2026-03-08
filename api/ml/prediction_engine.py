@@ -137,11 +137,46 @@ def train_model():
 
 # ─── Prediction ───────────────────────────────────────────────────────────────
 
-def _xg_from_feats(feats: dict) -> float:
-    xg = feats.get("xg_estimate", 0.0)
-    if xg and xg > 0:
-        return round(xg, 2)
-    return round(feats.get("goals_for_pg", feats.get("goals_per90", 1.2)), 2)
+def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) -> float:
+    """
+    Dixon-Coles style Expected Goals using real venue-split data from team_venue_stats.
+
+    Attack rate: attacker's home_gf_pg (venue='home') or away_gf_pg (venue='away').
+                 Falls back to season avg goals_for_pg if venue data is unavailable.
+    Defence rate: opponent's concession rate at their venue (home defenders at home,
+                 away defenders on the road).
+    form_gf_avg: recent-form goals blended in as a short-term signal (35% weight).
+    """
+    # ── Attack: venue-specific goal rate from team_venue_stats ─────────────
+    if venue == "home":
+        attack_rate  = attacker_feats.get("home_gf_pg", 0.0)
+        defence_rate = defender_feats.get("away_ga_pg", 0.0)   # away team concedes on road
+    else:
+        attack_rate  = attacker_feats.get("away_gf_pg", 0.0)
+        defence_rate = defender_feats.get("home_ga_pg", 0.0)   # home team concedes at home
+
+    # ── Fallbacks if venue data missing ────────────────────────────────
+    season_gf = attacker_feats.get("goals_for_pg", 0.0)
+    form_gf   = attacker_feats.get("form_gf_avg",  0.0)
+
+    if attack_rate < 0.1:
+        attack_rate = season_gf if season_gf > 0.1 else (form_gf if form_gf > 0.1 else 1.35)
+    if defence_rate < 0.1:
+        defence_rate = defender_feats.get("goals_against_pg", 1.35)
+
+    # ── Blend in recent form (last-5 actual goals) as 35% short-term signal ──
+    if form_gf > 0.1:
+        attack_rate = 0.65 * attack_rate + 0.35 * form_gf
+
+    # ── Dixon-Coles defensive adjustment ──────────────────────────────
+    # defence_rate > 1.35 means leaky defence → attacker scores more
+    # defence_rate < 1.35 means solid defence → attacker scores less
+    LEAGUE_AVG_GA = 1.35
+    defence_factor = defence_rate / LEAGUE_AVG_GA if defence_rate > 0 else 1.0
+    xg = attack_rate * defence_factor
+
+    # ── Clamp to realistic range ─────────────────────────────────────
+    return round(max(0.5, min(xg, 5.0)), 2)
 
 
 def _key_factors(home_feats: dict, away_feats: dict,
@@ -265,8 +300,8 @@ def predict_match(home_team_id: int, away_team_id: int,
         proba = engine.predict_proba(fv)
         top_feats = engine.get_top_features(fv, n=6)
 
-        home_xg = _xg_from_feats(home_feats)
-        away_xg = _xg_from_feats(away_feats)
+        home_xg = _compute_venue_xg(home_feats, away_feats, "home")
+        away_xg = _compute_venue_xg(away_feats, home_feats, "away")
 
         factors = _key_factors(home_feats, away_feats, home_name, away_name)
 
