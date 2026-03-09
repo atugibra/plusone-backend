@@ -18,7 +18,7 @@ from ml.feature_engineering import (
 )
 from ml.ml_models import EnsemblePredictor
 from ml.model_store import save_to_db, load_from_db
-from ml.batch_features import build_training_dataset_fast, DataCache, _build_team_features
+from ml.batch_features import build_training_dataset_fast, DataCache, _build_team_features, _build_match_features
 
 # ─── Singleton state ──────────────────────────────────────────────────────────
 
@@ -481,28 +481,13 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                 lid  = fx["league_id"]
                 sid  = fx["season_id"]
 
-                home_feats = _build_team_features(cache, htid, lid, sid)
-                away_feats = _build_team_features(cache, atid, lid, sid)
-
-                # Build diff feature vector (same as training)
-                fv = eng.feature_names_ or []
-                row = {}
-                for feat in fv:
-                    if feat.startswith("home_"):
-                        k = feat[5:]
-                        row[feat] = home_feats.get(k, home_feats.get(feat, 0.0))
-                    elif feat.startswith("away_"):
-                        k = feat[5:]
-                        row[feat] = away_feats.get(k, away_feats.get(feat, 0.0))
-                    elif feat.endswith("_diff"):
-                        k = feat[:-5]
-                        row[feat] = home_feats.get(k, 0.0) - away_feats.get(k, 0.0)
-                    else:
-                        row[feat] = home_feats.get(feat, 0.0)
-
-                import numpy as np
-                X = np.array([[row.get(f, 0.0) for f in fv]])
-                proba = eng.predict_proba(X[0].tolist() if hasattr(X[0], 'tolist') else list(X[0]))
+                # Use _build_match_features() — EXACTLY the same function used
+                # during training. This guarantees feature names, order and
+                # values are identical to what the model was trained on.
+                fv, feat_names, home_feats, away_feats, h2h = _build_match_features(
+                    cache, htid, atid, lid, sid
+                )
+                proba = eng.predict_proba(fv)
 
                 home_xg = _compute_venue_xg(home_feats, away_feats, "home")
                 away_xg = _compute_venue_xg(away_feats, home_feats, "away")
