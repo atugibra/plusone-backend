@@ -9,11 +9,15 @@ POST /api/markets/dc/train     — Train (or retrain) DC model
 GET  /api/markets/dc/leaderboard — Elo leaderboard
 """
 
+
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from typing import Optional
 import logging
+import threading
+import time
 
+from database import get_connection
 from ml.dc_engine  import (predict_dc_match, train_dc_model,
                             dc_status, get_dc_predictor)
 from ml.markets    import MarketPricer, ValueDetector, ArbitrageScanner
@@ -21,8 +25,371 @@ from ml.markets    import MarketPricer, ValueDetector, ArbitrageScanner
 router = APIRouter()
 log = logging.getLogger(__name__)
 
+# ─── Training state (persistent thread, survives navigation) ──────────────────
+_dc_training_state: dict = {}
 
-# ─── GET /api/markets ─────────────────────────────────────────────────────────
+def _run_dc_training():
+    global _dc_training_state, _upcoming_cache
+    _dc_training_state = {"status": "running", "started_at": time.time()}
+    try:
+        result = train_dc_model()
+        _dc_training_state = {"status": "done", "result": result}
+        # Bust the upcoming cache so Free Picks reflects the new model immediately
+        _upcoming_cache = {"data": None, "expires_at": 0.0}
+        if result.get("trained"):
+            log.info("DC retrain complete: %d matches", result.get("n_matches", 0))
+        else:
+            log.error("DC retrain failed: %s", result.get("error"))
+    except Exception as e:
+        _dc_training_state = {"status": "error", "error": str(e)}
+        log.error("DC training exception: %s", e)
+
+
+# ─── 15-min cache for /upcoming (makes Free Picks near-instant after first hit) 
+_upcoming_cache: dict = {"data": None, "expires_at": 0.0}
+_UPCOMING_TTL = 15 * 60   # seconds
+
+
+# ─── GET /api/markets/upcoming ────────────────────────────────────────────────
+
+def _dc_bet_recommendations(calibrated: dict, xg_h: float, xg_a: float) -> list:
+    """Derive simple bet recommendations from DC calibrated probabilities."""
+    hw = calibrated.get("home_win", 0.33)
+    dr = calibrated.get("draw", 0.33)
+    aw = calibrated.get("away_win", 0.34)
+    lead = max(hw, dr, aw)
+    if lead == hw:
+        outcome, outcome_label = "home_win", "Home Win"
+    elif lead == aw:
+        outcome, outcome_label = "away_win", "Away Win"
+    else:
+        outcome, outcome_label = "draw", "Draw"
+
+    bets = []
+    if lead >= 0.55:
+        bets.append({"bet": f"✅ Strong Pick — {outcome_label}", "prob": round(lead * 100), "tier": "high"})
+    elif lead >= 0.47:
+        bets.append({"bet": f"💡 Value Bet — {outcome_label}", "prob": round(lead * 100), "tier": "medium"})
+    if xg_h >= 1.1 and xg_a >= 1.0:
+        bets.append({"bet": "⚽ Both Teams to Score (recommended)", "prob": None, "tier": "btts"})
+    if dr >= 0.33 and outcome != "draw":
+        bets.append({"bet": f"⚠️ Draw value — {round(dr * 100)}% probability", "prob": round(dr * 100), "tier": "draw_value"})
+    return bets
+
+
+@router.get("/upcoming")
+def upcoming_dc_predictions(
+    league_id: Optional[int] = Query(None, description="Filter by league ID"),
+    limit: int               = Query(30,   description="Max fixtures"),
+):
+    """
+    Bulk DC-engine predictions for all upcoming fixtures.
+    Results are cached for 15 minutes so the Free Picks page loads near-instantly
+    after the first request. Cache is busted automatically when DC model is retrained.
+    """
+    global _upcoming_cache
+
+    dc = get_dc_predictor()
+    if dc is None or not dc.fitted:
+        raise HTTPException(
+            status_code=503,
+            detail="DC model not trained. Go to Betting Markets and click 'Train Engine' first.",
+        )
+
+    # Return from cache if still fresh (only cache the default full-list request)
+    cache_key = (league_id, limit)
+    now = time.time()
+    if (
+        _upcoming_cache.get("data") is not None
+        and _upcoming_cache.get("expires_at", 0) > now
+        and _upcoming_cache.get("key") == cache_key
+    ):
+        log.debug("Returning /upcoming from cache (%.0fs remaining)",
+                  _upcoming_cache["expires_at"] - now)
+        return _upcoming_cache["data"]
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        query = """
+            SELECT m.id, m.match_date, m.gameweek, m.start_time,
+                   m.home_team_id, ht.name AS home_team,
+                   m.away_team_id, at.name AS away_team,
+                   l.id AS league_id, l.name AS league,
+                   s.name AS season
+            FROM matches m
+            JOIN teams   ht ON ht.id = m.home_team_id
+            JOIN teams   at ON at.id = m.away_team_id
+            JOIN leagues l  ON l.id  = m.league_id
+            JOIN seasons s  ON s.id  = m.season_id
+            WHERE m.home_score IS NULL
+              AND m.match_date >= CURRENT_DATE
+        """
+        params = []
+        if league_id:
+            query += " AND m.league_id = %s"
+            params.append(league_id)
+        query += " ORDER BY m.match_date ASC LIMIT %s"
+        params.append(limit)
+        cur.execute(query, params)
+        fixtures = cur.fetchall()
+    finally:
+        conn.close()
+
+    results = []
+    for fx in fixtures:
+        try:
+            pred = predict_dc_match(fx["home_team_id"], fx["away_team_id"])
+            if "error" in pred:
+                continue
+
+            cal  = pred.get("calibrated", {})
+            hw   = cal.get("home_win", 0.33)
+            dr   = cal.get("draw",     0.33)
+            aw   = cal.get("away_win", 0.34)
+            lead = max(hw, dr, aw)
+            if lead == hw:
+                outcome = "Home Win"
+            elif lead == aw:
+                outcome = "Away Win"
+            else:
+                outcome = "Draw"
+
+            conf_pct = pred.get("confidence", 50)
+            if conf_pct >= 60:
+                confidence = "High"
+            elif conf_pct >= 48:
+                confidence = "Medium"
+            else:
+                confidence = "Low"
+
+            xg_h = float(pred.get("exp_home_goals") or 0)
+            xg_a = float(pred.get("exp_away_goals") or 0)
+
+            # Predicted score from xG (rounded)
+            pred_h = max(0, round(xg_h))
+            pred_a = max(0, round(xg_a))
+
+            results.append({
+                "predicted_outcome": outcome,
+                "confidence":        confidence,
+                "confidence_score":  round(lead, 4),
+                "probabilities": {
+                    "home_win": round(hw, 4),
+                    "draw":     round(dr, 4),
+                    "away_win": round(aw, 4),
+                },
+                "expected_goals": {
+                    "home_xg":       round(xg_h, 2),
+                    "away_xg":       round(xg_a, 2),
+                    "predicted_score": f"{pred_h}-{pred_a}",
+                },
+                "match": {
+                    "match_id":      fx["id"],
+                    "home_team":     fx["home_team"],
+                    "away_team":     fx["away_team"],
+                    "home_team_id":  fx["home_team_id"],
+                    "away_team_id":  fx["away_team_id"],
+                    "league":        fx["league"],
+                    "league_id":     fx["league_id"],
+                    "date":          str(fx["match_date"]) if fx["match_date"] else None,
+                    "gameweek":      fx["gameweek"],
+                    "season":        fx["season"],
+                },
+                "model_breakdown": pred.get("models", {}),
+                "bet_recommendations": _dc_bet_recommendations(cal, xg_h, xg_a),
+                "engine": "dixon_coles",
+            })
+        except Exception as exc:
+            log.debug("DC skip fixture %s vs %s: %s", fx["home_team"], fx["away_team"], exc)
+            continue
+
+    response = {"count": len(results), "predictions": results, "engine": "dixon_coles"}
+    _upcoming_cache = {"data": response, "expires_at": time.time() + _UPCOMING_TTL, "key": cache_key}
+    log.info("Built /upcoming cache: %d predictions, TTL %ds", len(results), _UPCOMING_TTL)
+    return response
+
+
+
+# ─── GET /api/markets/match-preview ──────────────────────────────────────────
+
+@router.get("/match-preview")
+def match_preview(
+    home_team_id: int  = Query(..., description="Home team ID"),
+    away_team_id: int  = Query(..., description="Away team ID"),
+):
+    """
+    Rich pre-match data for the Free Picks card expand view.
+    Returns: last-5 results per team (with scores), season stats,
+             H2H last-8 with scores, next-3 upcoming per team.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    try:
+        # ── Helper: last N played results for one team ──────────────────
+        def recent_results(tid: int, n: int = 5):
+            cur.execute("""
+                SELECT
+                    m.match_date, m.gameweek,
+                    CASE WHEN m.home_team_id = %(t)s THEN at2.name ELSE ht2.name END AS opponent,
+                    CASE WHEN m.home_team_id = %(t)s THEN 'H' ELSE 'A'           END AS venue,
+                    CASE WHEN m.home_team_id = %(t)s THEN m.home_score ELSE m.away_score END AS ts,
+                    CASE WHEN m.home_team_id = %(t)s THEN m.away_score ELSE m.home_score END AS os,
+                    l.name AS league
+                FROM matches m
+                JOIN teams  ht2 ON ht2.id = m.home_team_id
+                JOIN teams  at2 ON at2.id = m.away_team_id
+                JOIN leagues l  ON l.id   = m.league_id
+                WHERE (m.home_team_id = %(t)s OR m.away_team_id = %(t)s)
+                  AND m.home_score IS NOT NULL
+                ORDER BY m.match_date DESC
+                LIMIT %(n)s
+            """, {"t": tid, "n": n})
+            out = []
+            for r in cur.fetchall():
+                ts = r["ts"] or 0;  os = r["os"] or 0
+                out.append({
+                    "date":     str(r["match_date"]) if r["match_date"] else None,
+                    "gameweek": r["gameweek"],
+                    "opponent": r["opponent"],
+                    "venue":    r["venue"],
+                    "score":    f"{ts}-{os}",
+                    "result":   "W" if ts > os else ("L" if ts < os else "D"),
+                    "league":   r["league"],
+                })
+            return out
+
+        # ── Helper: season aggregate stats ─────────────────────────────
+        def season_stats(tid: int):
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS played,
+                    SUM(CASE WHEN (home_team_id=%(t)s AND home_score>away_score)
+                              OR  (away_team_id=%(t)s AND away_score>home_score) THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN home_score=away_score THEN 1 ELSE 0 END) AS draws,
+                    SUM(CASE WHEN (home_team_id=%(t)s AND home_score<away_score)
+                              OR  (away_team_id=%(t)s AND away_score<home_score) THEN 1 ELSE 0 END) AS losses,
+                    SUM(CASE WHEN home_team_id=%(t)s THEN home_score ELSE away_score END) AS gf,
+                    SUM(CASE WHEN home_team_id=%(t)s THEN away_score ELSE home_score END) AS ga,
+                    SUM(CASE WHEN (home_team_id=%(t)s AND away_score=0)
+                              OR  (away_team_id=%(t)s AND home_score=0) THEN 1 ELSE 0 END) AS cs
+                FROM matches
+                WHERE (home_team_id=%(t)s OR away_team_id=%(t)s)
+                  AND home_score IS NOT NULL
+            """, {"t": tid})
+            r = cur.fetchone()
+            if not r or not r["played"]: return {}
+            p = r["played"]
+            return {
+                "played":             p,
+                "wins":               r["wins"]  or 0,
+                "draws":              r["draws"] or 0,
+                "losses":             r["losses"] or 0,
+                "goals_for":          r["gf"] or 0,
+                "goals_against":      r["ga"] or 0,
+                "avg_goals_for":      round((r["gf"] or 0) / p, 2),
+                "avg_goals_against":  round((r["ga"] or 0) / p, 2),
+                "clean_sheets":       r["cs"] or 0,
+                "clean_sheet_pct":    round((r["cs"] or 0) / p * 100),
+            }
+
+        # ── Helper: next N upcoming for one team (excluding the H2H match) ──
+        def upcoming_fixtures(tid: int, excl_opp: int, n: int = 3):
+            cur.execute("""
+                SELECT
+                    m.match_date, m.gameweek,
+                    CASE WHEN m.home_team_id=%(t)s THEN at3.name ELSE ht3.name END AS opponent,
+                    CASE WHEN m.home_team_id=%(t)s THEN 'H' ELSE 'A'           END AS venue,
+                    l.name AS league
+                FROM matches m
+                JOIN teams  ht3 ON ht3.id = m.home_team_id
+                JOIN teams  at3 ON at3.id = m.away_team_id
+                JOIN leagues l  ON l.id   = m.league_id
+                WHERE (m.home_team_id=%(t)s OR m.away_team_id=%(t)s)
+                  AND m.home_score IS NULL
+                  AND m.match_date >= CURRENT_DATE
+                  AND NOT ((m.home_team_id=%(t)s AND m.away_team_id=%(e)s)
+                        OR (m.away_team_id=%(t)s AND m.home_team_id=%(e)s))
+                ORDER BY m.match_date ASC
+                LIMIT %(n)s
+            """, {"t": tid, "e": excl_opp, "n": n})
+            return [
+                {"date":     str(r["match_date"]) if r["match_date"] else None,
+                 "gameweek": r["gameweek"],
+                 "opponent": r["opponent"],
+                 "venue":    r["venue"],
+                 "league":   r["league"]}
+                for r in cur.fetchall()
+            ]
+
+        # ── H2H ────────────────────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                m.match_date, m.gameweek,
+                ht4.name AS home_team,  at4.name AS away_team,
+                m.home_team_id,         m.away_team_id,
+                m.home_score,           m.away_score,
+                l.name AS league
+            FROM matches m
+            JOIN teams  ht4 ON ht4.id = m.home_team_id
+            JOIN teams  at4 ON at4.id = m.away_team_id
+            JOIN leagues l  ON l.id   = m.league_id
+            WHERE ((m.home_team_id=%(h)s AND m.away_team_id=%(a)s)
+                OR (m.home_team_id=%(a)s AND m.away_team_id=%(h)s))
+              AND m.home_score IS NOT NULL
+            ORDER BY m.match_date DESC
+            LIMIT 8
+        """, {"h": home_team_id, "a": away_team_id})
+        h2h_rows = cur.fetchall()
+
+        hw = dr = aw = 0
+        h2h_matches = []
+        for r in h2h_rows:
+            hs = r["home_score"] or 0
+            as_ = r["away_score"] or 0
+            if hs > as_:
+                result_code = "H"
+                if r["home_team_id"] == home_team_id: hw += 1
+                else: aw += 1
+            elif hs < as_:
+                result_code = "A"
+                if r["away_team_id"] == home_team_id: hw += 1
+                else: aw += 1
+            else:
+                result_code = "D"
+                dr += 1
+            h2h_matches.append({
+                "date":      str(r["match_date"]) if r["match_date"] else None,
+                "gameweek":  r["gameweek"],
+                "home_team": r["home_team"],
+                "away_team": r["away_team"],
+                "score":     f"{hs}-{as_}",
+                "result":    result_code,
+                "league":    r["league"],
+            })
+
+        return {
+            "home": {
+                "team_id":  home_team_id,
+                "form":     recent_results(home_team_id),
+                "stats":    season_stats(home_team_id),
+                "upcoming": upcoming_fixtures(home_team_id, away_team_id),
+            },
+            "away": {
+                "team_id":  away_team_id,
+                "form":     recent_results(away_team_id),
+                "stats":    season_stats(away_team_id),
+                "upcoming": upcoming_fixtures(away_team_id, home_team_id),
+            },
+            "h2h": {
+                "summary": {"home_wins": hw, "draws": dr, "away_wins": aw, "total": hw + dr + aw},
+                "matches":  h2h_matches,
+            },
+        }
+    finally:
+        conn.close()
+
 
 @router.get("")
 def get_markets(

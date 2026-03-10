@@ -16,6 +16,7 @@ Endpoints:
 
 import time
 import logging
+import threading
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
@@ -63,7 +64,12 @@ def prediction_status():
 
 
 def _run_training_in_background():
-    """Run inside FastAPI BackgroundTasks so the HTTP response returns immediately."""
+    """
+    Runs in a daemon Thread — completely independent of the HTTP request lifecycle.
+    This means training continues even if the user navigates away from the page.
+    FastAPI BackgroundTasks can be cancelled when the request connection drops;
+    a threading.Thread is not affected by that.
+    """
     global _training_state
     _training_state = {"status": "running", "started_at": time.time()}
     try:
@@ -74,16 +80,18 @@ def _run_training_in_background():
 
 
 @router.post("/train")
-def train(background_tasks: BackgroundTasks, req: TrainRequest = None):
+def train(req: TrainRequest = None):
     """
-    Kick off model training in the background.
-    Returns immediately with 202 — clients should poll /training-status.
-    May take 30-120 seconds depending on data size.
+    Kick off model training in a background thread.
+    Returns immediately — clients should poll /training-status for progress.
+    Training continues even if the user navigates away (daemon thread).
     """
     if _training_state.get("status") == "running":
-        return {"started": False, "message": "Training already in progress. Poll /training-status."}
-    background_tasks.add_task(_run_training_in_background)
-    return {"started": True, "message": "Training started in background. Poll /training-status for progress."}
+        elapsed = int(time.time() - _training_state.get("started_at", time.time()))
+        return {"started": False, "message": f"Training already running ({elapsed}s elapsed). Poll /training-status."}
+    t = threading.Thread(target=_run_training_in_background, daemon=True, name="model-training")
+    t.start()
+    return {"started": True, "message": "Training started. Poll /training-status for progress."}
 
 
 @router.get("/training-status")
