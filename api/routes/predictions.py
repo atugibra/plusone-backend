@@ -2,14 +2,20 @@
 Predictions API Route
 ======================
 Endpoints:
-  GET  /api/predictions/status      → model status + accuracy
-  POST /api/predictions/train       → train/retrain from all DB history
-  POST /api/predictions/predict     → rich prediction for one matchup (by team IDs)
-  GET  /api/predictions/upcoming    → predict all upcoming fixtures
-  GET  /api/predictions/fixtures    → list upcoming fixtures to pick from
-  POST /api/predictions/generate    → legacy rule-based prediction (by team names)
+  GET  /api/predictions/status         → model status + accuracy
+  POST /api/predictions/train          → train/retrain from all DB history
+  POST /api/predictions/predict        → rich prediction for one matchup (by team IDs)
+  GET  /api/predictions/upcoming       → predict all upcoming fixtures
+  GET  /api/predictions/public         → public-facing predictions with bet recommendations
+  GET  /api/predictions/fixtures       → list upcoming fixtures to pick from
+  POST /api/predictions/generate       → legacy rule-based prediction (by team names)
+  GET  /api/predictions/results        → recent completed match results
+  GET  /api/predictions/accuracy       → accuracy trend by gameweek
+  GET  /api/predictions/training-status → poll background training status
 """
 
+import time
+import logging
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
@@ -17,11 +23,14 @@ from database import get_connection
 import ml.prediction_engine as engine
 from ml.prediction_engine import predict_upcoming_fast
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 # Tracks background training state so /status can report errors
 _training_state: dict = {}
 
+# Simple in-memory cache for public predictions (15-minute TTL)
+_public_cache: dict = {"data": None, "expires_at": 0.0}
 
 
 # ─── Request models ───────────────────────────────────────────────────────────
@@ -56,7 +65,7 @@ def prediction_status():
 def _run_training_in_background():
     """Run inside FastAPI BackgroundTasks so the HTTP response returns immediately."""
     global _training_state
-    _training_state = {"status": "running", "started_at": __import__('time').time()}
+    _training_state = {"status": "running", "started_at": time.time()}
     try:
         result = engine.train_model()
         _training_state = {"status": "done", "result": result}
@@ -86,11 +95,64 @@ def training_status():
     return state
 
 
+# ─── Auto-log helper ──────────────────────────────────────────────────────────
+
+def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
+    """
+    Fire-and-forget: write one prediction result to prediction_log.
+    Called as a BackgroundTask after every /predict and /upcoming call.
+    Never raises — failure is logged but ignored so the main response isn't affected.
+    """
+    try:
+        match_info   = result.get("match", {})
+        probs        = result.get("probabilities", {})
+        home_win_p   = probs.get("home_win")
+        draw_p       = probs.get("draw")
+        away_win_p   = probs.get("away_win")
+        predicted    = result.get("predicted_outcome")
+        confidence   = result.get("confidence")
+        conf_score   = result.get("confidence_score")
+        home_team    = match_info.get("home_team") or result.get("home_team")
+        away_team    = match_info.get("away_team") or result.get("away_team")
+        league       = match_info.get("league") or result.get("league")
+        match_date   = match_info.get("date") or match_info.get("match_date")
+        home_xg      = (result.get("expected_goals") or {}).get("home_xg")
+        away_xg      = (result.get("expected_goals") or {}).get("away_xg")
+        pred_score   = (result.get("expected_goals") or {}).get("predicted_score")
+
+        if not predicted or not home_team or not away_team:
+            return
+
+        conn = get_connection()
+        cur  = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO prediction_log
+                    (match_id, home_team, away_team, league, match_date,
+                     predicted, confidence, confidence_score,
+                     home_win_prob, draw_prob, away_win_prob,
+                     home_xg, away_xg, predicted_score)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
+            """, (
+                match_id, home_team, away_team, league, match_date,
+                predicted, confidence, conf_score,
+                home_win_p, draw_p, away_win_p,
+                home_xg, away_xg, pred_score,
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("Could not log prediction to prediction_log: %s", exc)
+
+
 @router.post("/predict")
-def predict(req: PredictRequest):
+def predict(req: PredictRequest, background_tasks: BackgroundTasks):
     """
     Predict the outcome of a specific match by team IDs.
     Returns rich output: probabilities, xG, key factors, H2H, team comparison.
+    Automatically logs the prediction to prediction_log (non-blocking).
     Returns 422 if the model has not been trained yet.
     """
     if req.home_team_id == req.away_team_id:
@@ -104,14 +166,17 @@ def predict(req: PredictRequest):
         )
         if "error" in result:
             error_msg = result["error"]
-            # Return 422 for untrained model (not a server fault)
             if "not trained" in error_msg.lower() or "no model" in error_msg.lower():
                 raise HTTPException(
                     status_code=422,
                     detail="Model not trained yet. Click 'Train Model' first, then try again."
                 )
-            # For any other prediction-related error, return 422 as it's likely due to bad input or missing data
             raise HTTPException(status_code=422, detail=error_msg)
+
+        # Auto-log the prediction (best-effort, non-blocking)
+        match_id = result.get("match", {}).get("match_id") or result.get("match_id")
+        background_tasks.add_task(_log_prediction_to_db, result, match_id)
+
         return result
     except HTTPException:
         raise
@@ -121,12 +186,22 @@ def predict(req: PredictRequest):
 
 @router.get("/upcoming")
 def upcoming_predictions(
+    background_tasks: BackgroundTasks,
     league_id: Optional[int] = Query(None, description="Filter by league ID"),
     limit:     int           = Query(50,   description="Max fixtures to predict"),
 ):
-    """Predict all upcoming unplayed fixtures using the fast bulk-load path."""
+    """Predict all upcoming unplayed fixtures using the fast bulk-load path.
+    Automatically logs every prediction to prediction_log (non-blocking)."""
     try:
         results = predict_upcoming_fast(league_id=league_id, limit=limit)
+
+        # Auto-log all predictions in background
+        def _bulk_log():
+            for r in results:
+                _log_prediction_to_db(r)
+
+        background_tasks.add_task(_bulk_log)
+
         return {
             "count":       len(results),
             "predictions": results,
@@ -134,6 +209,109 @@ def upcoming_predictions(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ─── Public predictions endpoint (bet recommendations) ───────────────────────
+
+def _derive_best_bets(predictions: list) -> list:
+    """
+    Add bet_recommendation field to each prediction.
+    Logic:
+    - High confidence + lead probability > 55% → "Strong pick: {outcome}"
+    - Medium confidence + lead prob > 48% → "Value bet: {outcome}"
+    - Both teams strong attack (predicted score >=2 goals each side) → "Both Teams to Score"
+    - Under-valued draw (draw_prob > 35% but predicted outcome isn't draw) → flag it
+    """
+    enriched = []
+    for p in predictions:
+        probs    = p.get("probabilities", {})
+        hw       = probs.get("home_win", 0.33)
+        dr       = probs.get("draw", 0.33)
+        aw       = probs.get("away_win", 0.34)
+        conf     = p.get("confidence", "Low")
+        outcome  = p.get("predicted_outcome", "")
+        xg       = p.get("expected_goals", {}) or {}
+        home_xg  = float(xg.get("home_xg") or 0)
+        away_xg  = float(xg.get("away_xg") or 0)
+        match    = p.get("match", {}) or {}
+
+        bets = []
+
+        # Main outcome bet
+        lead_prob = max(hw, dr, aw)
+        if conf == "High" and lead_prob >= 0.55:
+            bets.append({
+                "bet":  f"✅ Strong Pick — {outcome}",
+                "prob": round(lead_prob * 100),
+                "tier": "high",
+            })
+        elif conf in ("High", "Medium") and lead_prob >= 0.48:
+            bets.append({
+                "bet":  f"💡 Value Bet — {outcome}",
+                "prob": round(lead_prob * 100),
+                "tier": "medium",
+            })
+
+        # BTTS (Both Teams to Score)
+        if home_xg >= 1.1 and away_xg >= 1.0:
+            bets.append({
+                "bet":  "⚽ Both Teams to Score (recommended)",
+                "prob": None,
+                "tier": "btts",
+            })
+
+        # Undervalued draw warning
+        if dr >= 0.34 and outcome != "Draw":
+            bets.append({
+                "bet":  f"⚠️ Draw value — {round(dr * 100)}% probability, consider 1X or X2",
+                "prob": round(dr * 100),
+                "tier": "draw_value",
+            })
+
+        enriched.append({**p, "bet_recommendations": bets})
+    return enriched
+
+
+@router.get("/public")
+def public_predictions(
+    league_id: Optional[int] = Query(None, description="Filter by league ID"),
+    limit:     int           = Query(30,   description="Max predictions"),
+):
+    """
+    Public-facing upcoming match predictions with bet recommendations.
+    Results are cached for 15 minutes to reduce DB load.
+    No authentication required.
+    """
+    global _public_cache
+    now = time.time()
+
+    # Return cached data if still fresh
+    if _public_cache["data"] is not None and now < _public_cache["expires_at"]:
+        data = _public_cache["data"]
+        if league_id:
+            data = [p for p in data if (p.get("match") or {}).get("league_id") == league_id]
+        return {"count": len(data), "predictions": data[:limit], "cached": True}
+
+    try:
+        raw = predict_upcoming_fast(league_id=None, limit=100)
+        enriched = _derive_best_bets(raw)
+
+        # Cache result for 15 minutes
+        _public_cache = {"data": enriched, "expires_at": now + 900}
+
+        if league_id:
+            enriched = [p for p in enriched if (p.get("match") or {}).get("league_id") == league_id]
+
+        return {
+            "count":       len(enriched[:limit]),
+            "predictions": enriched[:limit],
+            "cached":      False,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Fixtures list ────────────────────────────────────────────────────────────
 
 @router.get("/fixtures")
 def list_upcoming_fixtures(
@@ -193,7 +371,6 @@ def list_prediction_results(
     """
     Return recent completed matches from the DB with real scores.
     Used by the frontend 'Predictions' page to show past match results.
-    Each row has home/away team, final score, league, match date, and gameweek.
     """
     conn = get_connection()
     cur  = conn.cursor()
@@ -235,8 +412,7 @@ def prediction_accuracy_trend(
 ):
     """
     Compute accuracy trend grouped by gameweek from real match data.
-    Uses the legacy rule-based engine to score past predictions vs actual results.
-    Returns list of {week, predictions, correct, accuracy} dicts for chart display.
+    Uses standings win-rate heuristic to score past predictions vs actual results.
     """
     conn = get_connection()
     cur  = conn.cursor()
@@ -305,24 +481,26 @@ def _safe_div(a, b, default=0.0):
 
 
 def _get_team_stats(cur, team_name: str):
+    # Fixed: removed non-existent scraped_at column; use season_id DESC for ordering
     cur.execute("""
         SELECT ts.goals, ts.assists, ts.games, ts.possession, ts.avg_age
         FROM   team_squad_stats ts
         JOIN   teams t ON t.id = ts.team_id
         WHERE  LOWER(t.name) LIKE LOWER(%s) AND ts.split = 'for'
-        ORDER  BY ts.scraped_at DESC LIMIT 1
+        ORDER  BY ts.season_id DESC LIMIT 1
     """, (f"%{team_name}%",))
     return cur.fetchone()
 
 
 def _get_team_standings(cur, team_name: str):
+    # Fixed: removed non-existent scraped_at column; use season_id DESC for ordering
     cur.execute("""
         SELECT ls.wins, ls.ties, ls.losses, ls.games,
                ls.goals_for, ls.goals_against, ls.points, ls.rank
         FROM   league_standings ls
         JOIN   teams t ON t.id = ls.team_id
         WHERE  LOWER(t.name) LIKE LOWER(%s)
-        ORDER  BY ls.scraped_at DESC LIMIT 1
+        ORDER  BY ls.season_id DESC LIMIT 1
     """, (f"%{team_name}%",))
     return cur.fetchone()
 

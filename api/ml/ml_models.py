@@ -144,6 +144,17 @@ class EnsemblePredictor:
         dr = prob_map.get(1, 0.33)
         aw = prob_map.get(2, 0.34)
 
+        # ── Probability floor ──────────────────────────────────────────────────
+        # XGBoost collapses one class to near-zero when the team has no squad
+        # or standings data in the DB (all-zero feature vector). This produced
+        # the "0% Home Win" bug seen in production. Apply a 5% floor per class
+        # then re-normalise so probabilities still sum to 1.0.
+        MIN_PROB = 0.05
+        hw = max(hw, MIN_PROB)
+        dr = max(dr, MIN_PROB)
+        aw = max(aw, MIN_PROB)
+        # ──────────────────────────────────────────────────────────────────────
+
         # Normalize to sum exactly to 1
         total = hw + dr + aw
         hw, dr, aw = hw / total, dr / total, aw / total
@@ -152,9 +163,9 @@ class EnsemblePredictor:
         predicted_label = LABELS[predicted_int]
         confidence_score = max(hw, dr, aw)
 
-        if confidence_score >= 0.60:
+        if confidence_score >= 0.55:
             confidence = "High"
-        elif confidence_score >= 0.45:
+        elif confidence_score >= 0.42:
             confidence = "Medium"
         else:
             confidence = "Low"
