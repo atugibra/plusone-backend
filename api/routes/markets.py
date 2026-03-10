@@ -505,26 +505,30 @@ def scan_arbitrage(req: ArbRequest):
 @router.get("/dc/status")
 def get_dc_status():
     """Current DC model status."""
-    return dc_status()
+    st = dc_status()
+    # If the background thread is currently training, tell the frontend so polling continues
+    if _dc_training_state.get("status") == "running":
+        st["training_status"] = "running"
+    elif "status" in _dc_training_state:
+        st["training_status"] = _dc_training_state["status"]
+    return st
 
 
 # ─── POST /api/markets/dc/train ──────────────────────────────────────────────
 
 @router.post("/dc/train")
-def train_dc(background_tasks: BackgroundTasks):
+def train_dc():
     """
     Train (or retrain) the DC + Elo + xG ensemble from DB data.
-    Runs asynchronously — check /dc/status for completion.
+    Runs asynchronously in a daemon thread so it survives frontend disconnects.
     """
-    def _train():
-        result = train_dc_model()
-        if result.get("trained"):
-            log.info("DC retrain complete: %d matches", result.get("n_matches", 0))
-        else:
-            log.error("DC retrain failed: %s", result.get("error"))
+    global _dc_training_state
+    if _dc_training_state.get("status") == "running":
+        return {"message": "DC model training is already running."}
 
-    background_tasks.add_task(_train)
-    return {"message": "DC model training started in background. Check /api/markets/dc/status."}
+    thread = threading.Thread(target=_run_dc_training, daemon=True)
+    thread.start()
+    return {"message": "DC model training started in background thread."}
 
 
 # ─── GET /api/markets/dc/predict ─────────────────────────────────────────────

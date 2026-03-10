@@ -28,7 +28,7 @@ def _load_completed(cur, league: str = None) -> pd.DataFrame:
     """Load completed predictions from prediction_log table."""
     query = """
         SELECT
-            id, home_team, away_team, league, match_date, gameweek,
+            id, home_team, away_team, league, match_date,
             prob_home_win, prob_draw, prob_away_win,
             predicted_outcome, actual_outcome, correct,
             market_home_odds, market_draw_odds, market_away_odds,
