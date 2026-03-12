@@ -26,22 +26,23 @@ log    = logging.getLogger(__name__)
 
 def _load_completed(cur, league: str = None) -> pd.DataFrame:
     """Load completed predictions from prediction_log table."""
+    # NOTE: prediction_log columns are: home_win_prob, draw_prob, away_win_prob,
+    #       actual (text outcome), predicted (text outcome), correct (bool)
     query = """
         SELECT
             id, home_team, away_team, league, match_date,
-            prob_home_win, prob_draw, prob_away_win,
-            predicted_outcome, actual_outcome, correct,
-            market_home_odds, market_draw_odds, market_away_odds,
-            confidence_score
+            home_win_prob, draw_prob, away_win_prob,
+            predicted, actual, correct,
+            confidence, confidence_score
         FROM prediction_log
         WHERE actual IS NOT NULL
-          AND home_win_prob   IS NOT NULL
-          AND draw_prob       IS NOT NULL
-          AND away_win_prob   IS NOT NULL
+          AND home_win_prob IS NOT NULL
+          AND draw_prob     IS NOT NULL
+          AND away_win_prob IS NOT NULL
     """
     params = []
     if league:
-        query  += " AND league = %s"
+        query += " AND league = %s"
         params.append(league)
     query += " ORDER BY match_date ASC"
 
@@ -57,13 +58,14 @@ def _load_completed(cur, league: str = None) -> pd.DataFrame:
 
     df = pd.DataFrame([dict(r) for r in rows])
 
-    # Map column names — prediction_log uses home_win_prob etc
-    col_map = {
+    # Rename to the names expected by MetricsEngine
+    df = df.rename(columns={
         "home_win_prob": "prob_home_win",
         "draw_prob":     "prob_draw",
         "away_win_prob": "prob_away_win",
-    }
-    df = df.rename(columns=col_map)
+        "actual":        "actual_outcome",
+        "predicted":     "predicted_outcome",
+    })
 
     # Map actual text outcome → int (0=Away Win, 1=Draw, 2=Home Win)
     outcome_map = {
@@ -73,16 +75,11 @@ def _load_completed(cur, league: str = None) -> pd.DataFrame:
     }
     if "actual_outcome" in df.columns:
         df["actual_int"] = df["actual_outcome"].astype(str).map(outcome_map)
-    elif "actual" in df.columns:
-        df["actual_int"] = df["actual"].astype(str).map(outcome_map)
     else:
         return pd.DataFrame()
 
-    # Map predicted outcome similarly
     if "predicted_outcome" in df.columns:
         df["predicted_int"] = df["predicted_outcome"].astype(str).map(outcome_map)
-    elif "predicted" in df.columns:
-        df["predicted_int"] = df["predicted"].astype(str).map(outcome_map)
 
     df = df.dropna(subset=["actual_int", "prob_home_win", "prob_draw", "prob_away_win"])
     return df

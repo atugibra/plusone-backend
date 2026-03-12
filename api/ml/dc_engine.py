@@ -30,6 +30,7 @@ from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 
 from database import get_connection
+from ml.model_store import save_to_db, load_from_db
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -408,9 +409,9 @@ class DCPredictor:
             JOIN teams at ON at.id = m.away_team_id
             WHERE m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
-              AND m.match_date >= CURRENT_DATE - INTERVAL '2 years'
-            ORDER BY m.match_date ASC
-            LIMIT 8000
+              AND m.match_date >= CURRENT_DATE - INTERVAL '3 months'
+            ORDER BY m.match_date DESC
+            LIMIT 1500
         """)
         rows = cur.fetchall()
         if not rows:
@@ -535,7 +536,8 @@ def get_dc_predictor() -> DCPredictor | None:
 def train_dc_model() -> dict:
     """
     Train (or retrain) the DC ensemble from DB data.
-    Safe to call from a FastAPI BackgroundTask.
+    After training, automatically saves the model to Supabase so it
+    survives Railway/Render redeploys.
     """
     global _dc_predictor, _dc_meta
     import time
@@ -555,6 +557,12 @@ def train_dc_model() -> dict:
             "elapsed_s":  elapsed,
         }
         log.info("DC model trained: %d matches, %.1fs", predictor.n_matches, elapsed)
+        # — Persist to Supabase so the model survives redeploys —
+        saved = save_to_db(predictor, name="dc_model")
+        if saved:
+            log.info("DC model saved to Supabase ml_models table.")
+        else:
+            log.warning("DC model could not be saved to Supabase (will retrain on next cold start).")
         return {"trained": True, **_dc_meta}
     except Exception as e:
         log.error("DC training error: %s", e)
@@ -581,14 +589,34 @@ def dc_status() -> dict:
     }
 
 
-# Auto-train on import (non-blocking — only if not already trained)
+# Auto-load or auto-train on startup (non-blocking daemon thread)
 def _auto_train():
+    global _dc_predictor, _dc_meta
+    # 1️⃣  Try loading the saved model from Supabase first (fast cold-start)
+    try:
+        loaded = load_from_db(name="dc_model")
+        if loaded is not None and getattr(loaded, "fitted", False):
+            _dc_predictor = loaded
+            # Reconstruct minimal meta from the loaded model
+            _dc_meta = {
+                "n_matches":  getattr(loaded, "n_matches", 0),
+                "trained_at": "(loaded from Supabase)",
+                "elapsed_s":  0,
+            }
+            log.info("DC model loaded from Supabase (%d teams).", len(loaded.team_names))
+            return
+    except Exception as e:
+        log.warning("DC Supabase load failed, will train from scratch: %s", e)
+
+    # 2️⃣  No saved model found — train from DB data
     try:
         result = train_dc_model()
         if result.get("trained"):
             log.info("DC auto-train complete: %d matches", result.get("n_matches", 0))
+        else:
+            log.warning("DC auto-train failed: %s", result.get("error"))
     except Exception as e:
-        log.warning("DC auto-train failed (will retry on next /train call): %s", e)
+        log.warning("DC auto-train exception (will retry on next /train call): %s", e)
 
 import threading
 threading.Thread(target=_auto_train, daemon=True).start()

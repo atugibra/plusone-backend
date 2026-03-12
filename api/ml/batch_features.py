@@ -157,9 +157,9 @@ class DataCache:
                    home_score, away_score, match_date
             FROM matches
             WHERE home_score IS NOT NULL AND away_score IS NOT NULL
-              AND match_date >= CURRENT_DATE - INTERVAL '2 years'
+              AND match_date >= CURRENT_DATE - INTERVAL '6 months'
             ORDER BY match_date DESC
-            LIMIT 5000
+            LIMIT 1500
         """)
         self.all_matches: List[dict] = [dict(r) for r in cur.fetchall()]
 

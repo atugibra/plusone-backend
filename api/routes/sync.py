@@ -62,6 +62,44 @@ def safe_age_int(val):
 
 router = APIRouter()
 
+
+def _auto_evaluate_predictions(conn) -> int:
+    """
+    Grade all unevaluated prediction_log rows whose match is now complete.
+    Called automatically after each sync so performance metrics stay current.
+    Returns the number of rows updated.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT pl.id, pl.predicted, m.home_score, m.away_score
+            FROM prediction_log pl
+            JOIN matches m ON m.id = pl.match_id
+            WHERE pl.actual IS NULL
+              AND m.home_score IS NOT NULL
+              AND m.away_score IS NOT NULL
+        """)
+        rows = cur.fetchall()
+        updated = 0
+        for r in rows:
+            hs = int(r["home_score"]); as_ = int(r["away_score"])
+            if hs > as_:  actual = "Home Win"
+            elif as_ > hs: actual = "Away Win"
+            else:          actual = "Draw"
+            correct = (actual == r["predicted"])
+            cur.execute("""
+                UPDATE prediction_log
+                SET actual = %s, correct = %s, evaluated_at = NOW()
+                WHERE id = %s
+            """, (actual, correct, r["id"]))
+            updated += 1
+        conn.commit()
+        return updated
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        return 0
+
 class TableData(BaseModel):
     headers: List[str] = []
     rows: List[List[Any]] = []
@@ -407,7 +445,9 @@ def sync_all(payload: SyncPayload):
         conn.commit()
         log_scrape(cur, league_id, season_id, "sync_all", fx + st + pl + sd + ha, 0)
         conn.commit()
-        return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha}
+        # Auto-evaluate predictions whose matches just received scores
+        evaluated = _auto_evaluate_predictions(conn)
+        return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "predictions_evaluated": evaluated}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -427,7 +467,9 @@ def sync_fixtures(payload: SyncPayload):
             rows.extend(tables_to_fixtures(payload.tables))
         inserted = _insert_fixtures(cur, league_id, season_id, payload.league, rows)
         conn.commit()
-        return {"success": True, "matches_inserted": inserted}
+        # Auto-evaluate predictions whose matches just received scores
+        evaluated = _auto_evaluate_predictions(conn)
+        return {"success": True, "matches_inserted": inserted, "predictions_evaluated": evaluated}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))

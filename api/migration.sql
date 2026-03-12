@@ -1,70 +1,53 @@
 -- ============================================================
--- PlusOne Database Migration
--- Run this ONCE in the Supabase SQL Editor
+-- PlusOne Backend SQL Migrations
+-- Run once in the Supabase SQL Editor
 -- ============================================================
 
--- 1. Add updated_at to matches table (for incremental sync tracking)
-ALTER TABLE matches
-  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+-- ─── 1. ml_models table (DC Model Supabase Persistence) ───────────────────────
+-- Stores the serialised DCPredictor (joblib bytes) so it survives Railway redeploys.
 
--- Backfill existing rows with match_date as a reasonable updated_at value
-UPDATE matches
-  SET updated_at = COALESCE(match_date::timestamptz, NOW())
-  WHERE updated_at IS NULL;
+CREATE TABLE IF NOT EXISTS ml_models (
+    id             SERIAL PRIMARY KEY,
+    name           TEXT NOT NULL UNIQUE DEFAULT 'dc_model',
+    model_bytes    BYTEA NOT NULL,
+    n_samples      INT,
+    train_accuracy FLOAT,
+    cv_accuracy    FLOAT,
+    n_features     INT,
+    created_at     TIMESTAMPTZ DEFAULT NOW()
+);
 
--- Index for fast incremental sync queries
-CREATE INDEX IF NOT EXISTS matches_updated_at_idx ON matches(updated_at DESC);
 
--- 2. Verify prediction_log has all required columns
--- (Already confirmed — this is just a safety check)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'prediction_log' AND column_name = 'home_win_prob'
-  ) THEN
-    ALTER TABLE prediction_log ADD COLUMN home_win_prob FLOAT;
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'prediction_log' AND column_name = 'draw_prob'
-  ) THEN
-    ALTER TABLE prediction_log ADD COLUMN draw_prob FLOAT;
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'prediction_log' AND column_name = 'away_win_prob'
-  ) THEN
-    ALTER TABLE prediction_log ADD COLUMN away_win_prob FLOAT;
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'prediction_log' AND column_name = 'home_xg'
-  ) THEN
-    ALTER TABLE prediction_log ADD COLUMN home_xg FLOAT;
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'prediction_log' AND column_name = 'away_xg'
-  ) THEN
-    ALTER TABLE prediction_log ADD COLUMN away_xg FLOAT;
-  END IF;
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'prediction_log' AND column_name = 'predicted_score'
-  ) THEN
-    ALTER TABLE prediction_log ADD COLUMN predicted_score TEXT;
-  END IF;
-END $$;
+-- ─── 2. prediction_log UNIQUE constraint on match_id ──────────────────────────
+-- Required for ON CONFLICT (match_id) DO NOTHING deduplication in /upcoming
+-- Only run this if the constraint doesn't already exist:
 
--- Indexes for efficient querying
-CREATE INDEX IF NOT EXISTS prediction_log_match_id_idx  ON prediction_log(match_id);
-CREATE INDEX IF NOT EXISTS prediction_log_correct_idx   ON prediction_log(correct);
-CREATE INDEX IF NOT EXISTS prediction_log_date_idx      ON prediction_log(match_date);
-CREATE INDEX IF NOT EXISTS prediction_log_created_idx   ON prediction_log(created_at DESC);
+ALTER TABLE prediction_log
+  ADD CONSTRAINT prediction_log_match_id_unique UNIQUE (match_id);
 
--- 3. Verify the matches table now has updated_at
-SELECT column_name, data_type
-FROM information_schema.columns
-WHERE table_name = 'matches' AND column_name = 'updated_at';
--- Should return 1 row: updated_at | timestamp with time zone
+
+-- ─── 3. prediction_log table (if not created yet) ─────────────────────────────
+-- Run this block only if prediction_log doesn't exist in your database.
+
+CREATE TABLE IF NOT EXISTS prediction_log (
+    id               SERIAL PRIMARY KEY,
+    match_id         INT UNIQUE,           -- references matches(id)
+    home_team        TEXT NOT NULL,
+    away_team        TEXT NOT NULL,
+    league           TEXT,
+    match_date       DATE,
+    predicted        TEXT NOT NULL,        -- 'Home Win' / 'Draw' / 'Away Win'
+    confidence       TEXT,                 -- 'High' / 'Medium' / 'Low'
+    confidence_score FLOAT,
+    home_win_prob    FLOAT,
+    draw_prob        FLOAT,
+    away_win_prob    FLOAT,
+    actual           TEXT,                 -- filled in by evaluate after match
+    correct          BOOLEAN,              -- filled in by evaluate
+    evaluated_at     TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS prediction_log_match_id_idx ON prediction_log(match_id);
+CREATE INDEX IF NOT EXISTS prediction_log_correct_idx  ON prediction_log(correct);
+CREATE INDEX IF NOT EXISTS prediction_log_date_idx     ON prediction_log(match_date);

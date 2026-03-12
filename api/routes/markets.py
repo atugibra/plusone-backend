@@ -45,6 +45,43 @@ def _run_dc_training():
         log.error("DC training exception: %s", e)
 
 
+# ─── Helper: log DC prediction to prediction_log ──────────────────────────────
+
+def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
+                        league: str, match_date, predicted_outcome: str,
+                        confidence: str, confidence_score: float,
+                        home_win_prob: float, draw_prob: float,
+                        away_win_prob: float):
+    """
+    Write one prediction row to prediction_log (if not already logged).
+    Uses ON CONFLICT (match_id) DO NOTHING so repeated /upcoming calls
+    don't create duplicate rows for the same fixture.
+    Safe to call from a background thread.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO prediction_log
+                    (match_id, home_team, away_team, league, match_date,
+                     predicted, confidence, confidence_score,
+                     home_win_prob, draw_prob, away_win_prob)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (match_id) DO NOTHING
+            """, (
+                match_id, home_team, away_team, league, match_date,
+                predicted_outcome, confidence, round(confidence_score, 4),
+                round(home_win_prob, 4), round(draw_prob, 4), round(away_win_prob, 4),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.debug("prediction_log insert skipped: %s", exc)
+
+
+
 # ─── 15-min cache for /upcoming (makes Free Picks near-instant after first hit) 
 _upcoming_cache: dict = {"data": None, "expires_at": 0.0}
 _UPCOMING_TTL = 15 * 60   # seconds
@@ -170,7 +207,7 @@ def upcoming_dc_predictions(
             pred_h = max(0, round(xg_h))
             pred_a = max(0, round(xg_a))
 
-            results.append({
+            result_entry = {
                 "predicted_outcome": outcome,
                 "confidence":        confidence,
                 "confidence_score":  round(lead, 4),
@@ -199,7 +236,20 @@ def upcoming_dc_predictions(
                 "model_breakdown": pred.get("models", {}),
                 "bet_recommendations": _dc_bet_recommendations(cal, xg_h, xg_a),
                 "engine": "dixon_coles",
-            })
+            }
+            results.append(result_entry)
+
+            # Auto-log to prediction_log in a background thread (non-blocking)
+            import threading
+            threading.Thread(
+                target=_log_prediction_bg,
+                args=(
+                    fx["id"], fx["home_team"], fx["away_team"],
+                    fx["league"], fx["match_date"], outcome,
+                    confidence, lead, hw, dr, aw,
+                ),
+                daemon=True,
+            ).start()
         except Exception as exc:
             log.debug("DC skip fixture %s vs %s: %s", fx["home_team"], fx["away_team"], exc)
             continue
