@@ -202,7 +202,8 @@ def upcoming_predictions(
         # Auto-log all predictions in background
         def _bulk_log():
             for r in results:
-                _log_prediction_to_db(r)
+                mid = r.get("fixture_id") or (r.get("match") or {}).get("match_id")
+                _log_prediction_to_db(r, match_id=mid)
 
         background_tasks.add_task(_bulk_log)
 
