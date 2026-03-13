@@ -63,17 +63,21 @@ def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
         cur = conn.cursor()
         try:
             cur.execute("""
-                INSERT INTO prediction_log
-                    (match_id, home_team, away_team, league, match_date,
-                     predicted, confidence, confidence_score,
-                     home_win_prob, draw_prob, away_win_prob)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (
-                match_id, home_team, away_team, league, match_date,
-                predicted_outcome, confidence, round(confidence_score, 4),
-                round(home_win_prob, 4), round(draw_prob, 4), round(away_win_prob, 4),
-            ))
+                cur.execute("""
+                    INSERT INTO prediction_log
+                        (match_id, home_team, away_team, league, match_date,
+                         predicted, confidence, confidence_score,
+                         home_win_prob, draw_prob, away_win_prob)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (
+                    match_id, home_team, away_team, league, match_date,
+                    predicted_outcome, confidence,
+                    float(confidence_score),   
+                    float(home_win_prob),       
+                    float(draw_prob),          
+                    float(away_win_prob),     
+                ))
             conn.commit()
         finally:
             conn.close()
