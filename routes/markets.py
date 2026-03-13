@@ -47,42 +47,34 @@ def _run_dc_training():
 
 # ─── Helper: log DC prediction to prediction_log ──────────────────────────────
 
-def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
-                        league: str, match_date, predicted_outcome: str,
-                        confidence: str, confidence_score: float,
-                        home_win_prob: float, draw_prob: float,
-                        away_win_prob: float):
-    """
-    Write one prediction row to prediction_log (if not already logged).
-    Uses ON CONFLICT (match_id) DO NOTHING so repeated /upcoming calls
-    don't create duplicate rows for the same fixture.
-    Safe to call from a background thread.
-    """
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                cur.execute("""
-                    INSERT INTO prediction_log
-                        (match_id, home_team, away_team, league, match_date,
-                         predicted, confidence, confidence_score,
-                         home_win_prob, draw_prob, away_win_prob)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                """, (
-                    match_id, home_team, away_team, league, match_date,
-                    predicted_outcome, confidence,
-                    float(confidence_score),   
-                    float(home_win_prob),       
-                    float(draw_prob),          
-                    float(away_win_prob),     
-                ))
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        log.warning("prediction_log insert failed: %s", exc)
+          def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
+                                  league: str, match_date, predicted_outcome: str,
+                                  confidence: str, confidence_score: float,
+                                  home_win_prob: float, draw_prob: float,
+                                  away_win_prob: float):
+              try:
+                  conn = get_connection()
+                  cur = conn.cursor()
+                  try:
+                      cur.execute("""
+                          INSERT INTO prediction_log
+                              (match_id, home_team, away_team, league, match_date,
+                               predicted, confidence, confidence_score,
+                               home_win_prob, draw_prob, away_win_prob)
+                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                          ON CONFLICT DO NOTHING
+                      """, (
+                          int(match_id),
+                          str(home_team), str(away_team), str(league), match_date,
+                          str(predicted_outcome), str(confidence),
+                          float(confidence_score),
+                          float(home_win_prob), float(draw_prob), float(away_win_prob),
+                      ))
+                      conn.commit()
+                  finally:
+                      conn.close()
+              except Exception as exc:
+                  log.warning("prediction_log insert failed: %s", exc)
 
 
 
