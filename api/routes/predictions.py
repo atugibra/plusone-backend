@@ -112,6 +112,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
     Never raises — failure is logged but ignored so the main response isn't affected.
     """
     try:
+        match_id     = match_id or result.get("fixture_id") or result.get("match_id")
         match_info   = result.get("match", {})
         probs        = result.get("probabilities", {})
         home_win_p   = probs.get("home_win")
@@ -123,7 +124,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         home_team    = match_info.get("home_team") or result.get("home_team")
         away_team    = match_info.get("away_team") or result.get("away_team")
         league       = match_info.get("league") or result.get("league")
-        match_date   = match_info.get("date") or match_info.get("match_date")
+        match_date   = match_info.get("date") or match_info.get("match_date") or result.get("match_date")
         home_xg      = (result.get("expected_goals") or {}).get("home_xg")
         away_xg      = (result.get("expected_goals") or {}).get("away_xg")
         pred_score   = (result.get("expected_goals") or {}).get("predicted_score")
