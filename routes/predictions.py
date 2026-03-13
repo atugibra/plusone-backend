@@ -106,27 +106,21 @@ def training_status():
 # ─── Auto-log helper ──────────────────────────────────────────────────────────
 
 def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
-    """
-    Fire-and-forget: write one prediction result to prediction_log.
-    Called as a BackgroundTask after every /predict and /upcoming call.
-    Never raises — failure is logged but ignored so the main response isn't affected.
-    """
     try:
-        match_info   = result.get("match", {})
-        probs        = result.get("probabilities", {})
-        home_win_p   = probs.get("home_win")
-        draw_p       = probs.get("draw")
-        away_win_p   = probs.get("away_win")
-        predicted    = result.get("predicted_outcome")
-        confidence   = result.get("confidence")
-        conf_score   = result.get("confidence_score")
-        home_team    = match_info.get("home_team") or result.get("home_team")
-        away_team    = match_info.get("away_team") or result.get("away_team")
-        league       = match_info.get("league") or result.get("league")
-        match_date   = match_info.get("date") or match_info.get("match_date")
-        home_xg      = (result.get("expected_goals") or {}).get("home_xg")
-        away_xg      = (result.get("expected_goals") or {}).get("away_xg")
-        pred_score   = (result.get("expected_goals") or {}).get("predicted_score")
+        match_info = result.get("match", {})
+        probs      = result.get("probabilities", {})
+
+        home_team  = match_info.get("home_team") or result.get("home_team")
+        away_team  = match_info.get("away_team") or result.get("away_team")
+        league     = match_info.get("league")    or result.get("league")
+        predicted  = result.get("predicted_outcome")
+
+        # match_date lives at root level in upcoming results, inside match for single predict
+        match_date = (
+            result.get("match_date")          # predict_upcoming_fast puts it here
+            or match_info.get("date")         # DC markets puts it here
+            or match_info.get("match_date")
+        )
 
         if not predicted or not home_team or not away_team:
             return
@@ -138,22 +132,24 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 INSERT INTO prediction_log
                     (match_id, home_team, away_team, league, match_date,
                      predicted, confidence, confidence_score,
-                     home_win_prob, draw_prob, away_win_prob,
-                     home_xg, away_xg, predicted_score)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT DO NOTHING
+                     home_win_prob, draw_prob, away_win_prob)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (match_id) DO NOTHING
             """, (
-                match_id, home_team, away_team, league, match_date,
-                predicted, confidence, conf_score,
-                home_win_p, draw_p, away_win_p,
-                home_xg, away_xg, pred_score,
+                match_id,
+                home_team, away_team, league, match_date,
+                predicted,
+                result.get("confidence"),
+                result.get("confidence_score"),
+                probs.get("home_win"),
+                probs.get("draw"),
+                probs.get("away_win"),
             ))
             conn.commit()
         finally:
             conn.close()
     except Exception as exc:
-        log.warning("Could not log prediction to prediction_log: %s", exc)
-
+        log.warning("Could not log prediction: %s", exc)
 
 @router.post("/predict")
 def predict(req: PredictRequest, background_tasks: BackgroundTasks):
