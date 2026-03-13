@@ -140,10 +140,10 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 home_team, away_team, league, match_date,
                 predicted,
                 result.get("confidence"),
-                result.get("confidence_score"),
-                probs.get("home_win"),
-                probs.get("draw"),
-                probs.get("away_win"),
+                float(result.get("confidence_score") or 0),   
+                float(probs.get("home_win") or 0),             
+                float(probs.get("draw") or 0),                 
+                float(probs.get("away_win") or 0),            
             ))
             conn.commit()
         finally:
