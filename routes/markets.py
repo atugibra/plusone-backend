@@ -240,9 +240,9 @@ def upcoming_dc_predictions(
             threading.Thread(
                 target=_log_prediction_bg,
                 args=(
-                    fx["id"], fx["home_team"], fx["away_team"],
-                    fx["league"], fx["match_date"], outcome,
-                    confidence, lead, hw, dr, aw,
+                    int(fx["id"]), str(fx["home_team"]), str(fx["away_team"]),
+                    str(fx["league"]), fx["match_date"], str(outcome),
+                    str(confidence), float(lead), float(hw), float(dr), float(aw),
                 ),
                 daemon=True,
             ).start()
