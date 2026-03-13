@@ -51,3 +51,10 @@ CREATE TABLE IF NOT EXISTS prediction_log (
 CREATE INDEX IF NOT EXISTS prediction_log_match_id_idx ON prediction_log(match_id);
 CREATE INDEX IF NOT EXISTS prediction_log_correct_idx  ON prediction_log(correct);
 CREATE INDEX IF NOT EXISTS prediction_log_date_idx     ON prediction_log(match_date);
+ 
+ 
+ -- ─── 4. teams table logo_url column ─────────────────────────────────────────
+ -- Add column for storing team logos scraped from FBref
+ 
+ ALTER TABLE teams
+   ADD COLUMN IF NOT EXISTS logo_url TEXT;

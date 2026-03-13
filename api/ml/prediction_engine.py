@@ -446,6 +446,7 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
             SELECT m.id, m.home_team_id, m.away_team_id,
                    m.league_id, m.season_id, m.match_date, m.gameweek,
                    ht.name AS home_name, at.name AS away_name,
+                   ht.logo_url AS home_logo, at.logo_url AS away_logo,
                    l.name  AS league_name, s.name AS season_name
             FROM matches m
             JOIN teams   ht ON ht.id = m.home_team_id
@@ -501,6 +502,8 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                     "match": {
                         "home_team":    fx["home_name"],
                         "away_team":    fx["away_name"],
+                        "home_logo":    fx["home_logo"],
+                        "away_logo":    fx["away_logo"],
                         "league":       fx["league_name"],
                         "season":       fx["season_name"],
                         "home_team_id": htid,

@@ -336,8 +336,8 @@ def list_upcoming_fixtures(
     try:
         query = """
             SELECT m.id, m.match_date, m.gameweek, m.start_time,
-                   ht.id AS home_team_id, ht.name AS home_team,
-                   at.id AS away_team_id, at.name AS away_team,
+                   ht.id AS home_team_id, ht.name AS home_team, ht.logo_url AS home_logo,
+                   at.id AS away_team_id, at.name AS away_team, at.logo_url AS away_logo,
                    l.id  AS league_id,   l.name  AS league,
                    s.id  AS season_id,   s.name  AS season
             FROM matches m

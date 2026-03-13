@@ -113,6 +113,7 @@ class SyncPayload(BaseModel):
     stats: Optional[List[dict]] = None
     player_stats: Optional[List[dict]] = None
     playerStats: Optional[List[dict]] = None
+    team_logos: Optional[dict] = None
 
 def tables_to_fixtures(tables):
     result = []
@@ -442,12 +443,15 @@ def sync_all(payload: SyncPayload):
         pl  = _insert_player_stats(cur, season_id, payload.league, players_list)
         sd  = _insert_standings(cur, league_id, season_id, standings_list)
         ha  = _insert_home_away_stats(cur, league_id, season_id, ha_split_list)
+        logos = 0
+        if payload.team_logos:
+            logos = _update_team_logos(cur, league_id, payload.team_logos)
         conn.commit()
         log_scrape(cur, league_id, season_id, "sync_all", fx + st + pl + sd + ha, 0)
         conn.commit()
         # Auto-evaluate predictions whose matches just received scores
         evaluated = _auto_evaluate_predictions(conn)
-        return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "predictions_evaluated": evaluated}
+        return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "logos_updated": logos, "predictions_evaluated": evaluated}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -746,6 +750,26 @@ def _update_standings_home_away(cur, league_id, season_id, rows):
               AND  ls.season_id = %s
               AND  LOWER(t.name) LIKE LOWER(%s)
         """, (split_json, league_id, season_id, f"%{team_name}%"))
+
+def _update_team_logos(cur, league_id, team_logos):
+    """Update team logos from the scraper mapping."""
+    count = 0
+    for team_name, logo_url in team_logos.items():
+        if not team_name or not logo_url:
+            continue
+        try:
+            # We use an ILIKE match on name and league_id to find the team
+            cur.execute("""
+                UPDATE teams
+                SET logo_url = %s
+                WHERE league_id = %s AND name ILIKE %s
+                  AND (logo_url IS NULL OR logo_url != %s)
+            """, (logo_url, league_id, f"%{team_name}%", logo_url))
+            if cur.rowcount > 0:
+                count += cur.rowcount
+        except Exception:
+            pass
+    return count
 
 def log_scrape(cur, league_id, season_id, page_type, inserted, updated):
     try:

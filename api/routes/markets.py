@@ -68,7 +68,7 @@ def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
                      predicted, confidence, confidence_score,
                      home_win_prob, draw_prob, away_win_prob)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (match_id) DO NOTHING
+                ON CONFLICT DO NOTHING
             """, (
                 match_id, home_team, away_team, league, match_date,
                 predicted_outcome, confidence, round(confidence_score, 4),
@@ -78,7 +78,7 @@ def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
         finally:
             conn.close()
     except Exception as exc:
-        log.debug("prediction_log insert skipped: %s", exc)
+        log.warning("prediction_log insert failed: %s", exc)
 
 
 
@@ -193,9 +193,9 @@ def upcoming_dc_predictions(
                 outcome = "Draw"
 
             conf_pct = pred.get("confidence", 50)
-            if conf_pct >= 60:
+            if conf_pct >= 55:
                 confidence = "High"
-            elif conf_pct >= 48:
+            elif conf_pct >= 45:
                 confidence = "Medium"
             else:
                 confidence = "Low"

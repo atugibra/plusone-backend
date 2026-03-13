@@ -409,7 +409,7 @@ class DCPredictor:
             JOIN teams at ON at.id = m.away_team_id
             WHERE m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
-              AND m.match_date >= CURRENT_DATE - INTERVAL '3 months'
+              AND m.match_date >= CURRENT_DATE - INTERVAL '2 years'
             ORDER BY m.match_date DESC
             LIMIT 1500
         """)

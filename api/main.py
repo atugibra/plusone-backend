@@ -6,7 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
 
-from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance
+from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance, feedback
 
 
 load_dotenv()
@@ -99,6 +99,7 @@ app.include_router(predictions.router,    prefix="/api/predictions",    tags=["P
 app.include_router(prediction_log.router, prefix="/api/prediction-log", tags=["Prediction Log"])
 app.include_router(markets.router,        prefix="/api/markets",         tags=["Markets"])
 app.include_router(performance.router,    prefix="/api/performance",      tags=["Performance"])
+app.include_router(feedback.router,        prefix="/api/feedback",         tags=["Feedback"])
 
 
 if __name__ == "__main__":
