@@ -74,7 +74,7 @@ def _run_dc_training():
                   finally:
                       conn.close()
               except Exception as exc:
-                  log.warning("prediction_log insert failed: %s", exc)
+                  log.exception("prediction_log insert failed")
 
 
 
