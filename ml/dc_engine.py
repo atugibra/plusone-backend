@@ -479,7 +479,7 @@ class DCPredictor:
 
         raw_arr = np.array([[blended["away_win"], blended["draw"], blended["home_win"]]])
         cal_arr = self.calibrator.calibrate(raw_arr)[0]
-        calibrated = {"away_win": cal_arr[0], "draw": cal_arr[1], "home_win": cal_arr[2]}
+        calibrated = {"away_win": float(cal_arr[0]), "draw": float(cal_arr[1]), "home_win": float(cal_arr[2])}
 
         exp_h = (dc_pred["exp_home_goals"] * 0.5 + xg_pred["exp_home_xg"] * 0.5)
         exp_a = (dc_pred["exp_away_goals"] * 0.5 + xg_pred["exp_away_xg"] * 0.5)
