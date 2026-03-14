@@ -363,7 +363,7 @@ class EnsembleBlender:
         p_d  = self.weights[0]*dc["draw"]     + self.weights[1]*elo["draw"]     + self.weights[2]*xg["draw"]
         p_aw = self.weights[0]*dc["away_win"] + self.weights[1]*elo["away_win"] + self.weights[2]*xg["away_win"]
         total = p_hw + p_d + p_aw or 1
-        return {"home_win": p_hw/total, "draw": p_d/total, "away_win": p_aw/total}
+        return {"home_win": float(p_hw/total), "draw": float(p_d/total), "away_win": float(p_aw/total)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -486,8 +486,8 @@ class DCPredictor:
         mc_results = self.mc.simulate(exp_h, exp_a)
 
         probs = np.array([calibrated["home_win"], calibrated["draw"], calibrated["away_win"]])
-        entropy = -np.sum(probs * np.log(probs + 1e-10))
-        max_entropy = -np.log(1 / 3)
+        entropy = float(-np.sum(probs * np.log(probs + 1e-10)))
+        max_entropy = float(-np.log(1 / 3))
         confidence_score = round((1 - entropy / max_entropy) * 100, 1)
 
         outcome_label = max(calibrated, key=calibrated.get).replace("_", " ").title()
