@@ -105,6 +105,16 @@ def training_status():
 
 # ─── Auto-log helper ──────────────────────────────────────────────────────────
 
+def _to_float(v):
+    """Coerce numpy scalars (or any numeric) to a native Python float for psycopg2."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
     """
     Fire-and-forget: write one prediction result to prediction_log.
@@ -115,18 +125,18 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         match_id     = match_id or result.get("fixture_id") or result.get("match_id")
         match_info   = result.get("match", {})
         probs        = result.get("probabilities", {})
-        home_win_p   = probs.get("home_win")
-        draw_p       = probs.get("draw")
-        away_win_p   = probs.get("away_win")
+        home_win_p   = _to_float(probs.get("home_win"))
+        draw_p       = _to_float(probs.get("draw"))
+        away_win_p   = _to_float(probs.get("away_win"))
         predicted    = result.get("predicted_outcome")
         confidence   = result.get("confidence")
-        conf_score   = result.get("confidence_score")
+        conf_score   = _to_float(result.get("confidence_score"))
         home_team    = match_info.get("home_team") or result.get("home_team")
         away_team    = match_info.get("away_team") or result.get("away_team")
         league       = match_info.get("league") or result.get("league")
         match_date   = match_info.get("date") or match_info.get("match_date") or result.get("match_date")
-        home_xg      = (result.get("expected_goals") or {}).get("home_xg")
-        away_xg      = (result.get("expected_goals") or {}).get("away_xg")
+        home_xg      = _to_float((result.get("expected_goals") or {}).get("home_xg"))
+        away_xg      = _to_float((result.get("expected_goals") or {}).get("away_xg"))
         pred_score   = (result.get("expected_goals") or {}).get("predicted_score")
 
         if not predicted or not home_team or not away_team:

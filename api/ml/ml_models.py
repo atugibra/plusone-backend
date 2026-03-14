@@ -171,13 +171,13 @@ class EnsemblePredictor:
             confidence = "Low"
 
         return {
-            "home_win":         round(hw, 4),
-            "draw":             round(dr, 4),
-            "away_win":         round(aw, 4),
+            "home_win":         round(float(hw), 4),
+            "draw":             round(float(dr), 4),
+            "away_win":         round(float(aw), 4),
             "predicted_outcome": predicted_label,
             "label_int":        predicted_int,
             "confidence":       confidence,
-            "confidence_score": round(confidence_score, 4),
+            "confidence_score": round(float(confidence_score), 4),
         }
 
     def get_top_features(self, x, n=6):
