@@ -12,6 +12,7 @@ Endpoints:
   GET  /api/predictions/results        → recent completed match results
   GET  /api/predictions/accuracy       → accuracy trend by gameweek
   GET  /api/predictions/training-status → poll background training status
+  POST /api/predictions/consensus      → dynamic multi-engine consensus prediction
 """
 
 import time
@@ -42,6 +43,14 @@ class TrainRequest(BaseModel):
 
 
 class PredictRequest(BaseModel):
+    home_team_id: int
+    away_team_id: int
+    league_id:    int
+    season_id:    int
+
+
+class ConsensusRequest(BaseModel):
+    """Request body for the multi-engine consensus endpoint."""
     home_team_id: int
     away_team_id: int
     league_id:    int
@@ -115,10 +124,16 @@ def _to_float(v):
         return None
 
 
-def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
+def _log_prediction_to_db(
+    result: dict,
+    match_id: Optional[int] = None,
+    dc_predicted_outcome:     Optional[str] = None,
+    ml_predicted_outcome:     Optional[str] = None,
+    legacy_predicted_outcome: Optional[str] = None,
+):
     """
     Fire-and-forget: write one prediction result to prediction_log.
-    Called as a BackgroundTask after every /predict and /upcoming call.
+    Called as a BackgroundTask after every /predict, /upcoming, and /consensus call.
     Never raises — failure is logged but ignored so the main response isn't affected.
     """
     try:
@@ -150,14 +165,16 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                     (match_id, home_team, away_team, league, match_date,
                      predicted, confidence, confidence_score,
                      home_win_prob, draw_prob, away_win_prob,
-                     home_xg, away_xg, predicted_score)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     home_xg, away_xg, predicted_score,
+                     dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT DO NOTHING
             """, (
                 match_id, home_team, away_team, league, match_date,
                 predicted, confidence, conf_score,
                 home_win_p, draw_p, away_win_p,
                 home_xg, away_xg, pred_score,
+                dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome,
             ))
             conn.commit()
         finally:
@@ -197,6 +214,70 @@ def predict(req: PredictRequest, background_tasks: BackgroundTasks):
         background_tasks.add_task(_log_prediction_to_db, result, match_id)
 
         return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/consensus")
+def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
+    """
+    Dynamic multi-engine consensus prediction.
+
+    Runs the DC, ML, and Legacy engines and blends their probabilities using
+    dynamically computed weights based on each engine's 30-day trailing
+    accuracy recorded in prediction_log.
+
+    Falls back to default weights (DC 45% / ML 35% / Legacy 20%) when fewer
+    than 10 graded rows exist in prediction_log.
+
+    Returns:
+      - consensus: blended probabilities + predicted outcome + confidence
+      - engines:   individual picks from DC, ML, and Legacy
+      - weights_used: blend weights and whether they are dynamic or default
+      - agreement: 'full' | 'majority' | 'split'
+      - markets:   BTTS, O/U 2.5, and expected goal values
+    """
+    from ml.consensus_engine import run_consensus
+
+    if req.home_team_id == req.away_team_id:
+        raise HTTPException(status_code=400, detail="Home and away teams must be different.")
+    try:
+        result = run_consensus(
+            req.home_team_id,
+            req.away_team_id,
+            req.league_id,
+            req.season_id,
+        )
+
+        # Fire-and-forget: log consensus prediction with individual engine picks
+        engine_picks = result.get("_engine_picks", {})
+        consensus    = result.get("consensus", {})
+        log_payload  = {
+            "match":          result.get("match", {}),
+            "probabilities": {
+                "home_win": consensus.get("home_win"),
+                "draw":     consensus.get("draw"),
+                "away_win": consensus.get("away_win"),
+            },
+            "predicted_outcome": consensus.get("predicted_outcome"),
+            "confidence":        consensus.get("confidence"),
+            "confidence_score":  consensus.get("confidence_score"),
+        }
+        background_tasks.add_task(
+            _log_prediction_to_db,
+            log_payload,
+            None,                        # match_id (not known at request time)
+            engine_picks.get("dc"),      # dc_predicted_outcome
+            engine_picks.get("ml"),      # ml_predicted_outcome
+            engine_picks.get("legacy"),  # legacy_predicted_outcome
+        )
+
+        # Strip internal key before sending to client
+        result.pop("_engine_picks", None)
+        return result
+
     except HTTPException:
         raise
     except Exception as e:

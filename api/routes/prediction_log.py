@@ -29,11 +29,26 @@ SQL to run ONCE in Supabase SQL Editor:
       actual          TEXT,           -- filled in by /evaluate after match
       correct         BOOLEAN,        -- filled in by /evaluate
       evaluated_at    TIMESTAMPTZ,
-      created_at      TIMESTAMPTZ DEFAULT NOW()
+      created_at      TIMESTAMPTZ DEFAULT NOW(),
+      -- Per-engine picks (added for Dynamic Consensus Engine tracking)
+      dc_predicted_outcome     TEXT,
+      ml_predicted_outcome     TEXT,
+      legacy_predicted_outcome TEXT,
+      dc_correct               BOOLEAN,
+      ml_correct               BOOLEAN,
+      legacy_correct           BOOLEAN
   );
   CREATE INDEX IF NOT EXISTS prediction_log_match_id_idx ON prediction_log(match_id);
   CREATE INDEX IF NOT EXISTS prediction_log_correct_idx  ON prediction_log(correct);
   CREATE INDEX IF NOT EXISTS prediction_log_date_idx     ON prediction_log(match_date);
+
+  -- If the table already exists, add the per-engine columns:
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_predicted_outcome     TEXT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_predicted_outcome     TEXT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_predicted_outcome TEXT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_correct               BOOLEAN;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_correct               BOOLEAN;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_correct           BOOLEAN;
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -59,6 +74,10 @@ class RecordRequest(BaseModel):
     home_win_prob:   Optional[float] = None
     draw_prob:       Optional[float] = None
     away_win_prob:   Optional[float] = None
+    # Per-engine picks from the consensus endpoint
+    dc_predicted_outcome:     Optional[str] = None
+    ml_predicted_outcome:     Optional[str] = None
+    legacy_predicted_outcome: Optional[str] = None
 
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
@@ -84,8 +103,9 @@ def record_prediction(req: RecordRequest):
             INSERT INTO prediction_log
                 (match_id, home_team, away_team, league, match_date,
                  predicted, confidence, confidence_score,
-                 home_win_prob, draw_prob, away_win_prob)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 home_win_prob, draw_prob, away_win_prob,
+                 dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
         """, (
             req.match_id, req.home_team, req.away_team,
@@ -93,6 +113,7 @@ def record_prediction(req: RecordRequest):
             req.match_date,
             req.predicted, req.confidence, req.confidence_score,
             req.home_win_prob, req.draw_prob, req.away_win_prob,
+            req.dc_predicted_outcome, req.ml_predicted_outcome, req.legacy_predicted_outcome,
         ))
         row = cur.fetchone()
         conn.commit()
@@ -184,11 +205,26 @@ def evaluate_predictions():
         for r in rows:
             actual  = _outcome_label(int(r["home_score"]), int(r["away_score"]))
             correct = (actual == r["predicted"])
+            # Grade each individual engine pick if it was recorded
             cur.execute("""
                 UPDATE prediction_log
-                SET actual = %s, correct = %s, evaluated_at = NOW()
+                SET actual       = %s,
+                    correct      = %s,
+                    evaluated_at = NOW(),
+                    dc_correct     = CASE
+                                       WHEN dc_predicted_outcome     IS NOT NULL
+                                       THEN dc_predicted_outcome     = %s
+                                       ELSE NULL END,
+                    ml_correct     = CASE
+                                       WHEN ml_predicted_outcome     IS NOT NULL
+                                       THEN ml_predicted_outcome     = %s
+                                       ELSE NULL END,
+                    legacy_correct = CASE
+                                       WHEN legacy_predicted_outcome IS NOT NULL
+                                       THEN legacy_predicted_outcome = %s
+                                       ELSE NULL END
                 WHERE id = %s
-            """, (actual, correct, r["id"]))
+            """, (actual, correct, actual, actual, actual, r["id"]))
             updated += 1
 
         conn.commit()
