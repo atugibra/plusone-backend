@@ -112,21 +112,71 @@ def evaluate_predictions():
     Scan all un-evaluated prediction_log rows whose match has now completed
     (i.e. matches table has home_score populated) and mark them correct/wrong.
 
-    Safe to call repeatedly — only updates rows where correct IS NULL.
-    Run this after each sync cycle or manually from the admin panel.
+    Handles two cases:
+      1. match_id is set  → direct JOIN on matches.id
+      2. match_id is NULL → fuzzy match on home_team / away_team / match_date
+
+    Safe to call repeatedly — only updates rows where actual IS NULL.
     Returns how many rows were evaluated.
     """
     conn = get_connection()
     cur  = conn.cursor()
     try:
-        # Find unevaluated log rows that have a match_id and the match is now done
         cur.execute("""
+            -- Case 1: match_id is known
             SELECT pl.id, pl.predicted, m.home_score, m.away_score
             FROM prediction_log pl
             JOIN matches m ON m.id = pl.match_id
-            WHERE pl.correct IS NULL
+            WHERE pl.actual IS NULL
               AND m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
+
+            UNION
+
+            -- Case 2: match_id NULL, date is known
+            SELECT pl.id, pl.predicted, m.home_score, m.away_score
+            FROM prediction_log pl
+            JOIN matches m
+              ON pl.match_id IS NULL
+             AND pl.match_date IS NOT NULL
+             AND m.match_date = pl.match_date
+             AND m.home_score IS NOT NULL
+             AND m.away_score IS NOT NULL
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.home_team_id
+                     AND LOWER(t.name) = LOWER(pl.home_team)
+             )
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.away_team_id
+                     AND LOWER(t.name) = LOWER(pl.away_team)
+             )
+            WHERE pl.actual IS NULL
+
+            UNION
+
+            -- Case 3: both match_id and match_date NULL → use created_at ±3 days
+            SELECT pl.id, pl.predicted, m.home_score, m.away_score
+            FROM prediction_log pl
+            JOIN matches m
+              ON pl.match_id IS NULL
+             AND pl.match_date IS NULL
+             AND m.home_score IS NOT NULL
+             AND m.away_score IS NOT NULL
+             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '3 days')
+                                  AND (pl.created_at::date + INTERVAL '3 days')
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.home_team_id
+                     AND LOWER(t.name) = LOWER(pl.home_team)
+             )
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.away_team_id
+                     AND LOWER(t.name) = LOWER(pl.away_team)
+             )
+            WHERE pl.actual IS NULL
         """)
         rows = cur.fetchall()
 

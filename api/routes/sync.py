@@ -66,24 +66,76 @@ router = APIRouter()
 def _auto_evaluate_predictions(conn) -> int:
     """
     Grade all unevaluated prediction_log rows whose match is now complete.
+    Handles three cases:
+      1. match_id is set             → direct JOIN on matches.id
+      2. match_id NULL, date known   → match via team name + match_date
+      3. match_id NULL, date NULL    → match via team name within ±3 days of created_at
     Called automatically after each sync so performance metrics stay current.
     Returns the number of rows updated.
     """
     try:
         cur = conn.cursor()
         cur.execute("""
+            -- Case 1: match_id is known
             SELECT pl.id, pl.predicted, m.home_score, m.away_score
             FROM prediction_log pl
             JOIN matches m ON m.id = pl.match_id
             WHERE pl.actual IS NULL
               AND m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
+
+            UNION
+
+            -- Case 2: match_id NULL but match_date is set
+            SELECT pl.id, pl.predicted, m.home_score, m.away_score
+            FROM prediction_log pl
+            JOIN matches m
+              ON pl.match_id IS NULL
+             AND pl.match_date IS NOT NULL
+             AND m.match_date  = pl.match_date
+             AND m.home_score IS NOT NULL
+             AND m.away_score IS NOT NULL
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.home_team_id
+                     AND LOWER(t.name) = LOWER(pl.home_team)
+             )
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.away_team_id
+                     AND LOWER(t.name) = LOWER(pl.away_team)
+             )
+            WHERE pl.actual IS NULL
+
+            UNION
+
+            -- Case 3: both match_id and match_date are NULL → use created_at ±3 days
+            SELECT pl.id, pl.predicted, m.home_score, m.away_score
+            FROM prediction_log pl
+            JOIN matches m
+              ON pl.match_id IS NULL
+             AND pl.match_date IS NULL
+             AND m.home_score IS NOT NULL
+             AND m.away_score IS NOT NULL
+             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '3 days')
+                                  AND (pl.created_at::date + INTERVAL '3 days')
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.home_team_id
+                     AND LOWER(t.name) = LOWER(pl.home_team)
+             )
+             AND EXISTS (
+                   SELECT 1 FROM teams t
+                   WHERE t.id = m.away_team_id
+                     AND LOWER(t.name) = LOWER(pl.away_team)
+             )
+            WHERE pl.actual IS NULL
         """)
         rows = cur.fetchall()
         updated = 0
         for r in rows:
             hs = int(r["home_score"]); as_ = int(r["away_score"])
-            if hs > as_:  actual = "Home Win"
+            if hs > as_:   actual = "Home Win"
             elif as_ > hs: actual = "Away Win"
             else:          actual = "Draw"
             correct = (actual == r["predicted"])
