@@ -28,10 +28,7 @@ from ml.prediction_engine import predict_upcoming_fast
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-# Tracks background training state so /status can report errors
 _training_state: dict = {}
-
-# Simple in-memory cache for public predictions (15-minute TTL)
 _public_cache: dict = {"data": None, "expires_at": 0.0}
 
 
@@ -50,14 +47,12 @@ class PredictRequest(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    """Legacy rule-based prediction by team name."""
     home_team: str
     away_team: str
     league: Optional[str] = None
 
 
 class ConsensusRequest(BaseModel):
-    """Request body for the multi-engine consensus endpoint."""
     home_team_id: int
     away_team_id: int
     league_id:    int
@@ -68,7 +63,6 @@ class ConsensusRequest(BaseModel):
 
 @router.get("/status")
 def prediction_status():
-    """Return current model status: trained, accuracy, n_samples, n_features."""
     return engine.get_status()
 
 
@@ -103,14 +97,15 @@ def training_status():
 # ─── Auto-log helper ──────────────────────────────────────────────────────────
 
 def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
+    conn = None
     try:
         match_info = result.get("match", {})
         probs      = result.get("probabilities", {})
 
-        home_team  = match_info.get("home_team") or result.get("home_team")
-        away_team  = match_info.get("away_team") or result.get("away_team")
-        league     = match_info.get("league")    or result.get("league")
-        predicted  = result.get("predicted_outcome")
+        home_team = match_info.get("home_team") or result.get("home_team")
+        away_team = match_info.get("away_team") or result.get("away_team")
+        league    = match_info.get("league")    or result.get("league")
+        predicted = result.get("predicted_outcome")
 
         match_date = (
             result.get("match_date")
@@ -119,32 +114,39 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         )
 
         if not predicted or not home_team or not away_team:
+            log.warning("_log_prediction_to_db: missing fields — predicted=%s home=%s away=%s",
+                        predicted, home_team, away_team)
             return
 
         conn = get_connection()
         cur  = conn.cursor()
-        try:
-            cur.execute("""
-                INSERT INTO prediction_log
-                    (match_id, home_team, away_team, league, match_date,
-                     predicted, confidence, confidence_score,
-                     home_win_prob, draw_prob, away_win_prob)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                match_id,
-                home_team, away_team, league, match_date,
-                predicted,
-                result.get("confidence"),
-                float(result.get("confidence_score") or 0),
-                float(probs.get("home_win") or 0),
-                float(probs.get("draw") or 0),
-                float(probs.get("away_win") or 0),
-            ))
-            conn.commit()
-        finally:
-            conn.close()
+        cur.execute("""
+            INSERT INTO prediction_log
+                (match_id, home_team, away_team, league, match_date,
+                 predicted, confidence, confidence_score,
+                 home_win_prob, draw_prob, away_win_prob)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            match_id,
+            home_team, away_team, league, match_date,
+            predicted,
+            result.get("confidence"),
+            float(result.get("confidence_score") or 0),
+            float(probs.get("home_win") or 0),
+            float(probs.get("draw") or 0),
+            float(probs.get("away_win") or 0),
+        ))
+        conn.commit()
+        log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
     except Exception as exc:
-        log.warning("Could not log prediction: %s", exc)
+        log.error("Could not log prediction: %s", exc, exc_info=True)
+        if conn:
+            try: conn.rollback()
+            except: pass
+    finally:
+        if conn:
+            try: conn.close()
+            except: pass
 
 
 @router.post("/predict")
@@ -153,20 +155,13 @@ def predict(req: PredictRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Home and away teams must be different.")
     try:
         result = engine.predict_match(
-            req.home_team_id,
-            req.away_team_id,
-            req.league_id,
-            req.season_id,
+            req.home_team_id, req.away_team_id, req.league_id, req.season_id,
         )
         if "error" in result:
             error_msg = result["error"]
             if "not trained" in error_msg.lower() or "no model" in error_msg.lower():
-                raise HTTPException(
-                    status_code=422,
-                    detail="Model not trained yet. Click 'Train Model' first, then try again."
-                )
+                raise HTTPException(status_code=422, detail="Model not trained yet.")
             raise HTTPException(status_code=422, detail=error_msg)
-
         match_id = result.get("match", {}).get("match_id") or result.get("match_id")
         background_tasks.add_task(_log_prediction_to_db, result, match_id)
         return result
@@ -179,38 +174,35 @@ def predict(req: PredictRequest, background_tasks: BackgroundTasks):
 @router.get("/upcoming")
 def upcoming_predictions(
     background_tasks: BackgroundTasks,
-    league_id: Optional[int] = Query(None, description="Filter by league ID"),
-    limit:     int           = Query(50,   description="Max fixtures to predict"),
+    league_id: Optional[int] = Query(None),
+    limit:     int           = Query(50),
 ):
     try:
         results = predict_upcoming_fast(league_id=league_id, limit=limit)
-
         def _bulk_log():
             for r in results:
                 mid = r.get("fixture_id") or (r.get("match") or {}).get("match_id")
                 _log_prediction_to_db(r, match_id=mid)
-
         background_tasks.add_task(_bulk_log)
         return {"count": len(results), "predictions": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Public predictions endpoint (bet recommendations) ───────────────────────
+# ─── Public predictions endpoint ─────────────────────────────────────────────
 
 def _derive_best_bets(predictions: list) -> list:
     enriched = []
     for p in predictions:
-        probs    = p.get("probabilities", {})
-        hw       = probs.get("home_win", 0.33)
-        dr       = probs.get("draw", 0.33)
-        aw       = probs.get("away_win", 0.34)
-        conf     = p.get("confidence", "Low")
-        outcome  = p.get("predicted_outcome", "")
-        xg       = p.get("expected_goals", {}) or {}
-        home_xg  = float(xg.get("home_xg") or 0)
-        away_xg  = float(xg.get("away_xg") or 0)
-
+        probs   = p.get("probabilities", {})
+        hw      = probs.get("home_win", 0.33)
+        dr      = probs.get("draw", 0.33)
+        aw      = probs.get("away_win", 0.34)
+        conf    = p.get("confidence", "Low")
+        outcome = p.get("predicted_outcome", "")
+        xg      = p.get("expected_goals", {}) or {}
+        home_xg = float(xg.get("home_xg") or 0)
+        away_xg = float(xg.get("away_xg") or 0)
         bets = []
         lead_prob = max(hw, dr, aw)
         if conf == "High" and lead_prob >= 0.55:
@@ -221,7 +213,6 @@ def _derive_best_bets(predictions: list) -> list:
             bets.append({"bet": "⚽ Both Teams to Score (recommended)", "prob": None, "tier": "btts"})
         if dr >= 0.34 and outcome != "Draw":
             bets.append({"bet": f"⚠️ Draw value — {round(dr * 100)}% probability, consider 1X or X2", "prob": round(dr * 100), "tier": "draw_value"})
-
         enriched.append({**p, "bet_recommendations": bets})
     return enriched
 
@@ -254,7 +245,7 @@ def public_predictions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Fixtures list ────────────────────────────────────────────────────────────
+# ─── Fixtures ─────────────────────────────────────────────────────────────────
 
 @router.get("/fixtures")
 def list_upcoming_fixtures(
@@ -276,8 +267,7 @@ def list_upcoming_fixtures(
             JOIN teams   at ON at.id = m.away_team_id
             JOIN leagues l  ON l.id  = m.league_id
             JOIN seasons s  ON s.id  = m.season_id
-            WHERE m.home_score IS NULL
-              AND m.match_date >= CURRENT_DATE
+            WHERE m.home_score IS NULL AND m.match_date >= CURRENT_DATE
         """
         params = []
         if league_id:
@@ -295,7 +285,7 @@ def list_upcoming_fixtures(
         conn.close()
 
 
-# ─── Historical Results ───────────────────────────────────────────────────────
+# ─── Results ──────────────────────────────────────────────────────────────────
 
 @router.get("/results")
 def list_prediction_results(
@@ -367,8 +357,7 @@ def prediction_accuracy_trend(
                    ON ls_a.team_id = m.away_team_id
                   AND ls_a.league_id = m.league_id
                   AND ls_a.season_id = m.season_id
-            WHERE m.home_score IS NOT NULL
-              AND m.gameweek IS NOT NULL
+            WHERE m.home_score IS NOT NULL AND m.gameweek IS NOT NULL
         """
         params = []
         if league_id:
@@ -410,7 +399,9 @@ def _consensus_safe_div(a, b, default=0.0):
         return default
 
 
-def _fetch_engine_weights(cur) -> dict:
+def _fetch_engine_weights(conn) -> dict:
+    """Uses its own cursor. Rolls back on failure so conn stays usable."""
+    cur = conn.cursor()
     try:
         cur.execute("""
             SELECT
@@ -425,7 +416,7 @@ def _fetch_engine_weights(cur) -> dict:
               AND ml_predicted_outcome     IS NOT NULL
               AND legacy_predicted_outcome IS NOT NULL
         """)
-        row = cur.fetchone()
+        row   = cur.fetchone()
         total = int(row["total"] or 0) if row else 0
         if total < _MIN_GRADED_ROWS:
             return dict(_DEFAULT_WEIGHTS)
@@ -440,24 +431,29 @@ def _fetch_engine_weights(cur) -> dict:
             "ml":     round(ml_acc     / w_sum, 4),
             "legacy": round(legacy_acc / w_sum, 4),
         }
-    except Exception:
+    except Exception as exc:
+        log.warning("_fetch_engine_weights failed (%s) — using defaults", exc)
+        try: conn.rollback()   # reset aborted transaction so conn stays usable
+        except: pass
         return dict(_DEFAULT_WEIGHTS)
+    finally:
+        try: cur.close()
+        except: pass
 
 
-def _run_legacy_inline(cur, home_id: int, away_id: int) -> dict:
+def _run_legacy_inline(conn, home_id: int, away_id: int) -> dict:
     fallback = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35,
                 "predicted_outcome": "Home Win"}
+    cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT ls.wins, ls.games, ls.goals_for, ls.goals_against
-            FROM league_standings ls WHERE ls.team_id = %s
-            ORDER BY ls.season_id DESC LIMIT 1
+            SELECT ls.wins, ls.games FROM league_standings ls
+            WHERE ls.team_id = %s ORDER BY ls.season_id DESC LIMIT 1
         """, (home_id,))
         h_st = cur.fetchone()
         cur.execute("""
-            SELECT ls.wins, ls.games, ls.goals_for, ls.goals_against
-            FROM league_standings ls WHERE ls.team_id = %s
-            ORDER BY ls.season_id DESC LIMIT 1
+            SELECT ls.wins, ls.games FROM league_standings ls
+            WHERE ls.team_id = %s ORDER BY ls.season_id DESC LIMIT 1
         """, (away_id,))
         a_st = cur.fetchone()
         cur.execute("""
@@ -488,14 +484,15 @@ def _run_legacy_inline(cur, home_id: int, away_id: int) -> dict:
         home_p = round(r_h / s, 4)
         away_p = round(r_a / s, 4)
         draw_p = round(1 - home_p - away_p, 4)
-
-        probs = [home_p, draw_p, away_p]
-        idx   = probs.index(max(probs))
+        probs  = [home_p, draw_p, away_p]
         return {"home_win": home_p, "draw": draw_p, "away_win": away_p,
-                "predicted_outcome": _OUTCOME_LABELS[idx]}
+                "predicted_outcome": _OUTCOME_LABELS[probs.index(max(probs))]}
     except Exception as exc:
-        log.warning("Consensus legacy engine error: %s", exc)
+        log.warning("Legacy engine error: %s", exc)
         return fallback
+    finally:
+        try: cur.close()
+        except: pass
 
 
 def _blend_probs(dc: dict, ml: dict, legacy: dict, w: dict) -> dict:
@@ -508,7 +505,7 @@ def _blend_probs(dc: dict, ml: dict, legacy: dict, w: dict) -> dict:
 
 def _entropy_confidence(probs: dict):
     import math
-    vals = [probs["home_win"], probs["draw"], probs["away_win"]]
+    vals        = [probs["home_win"], probs["draw"], probs["away_win"]]
     entropy     = -sum(p * math.log(max(p, 1e-10)) for p in vals)
     max_entropy = -math.log(1.0 / 3.0)
     score = round((1.0 - entropy / max_entropy) * 100, 1)
@@ -518,18 +515,12 @@ def _entropy_confidence(probs: dict):
 
 @router.post("/consensus")
 def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
-    """
-    Dynamic multi-engine consensus prediction.
-    Self-contained: runs DC Engine, ML Engine, and Legacy Engine inline
-    with no dependency on ml.consensus_engine module.
-    """
     import math
-    conn = get_connection()
-    cur  = conn.cursor()
+    conn   = get_connection()
     errors = []
     try:
-        # ── 1. Dynamic weights ─────────────────────────────────────────────────
-        weights = _fetch_engine_weights(cur)
+        # ── 1. Dynamic weights (own cursor, rolls back on failure) ─────────────
+        weights = _fetch_engine_weights(conn)
         weight_source = "dynamic_historical" if weights != _DEFAULT_WEIGHTS else "default_fallback"
 
         # ── 2. DC Engine ───────────────────────────────────────────────────────
@@ -548,15 +539,17 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             dc_probs = {k: round(v / s, 4) for k, v in dc_probs.items()}
             dc_outcome = _OUTCOME_LABELS[[dc_probs["home_win"], dc_probs["draw"], dc_probs["away_win"]].index(max(dc_probs.values()))]
         except Exception as exc:
-            log.warning("Consensus: DC engine error: %s", exc)
+            log.warning("Consensus: DC error: %s", exc)
             errors.append(f"dc: {exc}")
             dc_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
             dc_outcome = "Home Win"
             weights["dc"] = 0.0
 
         # ── 3. ML Engine ───────────────────────────────────────────────────────
-        home_name, away_name, league_name, season_name = (
-            f"Team {req.home_team_id}", f"Team {req.away_team_id}", "", "")
+        home_name = f"Team {req.home_team_id}"
+        away_name = f"Team {req.away_team_id}"
+        league_name = ""
+        season_name = ""
         expected_goals = {}
         try:
             import ml.prediction_engine as ml_engine
@@ -580,20 +573,20 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             season_name    = mi.get("season", "")
             expected_goals = ml_raw.get("expected_goals", {})
         except Exception as exc:
-            log.warning("Consensus: ML engine error: %s", exc)
+            log.warning("Consensus: ML error: %s", exc)
             errors.append(f"ml: {exc}")
             ml_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
             ml_outcome = "Home Win"
             weights["ml"] = 0.0
 
-        # ── 4. Legacy Engine ───────────────────────────────────────────────────
+        # ── 4. Legacy Engine (own cursor via conn) ─────────────────────────────
         try:
-            legacy_raw     = _run_legacy_inline(cur, req.home_team_id, req.away_team_id)
+            legacy_raw     = _run_legacy_inline(conn, req.home_team_id, req.away_team_id)
             legacy_probs   = {k: v for k, v in legacy_raw.items()
                               if k in ("home_win", "draw", "away_win")}
             legacy_outcome = legacy_raw.get("predicted_outcome", "Home Win")
         except Exception as exc:
-            log.warning("Consensus: Legacy engine error: %s", exc)
+            log.warning("Consensus: Legacy error: %s", exc)
             errors.append(f"legacy: {exc}")
             legacy_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
             legacy_outcome = "Home Win"
@@ -601,10 +594,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
 
         # ── 5. Re-normalise weights ────────────────────────────────────────────
         w_sum = sum(weights.values())
-        if w_sum < 0.01:
-            weights = dict(_DEFAULT_WEIGHTS)
-        else:
-            weights = {k: round(v / w_sum, 4) for k, v in weights.items()}
+        weights = dict(_DEFAULT_WEIGHTS) if w_sum < 0.01 else {k: round(v / w_sum, 4) for k, v in weights.items()}
 
         # ── 6. Blend ───────────────────────────────────────────────────────────
         blended = _blend_probs(dc_probs, ml_probs, legacy_probs, weights)
@@ -613,11 +603,10 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
         prob_list = [blended["home_win"], blended["draw"], blended["away_win"]]
         consensus_outcome = _OUTCOME_LABELS[prob_list.index(max(prob_list))]
         confidence_score, confidence_label = _entropy_confidence(blended)
-        all_outcomes    = [dc_outcome, ml_outcome, legacy_outcome]
-        unique_outcomes = len(set(all_outcomes))
+        unique_outcomes = len(set([dc_outcome, ml_outcome, legacy_outcome]))
         agreement = "full" if unique_outcomes == 1 else ("majority" if unique_outcomes == 2 else "split")
 
-        # ── 8. Market proxies ──────────────────────────────────────────────────
+        # ── 8. Markets ─────────────────────────────────────────────────────────
         home_xg  = float(expected_goals.get("home_xg", 1.35))
         away_xg  = float(expected_goals.get("away_xg", 1.10))
         btts_yes = max(0.0, min(1.0, round(
@@ -661,23 +650,23 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             **({"_errors": errors} if errors else {}),
         }
 
-        # Log the consensus prediction (best-effort)
-        consensus = result.get("consensus", {})
-        background_tasks.add_task(
-            _log_prediction_to_db,
+        # ── 9. Log directly (synchronous — guarantees it runs) ─────────────────
+        consensus = result["consensus"]
+        _log_prediction_to_db(
             {
                 "probabilities": {
-                    "home_win": consensus.get("home_win"),
-                    "draw":     consensus.get("draw"),
-                    "away_win": consensus.get("away_win"),
+                    "home_win": consensus["home_win"],
+                    "draw":     consensus["draw"],
+                    "away_win": consensus["away_win"],
                 },
-                "predicted_outcome": consensus.get("predicted_outcome"),
-                "confidence":        consensus.get("confidence"),
-                "confidence_score":  consensus.get("confidence_score"),
-                "match":             result.get("match", {}),
+                "predicted_outcome": consensus["predicted_outcome"],
+                "confidence":        consensus["confidence"],
+                "confidence_score":  consensus["confidence_score"],
+                "match":             result["match"],
             },
             None,
         )
+
         return result
 
     except HTTPException:
@@ -685,7 +674,8 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
-        conn.close()
+        try: conn.close()
+        except: pass
 
 
 # ─── Legacy Rule-based Route ──────────────────────────────────────────────────
@@ -728,8 +718,7 @@ def _get_actual_result(cur, home_team: str, away_team: str):
         WHERE  LOWER(h.name) LIKE LOWER(%s)
           AND  LOWER(a.name) LIKE LOWER(%s)
           AND  m.home_score IS NOT NULL
-        ORDER  BY m.match_date DESC
-        LIMIT  1
+        ORDER  BY m.match_date DESC LIMIT 1
     """, (f"%{home_team}%", f"%{away_team}%"))
     return cur.fetchone()
 
@@ -773,7 +762,6 @@ def _fmt_stats(sq, st):
 
 @router.post("/generate")
 async def generate_prediction(req: GenerateRequest):
-    """Legacy rule-based endpoint: accepts team names, returns prediction."""
     conn = get_connection()
     cur  = conn.cursor()
     try:
