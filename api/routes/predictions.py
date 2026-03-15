@@ -239,8 +239,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
       - agreement: 'full' | 'majority' | 'split'
       - markets:   BTTS, O/U 2.5, and expected goal values
     """
-    from ml.consensus_engine import run_consensus
-
+    
     if req.home_team_id == req.away_team_id:
         raise HTTPException(status_code=400, detail="Home and away teams must be different.")
     try:
