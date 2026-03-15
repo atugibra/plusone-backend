@@ -132,13 +132,16 @@ def evaluate_predictions():
 
         updated = 0
         for r in rows:
-            actual  = _outcome_label(int(r["home_score"]), int(r["away_score"]))
-            correct = (actual == r["predicted"])
+            home_score = int(r["home_score"])
+            away_score = int(r["away_score"])
+            actual      = _outcome_label(home_score, away_score)
+            correct     = (actual == r["predicted"])
+            correct_score = f"{home_score}-{away_score}"
             cur.execute("""
                 UPDATE prediction_log
-                SET actual = %s, correct = %s, evaluated_at = NOW()
+                SET actual = %s, correct = %s, evaluated_at = NOW(), correct_score = %s
                 WHERE id = %s
-            """, (actual, correct, r["id"]))
+            """, (actual, correct, correct_score, r["id"]))
             updated += 1
 
         conn.commit()

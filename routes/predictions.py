@@ -170,7 +170,6 @@ def predict(req: PredictRequest, background_tasks: BackgroundTasks):
 
         match_id = result.get("match", {}).get("match_id") or result.get("match_id")
         background_tasks.add_task(_log_prediction_to_db, result, match_id)
-
         return result
     except HTTPException:
         raise
@@ -193,11 +192,7 @@ def upcoming_predictions(
                 _log_prediction_to_db(r, match_id=mid)
 
         background_tasks.add_task(_bulk_log)
-
-        return {
-            "count":       len(results),
-            "predictions": results,
-        }
+        return {"count": len(results), "predictions": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -218,34 +213,15 @@ def _derive_best_bets(predictions: list) -> list:
         away_xg  = float(xg.get("away_xg") or 0)
 
         bets = []
-
         lead_prob = max(hw, dr, aw)
         if conf == "High" and lead_prob >= 0.55:
-            bets.append({
-                "bet":  f"✅ Strong Pick — {outcome}",
-                "prob": round(lead_prob * 100),
-                "tier": "high",
-            })
+            bets.append({"bet": f"✅ Strong Pick — {outcome}", "prob": round(lead_prob * 100), "tier": "high"})
         elif conf in ("High", "Medium") and lead_prob >= 0.48:
-            bets.append({
-                "bet":  f"💡 Value Bet — {outcome}",
-                "prob": round(lead_prob * 100),
-                "tier": "medium",
-            })
-
+            bets.append({"bet": f"💡 Value Bet — {outcome}", "prob": round(lead_prob * 100), "tier": "medium"})
         if home_xg >= 1.1 and away_xg >= 1.0:
-            bets.append({
-                "bet":  "⚽ Both Teams to Score (recommended)",
-                "prob": None,
-                "tier": "btts",
-            })
-
+            bets.append({"bet": "⚽ Both Teams to Score (recommended)", "prob": None, "tier": "btts"})
         if dr >= 0.34 and outcome != "Draw":
-            bets.append({
-                "bet":  f"⚠️ Draw value — {round(dr * 100)}% probability, consider 1X or X2",
-                "prob": round(dr * 100),
-                "tier": "draw_value",
-            })
+            bets.append({"bet": f"⚠️ Draw value — {round(dr * 100)}% probability, consider 1X or X2", "prob": round(dr * 100), "tier": "draw_value"})
 
         enriched.append({**p, "bet_recommendations": bets})
     return enriched
@@ -253,31 +229,26 @@ def _derive_best_bets(predictions: list) -> list:
 
 @router.get("/public")
 def public_predictions(
-    league_id: Optional[int] = Query(None, description="Filter by league ID"),
-    limit:     int           = Query(30,   description="Max predictions"),
+    league_id: Optional[int] = Query(None),
+    limit:     int           = Query(30),
 ):
     global _public_cache
     now = time.time()
-
     if _public_cache["data"] is not None and now < _public_cache["expires_at"]:
         data = _public_cache["data"]
         if league_id:
             data = [p for p in data if (p.get("match") or {}).get("league_id") == league_id]
         return {"count": len(data), "predictions": data[:limit], "cached": True}
-
     try:
         raw = predict_upcoming_fast(league_id=None, limit=100)
         enriched = _derive_best_bets(raw)
-
         _public_cache = {"data": enriched, "expires_at": now + 900}
-
         if league_id:
             enriched = [p for p in enriched if (p.get("match") or {}).get("league_id") == league_id]
-
         return {
-            "count":       len(enriched[:limit]),
-            "predictions": enriched[:limit],
-            "cached":      False,
+            "count":        len(enriched[:limit]),
+            "predictions":  enriched[:limit],
+            "cached":       False,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         }
     except Exception as e:
@@ -288,9 +259,9 @@ def public_predictions(
 
 @router.get("/fixtures")
 def list_upcoming_fixtures(
-    league_id:  Optional[int] = Query(None),
-    season_id:  Optional[int] = Query(None),
-    limit:      int           = Query(100),
+    league_id: Optional[int] = Query(None),
+    season_id: Optional[int] = Query(None),
+    limit:     int           = Query(100),
 ):
     conn = get_connection()
     cur  = conn.cursor()
@@ -316,26 +287,22 @@ def list_upcoming_fixtures(
             query += " AND m.season_id = %s"; params.append(season_id)
         query += " ORDER BY m.match_date ASC LIMIT %s"
         params.append(limit)
-
         cur.execute(query, params)
         rows = cur.fetchall()
-        return {
-            "count":    len(rows),
-            "fixtures": [dict(r) for r in rows],
-        }
+        return {"count": len(rows), "fixtures": [dict(r) for r in rows]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
 
-# ─── Historical Results Endpoint ─────────────────────────────────────────────
+# ─── Historical Results ───────────────────────────────────────────────────────
 
 @router.get("/results")
 def list_prediction_results(
-    league_id:  Optional[int] = Query(None, description="Filter by league ID"),
-    season_id:  Optional[int] = Query(None, description="Filter by season ID"),
-    limit:      int           = Query(30,   description="Number of recent results"),
+    league_id: Optional[int] = Query(None),
+    season_id: Optional[int] = Query(None),
+    limit:     int           = Query(30),
 ):
     conn = get_connection()
     cur  = conn.cursor()
@@ -371,16 +338,16 @@ def list_prediction_results(
 
 @router.get("/accuracy")
 def prediction_accuracy_trend(
-    league_id:  Optional[int] = Query(None),
-    season_id:  Optional[int] = Query(None),
-    weeks:      int           = Query(9, description="Number of recent gameweeks"),
+    league_id: Optional[int] = Query(None),
+    season_id: Optional[int] = Query(None),
+    weeks:     int           = Query(9),
 ):
     conn = get_connection()
     cur  = conn.cursor()
     try:
         query = """
             SELECT m.gameweek,
-                   COUNT(*)                              AS total,
+                   COUNT(*) AS total,
                    COUNT(CASE
                      WHEN (m.home_score > m.away_score
                            AND ls_h.wins::float / NULLIF(ls_h.games,0) >
@@ -391,7 +358,7 @@ def prediction_accuracy_trend(
                        OR (m.home_score = m.away_score
                            AND ABS(ls_h.wins::float/NULLIF(ls_h.games,0)
                                  - ls_a.wins::float/NULLIF(ls_a.games,0)) < 0.05)
-                     THEN 1 END)                        AS correct
+                     THEN 1 END) AS correct
             FROM matches m
             LEFT JOIN league_standings ls_h
                    ON ls_h.team_id = m.home_team_id
@@ -409,11 +376,7 @@ def prediction_accuracy_trend(
             query += " AND m.league_id = %s"; params.append(league_id)
         if season_id:
             query += " AND m.season_id = %s"; params.append(season_id)
-        query += """
-            GROUP BY m.gameweek
-            ORDER BY m.gameweek DESC
-            LIMIT %s
-        """
+        query += " GROUP BY m.gameweek ORDER BY m.gameweek DESC LIMIT %s"
         params.append(weeks)
         cur.execute(query, params)
         rows = cur.fetchall()
@@ -612,10 +575,10 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             ml_probs = {k: round(v / s, 4) for k, v in ml_probs.items()}
             ml_outcome = ml_raw.get("predicted_outcome", "Home Win")
             mi = ml_raw.get("match", {})
-            home_name    = mi.get("home_team", home_name)
-            away_name    = mi.get("away_team", away_name)
-            league_name  = mi.get("league", "")
-            season_name  = mi.get("season", "")
+            home_name      = mi.get("home_team", home_name)
+            away_name      = mi.get("away_team", away_name)
+            league_name    = mi.get("league", "")
+            season_name    = mi.get("season", "")
             expected_goals = ml_raw.get("expected_goals", {})
         except Exception as exc:
             log.warning("Consensus: ML engine error: %s", exc)
@@ -798,14 +761,14 @@ def _fmt_stats(sq, st):
     if not sq and not st:
         return None
     return {
-        "goals_per_game":  round(_safe_div(sq["goals"] if sq else 0, sq["games"] if sq else 1, 0), 2) if sq else None,
-        "win_rate":        round(_safe_div(st["wins"]  if st else 0, st["games"] if st else 1, 0), 2) if st else None,
-        "possession":      float(sq["possession"]) if sq and sq.get("possession") else None,
-        "avg_age":         float(sq["avg_age"])    if sq and sq.get("avg_age")    else None,
-        "goals_for":       int(st["goals_for"])    if st and st.get("goals_for")  else None,
-        "goals_against":   int(st["goals_against"]) if st and st.get("goals_against") else None,
-        "rank":            int(st["rank"])         if st and st.get("rank")       else None,
-        "points":          int(st["points"])       if st and st.get("points")     else None,
+        "goals_per_game": round(_safe_div(sq["goals"] if sq else 0, sq["games"] if sq else 1, 0), 2) if sq else None,
+        "win_rate":       round(_safe_div(st["wins"]  if st else 0, st["games"] if st else 1, 0), 2) if st else None,
+        "possession":     float(sq["possession"]) if sq and sq.get("possession") else None,
+        "avg_age":        float(sq["avg_age"])    if sq and sq.get("avg_age")    else None,
+        "goals_for":      int(st["goals_for"])    if st and st.get("goals_for")  else None,
+        "goals_against":  int(st["goals_against"]) if st and st.get("goals_against") else None,
+        "rank":           int(st["rank"])         if st and st.get("rank")       else None,
+        "points":         int(st["points"])       if st and st.get("points")     else None,
     }
 
 
@@ -828,24 +791,24 @@ async def generate_prediction(req: GenerateRequest):
             pred_winner   = "home" if home_p > away_p and home_p > draw_p else ("away" if away_p > home_p and away_p > draw_p else "draw")
             actual_winner = "home" if ah > aa else ("away" if aa > ah else "draw")
             actual_result = {
-                "home_score": ah,
-                "away_score": aa,
-                "score_raw":  actual["score_raw"],
-                "match_date": str(actual["match_date"]) if actual.get("match_date") else None,
+                "home_score":         ah,
+                "away_score":         aa,
+                "score_raw":          actual["score_raw"],
+                "match_date":         str(actual["match_date"]) if actual.get("match_date") else None,
                 "prediction_correct": pred_winner == actual_winner,
             }
         return {
-            "success":      True,
-            "home_team":    req.home_team,
-            "away_team":    req.away_team,
-            "home_win_prob": home_p,
-            "draw_prob":    draw_p,
-            "away_win_prob": away_p,
+            "success":         True,
+            "home_team":       req.home_team,
+            "away_team":       req.away_team,
+            "home_win_prob":   home_p,
+            "draw_prob":       draw_p,
+            "away_win_prob":   away_p,
             "predicted_score": {"home": pred_h, "away": pred_a},
-            "confidence":   conf,
-            "home_stats":   _fmt_stats(h_sq, h_st),
-            "away_stats":   _fmt_stats(a_sq, a_st),
-            "actual_result": actual_result,
+            "confidence":      conf,
+            "home_stats":      _fmt_stats(h_sq, h_st),
+            "away_stats":      _fmt_stats(a_sq, a_st),
+            "actual_result":   actual_result,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
