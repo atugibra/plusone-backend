@@ -12,6 +12,7 @@ Endpoints:
   GET  /api/predictions/results        → recent completed match results
   GET  /api/predictions/accuracy       → accuracy trend by gameweek
   GET  /api/predictions/training-status → poll background training status
+  POST /api/predictions/consensus      → dynamic multi-engine consensus prediction
 """
 
 import time
@@ -53,6 +54,14 @@ class GenerateRequest(BaseModel):
     home_team: str
     away_team: str
     league: Optional[str] = None
+
+
+class ConsensusRequest(BaseModel):
+    """Request body for the multi-engine consensus endpoint."""
+    home_team_id: int
+    away_team_id: int
+    league_id:    int
+    season_id:    int
 
 
 # ─── ML Routes ────────────────────────────────────────────────────────────────
@@ -476,6 +485,56 @@ def prediction_accuracy_trend(
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+
+# ─── Dynamic Consensus Engine ────────────────────────────────────────────────
+
+@router.post("/consensus")
+def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
+    """
+    Dynamic multi-engine consensus prediction.
+    Blends DC Engine + ML Engine + Legacy Engine with weights derived
+    from historical prediction accuracy per engine.
+    Returns:
+      - engines:    per-engine raw picks (DC, ML, Legacy)
+      - weights:    dynamic weights used for blending
+      - consensus:  blended probabilities + predicted outcome + confidence
+      - markets:    BTTS, O2.5, clean sheet flags
+      - agreement:  "full" | "majority" | "split"
+    """
+    try:
+        from ml.consensus_engine import run_consensus
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"Consensus engine unavailable: {e}")
+    try:
+        result = run_consensus(
+            req.home_team_id,
+            req.away_team_id,
+            req.league_id,
+            req.season_id,
+        )
+        # Fire-and-forget: log consensus prediction with individual engine picks
+        consensus    = result.get("consensus", {})
+        background_tasks.add_task(
+            _log_prediction_to_db,
+            {
+                "probabilities": {
+                    "home_win": consensus.get("home_win"),
+                    "draw":     consensus.get("draw"),
+                    "away_win": consensus.get("away_win"),
+                },
+                "predicted_outcome": consensus.get("predicted_outcome"),
+                "confidence":        consensus.get("confidence"),
+                "confidence_score":  consensus.get("confidence_score"),
+                "match":             result.get("match", {}),
+            },
+            result.get("match", {}).get("match_id"),
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ─── Legacy Rule-based Route (kept for backward compatibility) ─────────────────
