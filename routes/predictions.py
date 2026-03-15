@@ -124,23 +124,40 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         conn = get_connection()
         cur  = conn.cursor()
         try:
-            cur.execute("""
-                INSERT INTO prediction_log
-                    (match_id, home_team, away_team, league, match_date,
-                     predicted, confidence, confidence_score,
-                     home_win_prob, draw_prob, away_win_prob)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (match_id) DO NOTHING
-            """, (
-                match_id,
-                home_team, away_team, league, match_date,
-                predicted,
-                result.get("confidence"),
-                float(result.get("confidence_score") or 0),
-                float(probs.get("home_win") or 0),
-                float(probs.get("draw") or 0),
-                float(probs.get("away_win") or 0),
-            ))
+            if match_id is not None:
+                cur.execute("""
+                    INSERT INTO prediction_log
+                        (match_id, home_team, away_team, league, match_date,
+                         predicted, confidence, confidence_score,
+                         home_win_prob, draw_prob, away_win_prob)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (match_id) DO NOTHING
+                """, (
+                    match_id,
+                    home_team, away_team, league, match_date,
+                    predicted,
+                    result.get("confidence"),
+                    float(result.get("confidence_score") or 0),
+                    float(probs.get("home_win") or 0),
+                    float(probs.get("draw") or 0),
+                    float(probs.get("away_win") or 0),
+                ))
+            else:
+                cur.execute("""
+                    INSERT INTO prediction_log
+                        (home_team, away_team, league, match_date,
+                         predicted, confidence, confidence_score,
+                         home_win_prob, draw_prob, away_win_prob)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    home_team, away_team, league, match_date,
+                    predicted,
+                    result.get("confidence"),
+                    float(result.get("confidence_score") or 0),
+                    float(probs.get("home_win") or 0),
+                    float(probs.get("draw") or 0),
+                    float(probs.get("away_win") or 0),
+                ))
             conn.commit()
         finally:
             conn.close()
