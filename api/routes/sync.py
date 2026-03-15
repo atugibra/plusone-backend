@@ -98,12 +98,12 @@ def _auto_evaluate_predictions(conn) -> int:
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.home_team_id
-                     AND LOWER(t.name) = LOWER(pl.home_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.home_team) || '%'
              )
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.away_team_id
-                     AND LOWER(t.name) = LOWER(pl.away_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.away_team) || '%'
              )
             WHERE pl.actual IS NULL
 
@@ -117,17 +117,17 @@ def _auto_evaluate_predictions(conn) -> int:
              AND pl.match_date IS NULL
              AND m.home_score IS NOT NULL
              AND m.away_score IS NOT NULL
-             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '3 days')
-                                  AND (pl.created_at::date + INTERVAL '3 days')
+             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '30 days')
+                                  AND (pl.created_at::date + INTERVAL '30 days')
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.home_team_id
-                     AND LOWER(t.name) = LOWER(pl.home_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.home_team) || '%'
              )
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.away_team_id
-                     AND LOWER(t.name) = LOWER(pl.away_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.away_team) || '%'
              )
             WHERE pl.actual IS NULL
         """)
@@ -470,6 +470,7 @@ def sync_all(payload: SyncPayload):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("SET statement_timeout = '60s'")
         league_id = get_or_create_league(cur, payload.league)
         season_id = get_or_create_season(cur, payload.season)
         fixtures_list = payload.fixtures or []
@@ -490,7 +491,7 @@ def sync_all(payload: SyncPayload):
                     ha_split_list.extend(tables_to_home_away_stats([t]))
                 else:
                     stats_list.extend(tables_to_squad_stats([t]))
-        fx  = _insert_fixtures(cur, league_id, season_id, payload.league, fixtures_list)
+        fx  = _insert_fixtures(cur, league_id, season_id, payload.league, fixtures_list, conn=conn)
         st  = _insert_squad_stats(cur, league_id, season_id, stats_list)
         pl  = _insert_player_stats(cur, season_id, payload.league, players_list)
         sd  = _insert_standings(cur, league_id, season_id, standings_list)
@@ -516,12 +517,13 @@ def sync_fixtures(payload: SyncPayload):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("SET statement_timeout = '60s'")
         league_id = get_or_create_league(cur, payload.league)
         season_id = get_or_create_season(cur, payload.season)
         rows = payload.fixtures or []
         if payload.tables:
             rows.extend(tables_to_fixtures(payload.tables))
-        inserted = _insert_fixtures(cur, league_id, season_id, payload.league, rows)
+        inserted = _insert_fixtures(cur, league_id, season_id, payload.league, rows, conn=conn)
         conn.commit()
         # Auto-evaluate predictions whose matches just received scores
         evaluated = _auto_evaluate_predictions(conn)
@@ -599,8 +601,16 @@ def tables_to_standings(tables):
     return result
 
 
-def _insert_fixtures(cur, league_id, season_id, league_name, fixtures):
+def _insert_fixtures(cur, league_id, season_id, league_name, fixtures, conn=None, batch_size=50):
+    """Insert fixture rows in small committed batches to avoid statement-timeout
+    on large leagues (e.g. Argentine Primera with 400+ rows per sync).
+
+    When `conn` is provided each batch is committed immediately so that the
+    index lock is released between chunks.  When called without `conn`
+    (legacy path) it falls back to the old single-transaction behaviour.
+    """
     count = 0
+    pending = 0
     for f in fixtures:
         home = str(f.get("home_team", "")).strip()
         away = str(f.get("away_team", "")).strip()
@@ -636,6 +646,11 @@ def _insert_fixtures(cur, league_id, season_id, league_name, fixtures):
             safe_text(f.get("referee", "")), safe_text(f.get("round", ""))
         ))
         count += 1
+        pending += 1
+        # Commit every batch_size rows to release index lock
+        if conn and pending >= batch_size:
+            conn.commit()
+            pending = 0
     return count
 
 

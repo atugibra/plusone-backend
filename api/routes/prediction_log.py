@@ -145,12 +145,12 @@ def evaluate_predictions():
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.home_team_id
-                     AND LOWER(t.name) = LOWER(pl.home_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.home_team) || '%'
              )
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.away_team_id
-                     AND LOWER(t.name) = LOWER(pl.away_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.away_team) || '%'
              )
             WHERE pl.actual IS NULL
 
@@ -164,17 +164,17 @@ def evaluate_predictions():
              AND pl.match_date IS NULL
              AND m.home_score IS NOT NULL
              AND m.away_score IS NOT NULL
-             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '3 days')
-                                  AND (pl.created_at::date + INTERVAL '3 days')
+             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '30 days')
+                                  AND (pl.created_at::date + INTERVAL '30 days')
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.home_team_id
-                     AND LOWER(t.name) = LOWER(pl.home_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.home_team) || '%'
              )
              AND EXISTS (
                    SELECT 1 FROM teams t
                    WHERE t.id = m.away_team_id
-                     AND LOWER(t.name) = LOWER(pl.away_team)
+                     AND LOWER(t.name) LIKE '%' || LOWER(pl.away_team) || '%'
              )
             WHERE pl.actual IS NULL
         """)
