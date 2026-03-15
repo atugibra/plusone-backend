@@ -24,11 +24,7 @@ import logging
 import math
 from typing import Optional
 
-import numpy as np
-
 from database import get_connection
-import ml.prediction_engine as ml_engine
-from ml.dc_engine import predict_dc_match
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +60,7 @@ def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
     Returns {home_win, draw, away_win, predicted_outcome}.
     Falls back to equal probs on any error.
     """
+    import numpy as np  # lazy import
     FALLBACK = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35,
                 "predicted_outcome": "Home Win"}
     try:
@@ -213,8 +210,9 @@ def _blend(dc: dict, ml: dict, legacy: dict, weights: dict) -> dict:
     }
 
 
-def _confidence_from_entropy(probs: dict) -> tuple[float, str]:
+def _confidence_from_entropy(probs: dict) -> tuple:
     """Shannon-entropy-based confidence score (0–100) and label."""
+    import numpy as np  # lazy import
     p = np.array([probs["home_win"], probs["draw"], probs["away_win"]])
     p = np.clip(p, 1e-10, 1.0)
     entropy     = float(-np.sum(p * np.log(p)))
@@ -274,6 +272,8 @@ def run_consensus(
 
         # ── 2. Run DC engine ──────────────────────────────────────────────────
         try:
+            from ml.dc_engine import predict_dc_match  # lazy import
+            import numpy as np
             dc_raw = predict_dc_match(home_team_id, away_team_id)
             if "error" in dc_raw:
                 raise RuntimeError(dc_raw["error"])
@@ -297,6 +297,7 @@ def run_consensus(
 
         # ── 3. Run ML engine ──────────────────────────────────────────────────
         try:
+            import ml.prediction_engine as ml_engine  # lazy import
             ml_raw = ml_engine.predict_match(home_team_id, away_team_id,
                                              league_id, season_id)
             if "error" in ml_raw:
@@ -352,6 +353,7 @@ def run_consensus(
         blended = _blend(dc_probs, ml_probs, legacy_probs, weights)
 
         # ── 7. Consensus outcome + confidence ─────────────────────────────────
+        import numpy as np  # lazy import (already imported above in DC block)
         idx = int(np.argmax([blended["home_win"], blended["draw"], blended["away_win"]]))
         consensus_outcome   = OUTCOME_LABELS[idx]
         confidence_score, confidence_label = _confidence_from_entropy(blended)
