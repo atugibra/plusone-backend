@@ -487,34 +487,275 @@ def prediction_accuracy_trend(
         conn.close()
 
 
-# ─── Dynamic Consensus Engine ────────────────────────────────────────────────
+# ─── Dynamic Consensus Engine (self-contained, no external module import) ────
+
+_OUTCOME_LABELS = ["Home Win", "Draw", "Away Win"]
+_DEFAULT_WEIGHTS = {"dc": 0.45, "ml": 0.35, "legacy": 0.20}
+_MIN_GRADED_ROWS = 10
+
+
+def _consensus_safe_div(a, b, default=0.0):
+    try:
+        return float(a) / float(b) if b else default
+    except Exception:
+        return default
+
+
+def _fetch_engine_weights(cur) -> dict:
+    """Query prediction_log for trailing 30-day per-engine accuracy."""
+    try:
+        cur.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN dc_correct     THEN 1 ELSE 0 END)::float AS dc_correct,
+                SUM(CASE WHEN ml_correct     THEN 1 ELSE 0 END)::float AS ml_correct,
+                SUM(CASE WHEN legacy_correct THEN 1 ELSE 0 END)::float AS legacy_correct
+            FROM prediction_log
+            WHERE correct IS NOT NULL
+              AND evaluated_at >= NOW() - INTERVAL '30 days'
+              AND dc_predicted_outcome     IS NOT NULL
+              AND ml_predicted_outcome     IS NOT NULL
+              AND legacy_predicted_outcome IS NOT NULL
+        """)
+        row = cur.fetchone()
+        total = int(row["total"] or 0) if row else 0
+        if total < _MIN_GRADED_ROWS:
+            return dict(_DEFAULT_WEIGHTS)
+        dc_acc     = float(row["dc_correct"]     or 0) / total
+        ml_acc     = float(row["ml_correct"]     or 0) / total
+        legacy_acc = float(row["legacy_correct"] or 0) / total
+        w_sum = dc_acc + ml_acc + legacy_acc
+        if w_sum < 0.01:
+            return dict(_DEFAULT_WEIGHTS)
+        return {
+            "dc":     round(dc_acc     / w_sum, 4),
+            "ml":     round(ml_acc     / w_sum, 4),
+            "legacy": round(legacy_acc / w_sum, 4),
+        }
+    except Exception:
+        return dict(_DEFAULT_WEIGHTS)
+
+
+def _run_legacy_inline(cur, home_id: int, away_id: int) -> dict:
+    """Heuristic prediction using standings + squad stats."""
+    fallback = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35,
+                "predicted_outcome": "Home Win"}
+    try:
+        cur.execute("""
+            SELECT ls.wins, ls.games, ls.goals_for, ls.goals_against
+            FROM league_standings ls WHERE ls.team_id = %s
+            ORDER BY ls.season_id DESC LIMIT 1
+        """, (home_id,))
+        h_st = cur.fetchone()
+        cur.execute("""
+            SELECT ls.wins, ls.games, ls.goals_for, ls.goals_against
+            FROM league_standings ls WHERE ls.team_id = %s
+            ORDER BY ls.season_id DESC LIMIT 1
+        """, (away_id,))
+        a_st = cur.fetchone()
+        cur.execute("""
+            SELECT ts.goals, ts.games FROM team_squad_stats ts
+            WHERE ts.team_id = %s AND ts.split = 'for'
+            ORDER BY ts.season_id DESC LIMIT 1
+        """, (home_id,))
+        h_sq = cur.fetchone()
+        cur.execute("""
+            SELECT ts.goals, ts.games FROM team_squad_stats ts
+            WHERE ts.team_id = %s AND ts.split = 'for'
+            ORDER BY ts.season_id DESC LIMIT 1
+        """, (away_id,))
+        a_sq = cur.fetchone()
+
+        h_gpg = _consensus_safe_div(h_sq["goals"] if h_sq else 0, h_sq["games"] if h_sq else 1, 1.2)
+        a_gpg = _consensus_safe_div(a_sq["goals"] if a_sq else 0, a_sq["games"] if a_sq else 1, 1.0)
+        h_wr  = _consensus_safe_div(h_st["wins"]  if h_st else 0, h_st["games"] if h_st else 1, 0.40)
+        a_wr  = _consensus_safe_div(a_st["wins"]  if a_st else 0, a_st["games"] if a_st else 1, 0.35)
+
+        h_str = 0.6 * h_gpg + 0.4 * h_wr
+        a_str = 0.6 * a_gpg + 0.4 * a_wr
+        total = h_str + a_str + 0.001
+        r_h = max(0.1, h_str / total + 0.06)
+        r_a = max(0.1, a_str / total - 0.03)
+        r_d = max(0.1, 1 - r_h - r_a)
+        s   = r_h + r_a + r_d
+        home_p = round(r_h / s, 4)
+        away_p = round(r_a / s, 4)
+        draw_p = round(1 - home_p - away_p, 4)
+
+        probs = [home_p, draw_p, away_p]
+        idx   = probs.index(max(probs))
+        return {"home_win": home_p, "draw": draw_p, "away_win": away_p,
+                "predicted_outcome": _OUTCOME_LABELS[idx]}
+    except Exception as exc:
+        log.warning("Consensus legacy engine error: %s", exc)
+        return fallback
+
+
+def _blend_probs(dc: dict, ml: dict, legacy: dict, w: dict) -> dict:
+    hw = w["dc"] * dc["home_win"] + w["ml"] * ml["home_win"] + w["legacy"] * legacy["home_win"]
+    dr = w["dc"] * dc["draw"]     + w["ml"] * ml["draw"]     + w["legacy"] * legacy["draw"]
+    aw = w["dc"] * dc["away_win"] + w["ml"] * ml["away_win"] + w["legacy"] * legacy["away_win"]
+    t  = hw + dr + aw or 1.0
+    return {"home_win": round(hw / t, 4), "draw": round(dr / t, 4), "away_win": round(aw / t, 4)}
+
+
+def _entropy_confidence(probs: dict):
+    import math
+    vals = [probs["home_win"], probs["draw"], probs["away_win"]]
+    entropy     = -sum(p * math.log(max(p, 1e-10)) for p in vals)
+    max_entropy = -math.log(1.0 / 3.0)
+    score = round((1.0 - entropy / max_entropy) * 100, 1)
+    label = "High" if score >= 30 else ("Medium" if score >= 15 else "Low")
+    return score, label
+
 
 @router.post("/consensus")
 def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
     """
     Dynamic multi-engine consensus prediction.
-    Blends DC Engine + ML Engine + Legacy Engine with weights derived
-    from historical prediction accuracy per engine.
-    Returns:
-      - engines:    per-engine raw picks (DC, ML, Legacy)
-      - weights:    dynamic weights used for blending
-      - consensus:  blended probabilities + predicted outcome + confidence
-      - markets:    BTTS, O2.5, clean sheet flags
-      - agreement:  "full" | "majority" | "split"
+    Self-contained: runs DC Engine, ML Engine, and Legacy Engine inline
+    with no dependency on ml.consensus_engine module.
     """
+    import math
+    conn = get_connection()
+    cur  = conn.cursor()
+    errors = []
     try:
-        from ml.consensus_engine import run_consensus
-    except ImportError as e:
-        raise HTTPException(status_code=503, detail=f"Consensus engine unavailable: {e}")
-    try:
-        result = run_consensus(
-            req.home_team_id,
-            req.away_team_id,
-            req.league_id,
-            req.season_id,
-        )
-        # Fire-and-forget: log consensus prediction with individual engine picks
-        consensus    = result.get("consensus", {})
+        # ── 1. Dynamic weights from prediction history ─────────────────────────
+        weights = _fetch_engine_weights(cur)
+        weight_source = "dynamic_historical" if weights != _DEFAULT_WEIGHTS else "default_fallback"
+
+        # ── 2. DC Engine ───────────────────────────────────────────────────────
+        try:
+            from ml.dc_engine import predict_dc_match
+            dc_raw = predict_dc_match(req.home_team_id, req.away_team_id)
+            if "error" in dc_raw:
+                raise RuntimeError(dc_raw["error"])
+            blended_key = dc_raw.get("calibrated") or dc_raw.get("blended") or {}
+            dc_probs = {
+                "home_win": float(blended_key.get("home_win", 0.35)),
+                "draw":     float(blended_key.get("draw",     0.30)),
+                "away_win": float(blended_key.get("away_win", 0.35)),
+            }
+            s = sum(dc_probs.values()) or 1
+            dc_probs = {k: round(v / s, 4) for k, v in dc_probs.items()}
+            dc_outcome = _OUTCOME_LABELS[[dc_probs["home_win"], dc_probs["draw"], dc_probs["away_win"]].index(max(dc_probs.values()))]
+        except Exception as exc:
+            log.warning("Consensus: DC engine error: %s", exc)
+            errors.append(f"dc: {exc}")
+            dc_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+            dc_outcome = "Home Win"
+            weights["dc"] = 0.0
+
+        # ── 3. ML Engine ───────────────────────────────────────────────────────
+        home_name, away_name, league_name, season_name = (
+            f"Team {req.home_team_id}", f"Team {req.away_team_id}", "", "")
+        expected_goals = {}
+        try:
+            import ml.prediction_engine as ml_engine
+            ml_raw = ml_engine.predict_match(
+                req.home_team_id, req.away_team_id, req.league_id, req.season_id)
+            if "error" in ml_raw:
+                raise RuntimeError(ml_raw["error"])
+            ml_probs_inner = ml_raw.get("probabilities", {})
+            ml_probs = {
+                "home_win": float(ml_probs_inner.get("home_win", 0.35)),
+                "draw":     float(ml_probs_inner.get("draw",     0.30)),
+                "away_win": float(ml_probs_inner.get("away_win", 0.35)),
+            }
+            s = sum(ml_probs.values()) or 1
+            ml_probs = {k: round(v / s, 4) for k, v in ml_probs.items()}
+            ml_outcome = ml_raw.get("predicted_outcome", "Home Win")
+            mi = ml_raw.get("match", {})
+            home_name    = mi.get("home_team", home_name)
+            away_name    = mi.get("away_team", away_name)
+            league_name  = mi.get("league", "")
+            season_name  = mi.get("season", "")
+            expected_goals = ml_raw.get("expected_goals", {})
+        except Exception as exc:
+            log.warning("Consensus: ML engine error: %s", exc)
+            errors.append(f"ml: {exc}")
+            ml_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+            ml_outcome = "Home Win"
+            weights["ml"] = 0.0
+
+        # ── 4. Legacy Engine ───────────────────────────────────────────────────
+        try:
+            legacy_raw     = _run_legacy_inline(cur, req.home_team_id, req.away_team_id)
+            legacy_probs   = {k: v for k, v in legacy_raw.items()
+                              if k in ("home_win", "draw", "away_win")}
+            legacy_outcome = legacy_raw.get("predicted_outcome", "Home Win")
+        except Exception as exc:
+            log.warning("Consensus: Legacy engine error: %s", exc)
+            errors.append(f"legacy: {exc}")
+            legacy_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+            legacy_outcome = "Home Win"
+            weights["legacy"] = 0.0
+
+        # ── 5. Re-normalise weights ─────────────────────────────────────────────
+        w_sum = sum(weights.values())
+        if w_sum < 0.01:
+            weights = dict(_DEFAULT_WEIGHTS)
+        else:
+            weights = {k: round(v / w_sum, 4) for k, v in weights.items()}
+
+        # ── 6. Blend ───────────────────────────────────────────────────────────
+        blended = _blend_probs(dc_probs, ml_probs, legacy_probs, weights)
+
+        # ── 7. Outcome + confidence ────────────────────────────────────────────
+        prob_list = [blended["home_win"], blended["draw"], blended["away_win"]]
+        consensus_outcome = _OUTCOME_LABELS[prob_list.index(max(prob_list))]
+        confidence_score, confidence_label = _entropy_confidence(blended)
+        all_outcomes    = [dc_outcome, ml_outcome, legacy_outcome]
+        unique_outcomes = len(set(all_outcomes))
+        agreement = "full" if unique_outcomes == 1 else ("majority" if unique_outcomes == 2 else "split")
+
+        # ── 8. Market proxies ──────────────────────────────────────────────────
+        home_xg  = float(expected_goals.get("home_xg", 1.35))
+        away_xg  = float(expected_goals.get("away_xg", 1.10))
+        btts_yes = max(0.0, min(1.0, round(
+            1 - math.exp(-home_xg) - math.exp(-away_xg) + math.exp(-(home_xg + away_xg)), 4)))
+        over_2_5 = max(0.0, min(1.0, round(
+            1 - sum(math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k)
+                    for k in range(3)), 4)))
+
+        result = {
+            "match": {
+                "home_team":    home_name,
+                "away_team":    away_name,
+                "home_team_id": req.home_team_id,
+                "away_team_id": req.away_team_id,
+                "league":       league_name,
+                "season":       season_name,
+            },
+            "consensus": {
+                "home_win":          blended["home_win"],
+                "draw":              blended["draw"],
+                "away_win":          blended["away_win"],
+                "predicted_outcome": consensus_outcome,
+                "confidence":        confidence_label,
+                "confidence_score":  confidence_score,
+            },
+            "engines": {
+                "dc":     {**dc_probs,     "predicted_outcome": dc_outcome},
+                "ml":     {**ml_probs,     "predicted_outcome": ml_outcome},
+                "legacy": {**legacy_probs, "predicted_outcome": legacy_outcome},
+            },
+            "weights_used": {**weights, "source": weight_source},
+            "agreement":    agreement,
+            "markets": {
+                "btts_yes":  btts_yes,
+                "btts_no":   round(1 - btts_yes, 4),
+                "over_2_5":  over_2_5,
+                "under_2_5": round(1 - over_2_5, 4),
+                "home_xg":   round(home_xg, 2),
+                "away_xg":   round(away_xg, 2),
+            },
+            **({"_errors": errors} if errors else {}),
+        }
+
+        # Log the consensus prediction (best-effort)
+        consensus = result.get("consensus", {})
         background_tasks.add_task(
             _log_prediction_to_db,
             {
@@ -528,13 +769,16 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
                 "confidence_score":  consensus.get("confidence_score"),
                 "match":             result.get("match", {}),
             },
-            result.get("match", {}).get("match_id"),
+            None,
         )
         return result
+
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        conn.close()
 
 
 # ─── Legacy Rule-based Route (kept for backward compatibility) ─────────────────
