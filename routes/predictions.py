@@ -118,14 +118,23 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                         predicted, home_team, away_team)
             return
 
+        # Markets — present in consensus (result.markets) or ML (result.expected_goals)
+        markets  = result.get("markets") or {}
+        xg_src   = result.get("expected_goals") or markets
+        btts_yes = markets.get("btts_yes")
+        over_2_5 = markets.get("over_2_5")
+        home_xg  = xg_src.get("home_xg")
+        away_xg  = xg_src.get("away_xg")
+
         conn = get_connection()
         cur  = conn.cursor()
         cur.execute("""
             INSERT INTO prediction_log
                 (match_id, home_team, away_team, league, match_date,
                  predicted, confidence, confidence_score,
-                 home_win_prob, draw_prob, away_win_prob)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 home_win_prob, draw_prob, away_win_prob,
+                 btts_yes, over_2_5, home_xg, away_xg)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             match_id,
             home_team, away_team, league, match_date,
@@ -135,6 +144,10 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
             float(probs.get("home_win") or 0),
             float(probs.get("draw") or 0),
             float(probs.get("away_win") or 0),
+            float(btts_yes) if btts_yes is not None else None,
+            float(over_2_5) if over_2_5 is not None else None,
+            float(home_xg)  if home_xg  is not None else None,
+            float(away_xg)  if away_xg  is not None else None,
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
@@ -433,7 +446,7 @@ def _fetch_engine_weights(conn) -> dict:
         }
     except Exception as exc:
         log.warning("_fetch_engine_weights failed (%s) — using defaults", exc)
-        try: conn.rollback()   # reset aborted transaction so conn stays usable
+        try: conn.rollback()
         except: pass
         return dict(_DEFAULT_WEIGHTS)
     finally:
@@ -519,7 +532,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
     conn   = get_connection()
     errors = []
     try:
-        # ── 1. Dynamic weights (own cursor, rolls back on failure) ─────────────
+        # ── 1. Dynamic weights ─────────────────────────────────────────────────
         weights = _fetch_engine_weights(conn)
         weight_source = "dynamic_historical" if weights != _DEFAULT_WEIGHTS else "default_fallback"
 
@@ -579,7 +592,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             ml_outcome = "Home Win"
             weights["ml"] = 0.0
 
-        # ── 4. Legacy Engine (own cursor via conn) ─────────────────────────────
+        # ── 4. Legacy Engine ───────────────────────────────────────────────────
         try:
             legacy_raw     = _run_legacy_inline(conn, req.home_team_id, req.away_team_id)
             legacy_probs   = {k: v for k, v in legacy_raw.items()
@@ -650,7 +663,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             **({"_errors": errors} if errors else {}),
         }
 
-        # ── 9. Log directly (synchronous — guarantees it runs) ─────────────────
+        # ── 9. Log directly (synchronous) ──────────────────────────────────────
         consensus = result["consensus"]
         _log_prediction_to_db(
             {
@@ -663,6 +676,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
                 "confidence":        consensus["confidence"],
                 "confidence_score":  consensus["confidence_score"],
                 "match":             result["match"],
+                "markets":           result["markets"],
             },
             None,
         )
