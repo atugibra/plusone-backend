@@ -24,6 +24,17 @@ from typing import Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 
+# ─── League-style defaults (used when a league has < 10 historical matches) ────
+_LEAGUE_STYLE_DEFAULTS = {
+    "league_home_win_rate":        0.44,
+    "league_draw_rate":            0.25,
+    "league_away_win_rate":        0.31,
+    "league_goals_pg":             2.70,
+    "league_btts_rate":            0.50,
+    "league_home_advantage_score": 1.42,
+}
+
+
 # ─── Helpers (mirrors feature_engineering.py) ─────────────────────────────────
 
 def _f(val, default=0.0):
@@ -148,27 +159,29 @@ class DataCache:
             self.players[k] = sorted(rows, key=lambda x: _f(x.get("goals")),
                                      reverse=True)[:5]
 
-        # 4. Completed matches — rolling 2-year window by DATE (not season_id)
-        # Using a date window (not season_id) ensures training always has enough
-        # historical data regardless of how seasons are numbered in the DB.
-        # 5000 row cap keeps memory bounded: ~5000 matches × ~400 bytes ≈ 2 MB.
+        # 4. Completed matches — rolling 3-year window by DATE (not season_id)
+        # Using a wide date window ensures training has a representative mix of
+        # all outcome types (Home Win ~44%, Away Win ~30%, Draw ~26%) from the
+        # full 15k+ match database. The previous 6-month / 1500-row cap was too
+        # narrow and caused the model to see a skewed outcome distribution.
+        # 6000 rows × ~400 bytes ≈ 2.4 MB — still well within memory budget.
         cur.execute("""
             SELECT id, home_team_id, away_team_id, season_id, league_id,
                    home_score, away_score, match_date
             FROM matches
             WHERE home_score IS NOT NULL AND away_score IS NOT NULL
-              AND match_date >= CURRENT_DATE - INTERVAL '6 months'
+              AND match_date >= CURRENT_DATE - INTERVAL '3 years'
             ORDER BY match_date DESC
-            LIMIT 1500
+            LIMIT 6000
         """)
         self.all_matches: List[dict] = [dict(r) for r in cur.fetchall()]
 
-        # Index by team — cap at 30 per team to bound memory
+        # Index by team — cap at 50 per team to bound memory
         self.matches_by_team: Dict[int, List] = defaultdict(list)
         for m in self.all_matches:
-            if len(self.matches_by_team[m["home_team_id"]]) < 30:
+            if len(self.matches_by_team[m["home_team_id"]]) < 50:
                 self.matches_by_team[m["home_team_id"]].append(m)
-            if len(self.matches_by_team[m["away_team_id"]]) < 30:
+            if len(self.matches_by_team[m["away_team_id"]]) < 50:
                 self.matches_by_team[m["away_team_id"]].append(m)
 
         # 5. Seasons ──────────────────────────────────────────────────────────
@@ -216,6 +229,44 @@ class DataCache:
             len(self.standings), len(self.squad), sum(len(v) for v in self.players.values()),
             len(self.all_matches), len(self.venue_stats),
         )
+
+        # 7. Compute league-style statistics in-memory from already-loaded matches.
+        # This reuses self.all_matches — no additional DB query needed.
+        # Keyed by league_id → dict of 6 style features.
+        self.league_style: Dict[int, dict] = {}
+        _by_league: Dict[int, dict] = defaultdict(lambda: {
+            "n": 0, "hw": 0, "d": 0, "aw": 0, "total_goals": 0.0, "btts": 0
+        })
+        for m in self.all_matches:
+            lid = m.get("league_id")
+            if lid is None:
+                continue
+            hs = _f(m.get("home_score")); as_ = _f(m.get("away_score"))
+            bucket = _by_league[lid]
+            bucket["n"] += 1
+            bucket["total_goals"] += hs + as_
+            if hs > as_:   bucket["hw"] += 1
+            elif hs == as_: bucket["d"]  += 1
+            else:           bucket["aw"] += 1
+            if hs > 0 and as_ > 0: bucket["btts"] += 1
+
+        for lid, b in _by_league.items():
+            n = b["n"]
+            if n < 10:
+                self.league_style[lid] = dict(_LEAGUE_STYLE_DEFAULTS)
+                continue
+            hw_r = b["hw"] / n
+            aw_r = b["aw"] / n
+            self.league_style[lid] = {
+                "league_home_win_rate":        round(hw_r,                   4),
+                "league_draw_rate":            round(b["d"]  / n,            4),
+                "league_away_win_rate":        round(aw_r,                   4),
+                "league_goals_pg":             round(b["total_goals"] / n,   4),
+                "league_btts_rate":            round(b["btts"] / n,          4),
+                "league_home_advantage_score": round(
+                    _safe_div(hw_r, aw_r, _LEAGUE_STYLE_DEFAULTS["league_home_advantage_score"]), 4
+                ),
+            }
 
 
 # ─── Form (in-memory) ─────────────────────────────────────────────────────────
@@ -647,6 +698,29 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
     for k, v in h2h.items():
         if k != "h2h_last_5":
             vector[k] = _f(v)
+
+    # ── League-style context (6 features) ──────────────────────────────────
+    # Mirrors feature_engineering.compute_league_style() — same keys so the
+    # trained model sees the same feature names at inference time.
+    style = cache.league_style.get(league_id, dict(_LEAGUE_STYLE_DEFAULTS))
+    vector.update(style)
+
+    # ── League-relative team strength (4 features) ─────────────────────────
+    lg_goals   = style["league_goals_pg"] or 2.70
+    half_goals = lg_goals / 2
+    vector["home_attack_rel_league"]  = _safe_div(
+        home_feats.get("goals_for_pg", 0.0), half_goals, 1.0
+    )
+    vector["away_attack_rel_league"]  = _safe_div(
+        away_feats.get("goals_for_pg", 0.0), half_goals, 1.0
+    )
+    vector["home_defence_rel_league"] = _safe_div(
+        half_goals, home_feats.get("goals_against_pg", half_goals) or half_goals, 1.0
+    )
+    vector["away_defence_rel_league"] = _safe_div(
+        half_goals, away_feats.get("goals_against_pg", half_goals) or half_goals, 1.0
+    )
+
     vector["home_advantage"] = 1.0
 
     feature_names  = sorted(vector.keys())
