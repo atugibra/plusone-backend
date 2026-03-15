@@ -73,12 +73,6 @@ def prediction_status():
 
 
 def _run_training_in_background():
-    """
-    Runs in a daemon Thread — completely independent of the HTTP request lifecycle.
-    This means training continues even if the user navigates away from the page.
-    FastAPI BackgroundTasks can be cancelled when the request connection drops;
-    a threading.Thread is not affected by that.
-    """
     global _training_state
     _training_state = {"status": "running", "started_at": time.time()}
     try:
@@ -90,11 +84,6 @@ def _run_training_in_background():
 
 @router.post("/train")
 def train(req: TrainRequest = None):
-    """
-    Kick off model training in a background thread.
-    Returns immediately — clients should poll /training-status for progress.
-    Training continues even if the user navigates away (daemon thread).
-    """
     if _training_state.get("status") == "running":
         elapsed = int(time.time() - _training_state.get("started_at", time.time()))
         return {"started": False, "message": f"Training already running ({elapsed}s elapsed). Poll /training-status."}
@@ -105,7 +94,6 @@ def train(req: TrainRequest = None):
 
 @router.get("/training-status")
 def training_status():
-    """Poll this endpoint to check if background training has finished."""
     state = _training_state
     if not state:
         return {"status": "idle", "message": "No training has been triggered yet."}
@@ -124,10 +112,9 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         league     = match_info.get("league")    or result.get("league")
         predicted  = result.get("predicted_outcome")
 
-        # match_date lives at root level in upcoming results, inside match for single predict
         match_date = (
-            result.get("match_date")          # predict_upcoming_fast puts it here
-            or match_info.get("date")         # DC markets puts it here
+            result.get("match_date")
+            or match_info.get("date")
             or match_info.get("match_date")
         )
 
@@ -149,10 +136,10 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 home_team, away_team, league, match_date,
                 predicted,
                 result.get("confidence"),
-                float(result.get("confidence_score") or 0),   
-                float(probs.get("home_win") or 0),             
-                float(probs.get("draw") or 0),                 
-                float(probs.get("away_win") or 0),            
+                float(result.get("confidence_score") or 0),
+                float(probs.get("home_win") or 0),
+                float(probs.get("draw") or 0),
+                float(probs.get("away_win") or 0),
             ))
             conn.commit()
         finally:
@@ -160,14 +147,9 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
     except Exception as exc:
         log.warning("Could not log prediction: %s", exc)
 
+
 @router.post("/predict")
 def predict(req: PredictRequest, background_tasks: BackgroundTasks):
-    """
-    Predict the outcome of a specific match by team IDs.
-    Returns rich output: probabilities, xG, key factors, H2H, team comparison.
-    Automatically logs the prediction to prediction_log (non-blocking).
-    Returns 422 if the model has not been trained yet.
-    """
     if req.home_team_id == req.away_team_id:
         raise HTTPException(status_code=400, detail="Home and away teams must be different.")
     try:
@@ -186,7 +168,6 @@ def predict(req: PredictRequest, background_tasks: BackgroundTasks):
                 )
             raise HTTPException(status_code=422, detail=error_msg)
 
-        # Auto-log the prediction (best-effort, non-blocking)
         match_id = result.get("match", {}).get("match_id") or result.get("match_id")
         background_tasks.add_task(_log_prediction_to_db, result, match_id)
 
@@ -203,12 +184,9 @@ def upcoming_predictions(
     league_id: Optional[int] = Query(None, description="Filter by league ID"),
     limit:     int           = Query(50,   description="Max fixtures to predict"),
 ):
-    """Predict all upcoming unplayed fixtures using the fast bulk-load path.
-    Automatically logs every prediction to prediction_log (non-blocking)."""
     try:
         results = predict_upcoming_fast(league_id=league_id, limit=limit)
 
-        # Auto-log all predictions in background
         def _bulk_log():
             for r in results:
                 mid = r.get("fixture_id") or (r.get("match") or {}).get("match_id")
@@ -227,14 +205,6 @@ def upcoming_predictions(
 # ─── Public predictions endpoint (bet recommendations) ───────────────────────
 
 def _derive_best_bets(predictions: list) -> list:
-    """
-    Add bet_recommendation field to each prediction.
-    Logic:
-    - High confidence + lead probability > 55% → "Strong pick: {outcome}"
-    - Medium confidence + lead prob > 48% → "Value bet: {outcome}"
-    - Both teams strong attack (predicted score >=2 goals each side) → "Both Teams to Score"
-    - Under-valued draw (draw_prob > 35% but predicted outcome isn't draw) → flag it
-    """
     enriched = []
     for p in predictions:
         probs    = p.get("probabilities", {})
@@ -246,11 +216,9 @@ def _derive_best_bets(predictions: list) -> list:
         xg       = p.get("expected_goals", {}) or {}
         home_xg  = float(xg.get("home_xg") or 0)
         away_xg  = float(xg.get("away_xg") or 0)
-        match    = p.get("match", {}) or {}
 
         bets = []
 
-        # Main outcome bet
         lead_prob = max(hw, dr, aw)
         if conf == "High" and lead_prob >= 0.55:
             bets.append({
@@ -265,7 +233,6 @@ def _derive_best_bets(predictions: list) -> list:
                 "tier": "medium",
             })
 
-        # BTTS (Both Teams to Score)
         if home_xg >= 1.1 and away_xg >= 1.0:
             bets.append({
                 "bet":  "⚽ Both Teams to Score (recommended)",
@@ -273,7 +240,6 @@ def _derive_best_bets(predictions: list) -> list:
                 "tier": "btts",
             })
 
-        # Undervalued draw warning
         if dr >= 0.34 and outcome != "Draw":
             bets.append({
                 "bet":  f"⚠️ Draw value — {round(dr * 100)}% probability, consider 1X or X2",
@@ -290,15 +256,9 @@ def public_predictions(
     league_id: Optional[int] = Query(None, description="Filter by league ID"),
     limit:     int           = Query(30,   description="Max predictions"),
 ):
-    """
-    Public-facing upcoming match predictions with bet recommendations.
-    Results are cached for 15 minutes to reduce DB load.
-    No authentication required.
-    """
     global _public_cache
     now = time.time()
 
-    # Return cached data if still fresh
     if _public_cache["data"] is not None and now < _public_cache["expires_at"]:
         data = _public_cache["data"]
         if league_id:
@@ -309,7 +269,6 @@ def public_predictions(
         raw = predict_upcoming_fast(league_id=None, limit=100)
         enriched = _derive_best_bets(raw)
 
-        # Cache result for 15 minutes
         _public_cache = {"data": enriched, "expires_at": now + 900}
 
         if league_id:
@@ -333,10 +292,6 @@ def list_upcoming_fixtures(
     season_id:  Optional[int] = Query(None),
     limit:      int           = Query(100),
 ):
-    """
-    List upcoming unplayed fixtures with team names and IDs.
-    Use this to discover team IDs before calling /predict.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
@@ -382,10 +337,6 @@ def list_prediction_results(
     season_id:  Optional[int] = Query(None, description="Filter by season ID"),
     limit:      int           = Query(30,   description="Number of recent results"),
 ):
-    """
-    Return recent completed matches from the DB with real scores.
-    Used by the frontend 'Predictions' page to show past match results.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
@@ -424,10 +375,6 @@ def prediction_accuracy_trend(
     season_id:  Optional[int] = Query(None),
     weeks:      int           = Query(9, description="Number of recent gameweeks"),
 ):
-    """
-    Compute accuracy trend grouped by gameweek from real match data.
-    Uses standings win-rate heuristic to score past predictions vs actual results.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
@@ -487,9 +434,9 @@ def prediction_accuracy_trend(
         conn.close()
 
 
-# ─── Dynamic Consensus Engine (self-contained, no external module import) ────
+# ─── Dynamic Consensus Engine (self-contained) ───────────────────────────────
 
-_OUTCOME_LABELS = ["Home Win", "Draw", "Away Win"]
+_OUTCOME_LABELS  = ["Home Win", "Draw", "Away Win"]
 _DEFAULT_WEIGHTS = {"dc": 0.45, "ml": 0.35, "legacy": 0.20}
 _MIN_GRADED_ROWS = 10
 
@@ -502,7 +449,6 @@ def _consensus_safe_div(a, b, default=0.0):
 
 
 def _fetch_engine_weights(cur) -> dict:
-    """Query prediction_log for trailing 30-day per-engine accuracy."""
     try:
         cur.execute("""
             SELECT
@@ -537,7 +483,6 @@ def _fetch_engine_weights(cur) -> dict:
 
 
 def _run_legacy_inline(cur, home_id: int, away_id: int) -> dict:
-    """Heuristic prediction using standings + squad stats."""
     fallback = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35,
                 "predicted_outcome": "Home Win"}
     try:
@@ -621,7 +566,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
     cur  = conn.cursor()
     errors = []
     try:
-        # ── 1. Dynamic weights from prediction history ─────────────────────────
+        # ── 1. Dynamic weights ─────────────────────────────────────────────────
         weights = _fetch_engine_weights(cur)
         weight_source = "dynamic_historical" if weights != _DEFAULT_WEIGHTS else "default_fallback"
 
@@ -692,7 +637,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             legacy_outcome = "Home Win"
             weights["legacy"] = 0.0
 
-        # ── 5. Re-normalise weights ─────────────────────────────────────────────
+        # ── 5. Re-normalise weights ────────────────────────────────────────────
         w_sum = sum(weights.values())
         if w_sum < 0.01:
             weights = dict(_DEFAULT_WEIGHTS)
@@ -781,7 +726,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
         conn.close()
 
 
-# ─── Legacy Rule-based Route (kept for backward compatibility) ─────────────────
+# ─── Legacy Rule-based Route ──────────────────────────────────────────────────
 
 def _safe_div(a, b, default=0.0):
     try: return float(a) / float(b) if b else default
@@ -789,7 +734,6 @@ def _safe_div(a, b, default=0.0):
 
 
 def _get_team_stats(cur, team_name: str):
-    # Fixed: removed non-existent scraped_at column; use season_id DESC for ordering
     cur.execute("""
         SELECT ts.goals, ts.assists, ts.games, ts.possession, ts.avg_age
         FROM   team_squad_stats ts
@@ -801,7 +745,6 @@ def _get_team_stats(cur, team_name: str):
 
 
 def _get_team_standings(cur, team_name: str):
-    # Fixed: removed non-existent scraped_at column; use season_id DESC for ordering
     cur.execute("""
         SELECT ls.wins, ls.ties, ls.losses, ls.games,
                ls.goals_for, ls.goals_against, ls.points, ls.rank
