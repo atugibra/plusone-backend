@@ -6,6 +6,8 @@ Singleton-style engine that:
   2. Predicts match outcomes with rich, detailed output
   3. Persists trained model to disk (survives API restarts)
   4. Auto-loads saved model on startup if present
+  5. Applies feedback calibration from prediction_log outcomes
+     (call POST /api/predictions/recalibrate after evaluating predictions)
 """
 
 import os
@@ -19,6 +21,7 @@ from ml.feature_engineering import (
 from ml.ml_models import EnsemblePredictor
 from ml.model_store import save_to_db, load_from_db
 from ml.batch_features import build_training_dataset_fast, DataCache, _build_team_features, _build_match_features
+from ml.feedback_calibrator import get_calibrator, reset_calibrator
 
 # ─── Singleton state ──────────────────────────────────────────────────────────
 
@@ -30,6 +33,8 @@ _meta = {
     "cv_accuracy": None,
     "errors": 0,
     "feature_names": [],
+    "calibrator_samples": 0,
+    "calibrator_accuracy": None,
 }
 
 OUTCOME_LABELS = {0: "Home Win", 1: "Draw", 2: "Away Win"}
@@ -38,7 +43,6 @@ OUTCOME_LABELS = {0: "Home Win", 1: "Draw", 2: "Away Win"}
 def _get_engine() -> EnsemblePredictor:
     global _engine
     if _engine is None:
-        # Try Supabase first (survives redeploys), fall back to local disk
         loaded = load_from_db()
         if loaded is None:
             loaded = EnsemblePredictor.load()
@@ -51,23 +55,37 @@ def _get_engine() -> EnsemblePredictor:
     return _engine
 
 
+def _apply_calibration(probs: dict) -> dict:
+    """
+    Apply feedback calibrator to raw model probabilities.
+    Falls through unchanged if calibrator not fitted yet.
+    """
+    try:
+        cal = get_calibrator()
+        if cal.is_fitted:
+            calibrated = cal.apply(probs)
+            _meta["calibrator_samples"]  = cal.n_samples
+            _meta["calibrator_accuracy"] = cal.post_accuracy
+            return calibrated
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Calibration apply failed: %s", exc)
+    return probs
+
+
 # ─── Training ─────────────────────────────────────────────────────────────────
 
 def train_model():
     """
     Pull all completed matches from the database, build 70+ feature vectors,
     train the XGBoost+RandomForest ensemble, and save to disk.
-
-    This may take 30-120 seconds depending on data size.
-    Returns a status dict with: success, matches_trained, train_accuracy,
-    cv_accuracy, errors_skipped, elapsed_seconds, n_features.
+    Returns a status dict.
     """
     global _engine, _meta
     conn = get_connection()
     cur  = conn.cursor()
     try:
         t0 = time.time()
-        # Fast path: bulk-load all tables in ~6 queries, build features in-memory
         X, y, match_ids, errors = build_training_dataset_fast(cur, skip_errors=True)
         conn.close()
 
@@ -106,7 +124,6 @@ def train_model():
             conn3.close()
 
         model.train(X, y, feature_names=feat_names or None)
-        # Save to disk (fast, local backup) AND Supabase (survives redeploys)
         model.save()
         save_to_db(model)
 
@@ -135,27 +152,48 @@ def train_model():
         raise
 
 
+# ─── Recalibration ────────────────────────────────────────────────────────────
+
+def recalibrate_from_log() -> dict:
+    """
+    Fit the feedback calibrator from evaluated prediction_log rows.
+    Call this after running POST /api/prediction-log/evaluate.
+
+    The calibrator learns which probability ranges the model is systematically
+    wrong about and adjusts future outputs accordingly.
+
+    Returns a summary dict with pre/post accuracy and improvement.
+    """
+    from ml.feedback_calibrator import FeedbackCalibrator
+    cal = FeedbackCalibrator()
+    result = cal.fit_from_db()
+
+    if result.get("success"):
+        cal.save()
+        reset_calibrator()   # force singleton reload next prediction
+        _meta["calibrator_samples"]  = cal.n_samples
+        _meta["calibrator_accuracy"] = cal.post_accuracy
+        import logging
+        logging.getLogger(__name__).info(
+            "Recalibration complete: %d samples, %.1f%% → %.1f%%",
+            cal.n_samples,
+            result["pre_accuracy_pct"],
+            result["post_accuracy_pct"],
+        )
+
+    return result
+
+
 # ─── Prediction ───────────────────────────────────────────────────────────────
 
 def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) -> float:
-    """
-    Dixon-Coles style Expected Goals using real venue-split data from team_venue_stats.
-
-    Attack rate: attacker's home_gf_pg (venue='home') or away_gf_pg (venue='away').
-                 Falls back to season avg goals_for_pg if venue data is unavailable.
-    Defence rate: opponent's concession rate at their venue (home defenders at home,
-                 away defenders on the road).
-    form_gf_avg: recent-form goals blended in as a short-term signal (35% weight).
-    """
-    # ── Attack: venue-specific goal rate from team_venue_stats ─────────────
     if venue == "home":
         attack_rate  = attacker_feats.get("home_gf_pg", 0.0)
-        defence_rate = defender_feats.get("away_ga_pg", 0.0)   # away team concedes on road
+        defence_rate = defender_feats.get("away_ga_pg", 0.0)
     else:
         attack_rate  = attacker_feats.get("away_gf_pg", 0.0)
-        defence_rate = defender_feats.get("home_ga_pg", 0.0)   # home team concedes at home
+        defence_rate = defender_feats.get("home_ga_pg", 0.0)
 
-    # ── Fallbacks if venue data missing ────────────────────────────────
     season_gf = attacker_feats.get("goals_for_pg", 0.0)
     form_gf   = attacker_feats.get("form_gf_avg",  0.0)
 
@@ -164,18 +202,12 @@ def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) ->
     if defence_rate < 0.1:
         defence_rate = defender_feats.get("goals_against_pg", 1.35)
 
-    # ── Blend in recent form (last-5 actual goals) as 35% short-term signal ──
     if form_gf > 0.1:
         attack_rate = 0.65 * attack_rate + 0.35 * form_gf
 
-    # ── Dixon-Coles defensive adjustment ──────────────────────────────
-    # defence_rate > 1.35 means leaky defence → attacker scores more
-    # defence_rate < 1.35 means solid defence → attacker scores less
     LEAGUE_AVG_GA = 1.35
     defence_factor = defence_rate / LEAGUE_AVG_GA if defence_rate > 0 else 1.0
     xg = attack_rate * defence_factor
-
-    # ── Clamp to realistic range ─────────────────────────────────────
     return round(max(0.5, min(xg, 5.0)), 2)
 
 
@@ -194,24 +226,17 @@ def _key_factors(home_feats: dict, away_feats: dict,
         pct    = abs(round(diff / max(abs(a), abs(h), 0.001) * 100, 1))
         factors.append(f"{better} {pct}% better {label} than {worse}")
 
-    pct_diff(home_feats.get("goals_per90",           0),
-             away_feats.get("goals_per90",           0), "goals/90")
-    pct_diff(home_feats.get("shots_on_target_per90", 0),
-             away_feats.get("shots_on_target_per90", 0), "shots on target/90")
-    pct_diff(home_feats.get("goals_per_shot",        0),
-             away_feats.get("goals_per_shot",        0), "shot conversion rate")
-
-    pct_diff(home_feats.get("gk_save_pct",        0),
-             away_feats.get("gk_save_pct",        0), "GK save%")
-    pct_diff(home_feats.get("gk_clean_sheets_pct",0),
-             away_feats.get("gk_clean_sheets_pct",0), "clean sheet rate")
+    pct_diff(home_feats.get("goals_per90",           0), away_feats.get("goals_per90",           0), "goals/90")
+    pct_diff(home_feats.get("shots_on_target_per90", 0), away_feats.get("shots_on_target_per90", 0), "shots on target/90")
+    pct_diff(home_feats.get("goals_per_shot",        0), away_feats.get("goals_per_shot",        0), "shot conversion rate")
+    pct_diff(home_feats.get("gk_save_pct",           0), away_feats.get("gk_save_pct",           0), "GK save%")
+    pct_diff(home_feats.get("gk_clean_sheets_pct",   0), away_feats.get("gk_clean_sheets_pct",   0), "clean sheet rate")
 
     hf = home_feats.get("form_score", 0.5)
     af = away_feats.get("form_score", 0.5)
     if abs(hf - af) > 0.1:
         better = home_name if hf > af else away_name
-        hpts = round(hf * 15)
-        apts = round(af * 15)
+        hpts = round(hf * 15); apts = round(af * 15)
         factors.append(f"{better} better recent form: {hpts}/15 vs {apts}/15 pts (last 5)")
 
     hp = home_feats.get("prev_rank_norm", 0.5)
@@ -239,16 +264,15 @@ def _key_factors(home_feats: dict, away_feats: dict,
 
     h_blowout = home_feats.get("blowout_rate", 0)
     a_blowout = away_feats.get("blowout_rate", 0)
-    if h_blowout > 0.25: factors.append(f"{home_name} has high explosive potential (3+ goals in {int(h_blowout*100)}% of games)")
-    if a_blowout > 0.25: factors.append(f"{away_name} has high explosive potential (3+ goals in {int(a_blowout*100)}% of games)")
+    if h_blowout > 0.25: factors.append(f"{home_name} high explosive potential (3+ goals in {int(h_blowout*100)}% of games)")
+    if a_blowout > 0.25: factors.append(f"{away_name} high explosive potential (3+ goals in {int(a_blowout*100)}% of games)")
 
     h_collapse = home_feats.get("defensive_collapse_rate", 0)
     a_collapse = away_feats.get("defensive_collapse_rate", 0)
     if h_collapse > 0.25: factors.append(f"{home_name} prone to defensive collapse (conceded 3+ in {int(h_collapse*100)}% of games)")
     if a_collapse > 0.25: factors.append(f"{away_name} prone to defensive collapse (conceded 3+ in {int(a_collapse*100)}% of games)")
 
-    pct_diff(home_feats.get("squad_depth_scorers", 0),
-             away_feats.get("squad_depth_scorers", 0), "squad scoring depth")
+    pct_diff(home_feats.get("squad_depth_scorers", 0), away_feats.get("squad_depth_scorers", 0), "squad scoring depth")
 
     hp_pos = home_feats.get("possession", 50)
     ap_pos = away_feats.get("possession", 50)
@@ -259,18 +283,29 @@ def _key_factors(home_feats: dict, away_feats: dict,
     return factors[:6]
 
 
+def _outcome_from_probs(probs: dict) -> tuple:
+    """Return (predicted_outcome_str, confidence_label, confidence_score)."""
+    hw = probs["home_win"]
+    d  = probs["draw"]
+    aw = probs["away_win"]
+    vals = [hw, d, aw]
+    labels = ["Home Win", "Draw", "Away Win"]
+    idx = int(max(range(3), key=lambda i: vals[i]))
+    predicted = labels[idx]
+
+    import math
+    p = [max(v, 1e-10) for v in vals]
+    entropy     = -sum(x * math.log(x) for x in p)
+    max_entropy = -math.log(1.0 / 3.0)
+    score = round((1.0 - entropy / max_entropy) * 100, 1)
+    label = "High" if score >= 30 else ("Medium" if score >= 15 else "Low")
+    return predicted, label, score
+
+
 def predict_match(home_team_id: int, away_team_id: int,
                   league_id: int, season_id: int) -> dict:
     """
-    Full rich prediction for one match. Returns comprehensive output dict with:
-    - probabilities (home_win, draw, away_win)
-    - predicted_outcome + confidence + confidence_score
-    - expected_goals (home_xg, away_xg, predicted_score)
-    - key_factors (human-readable list of deciding factors)
-    - team_comparison (attack, defence, form, possession, etc.)
-    - h2h head-to-head history
-    - top_features from XGBoost feature importances
-    - model_info (n_trained_on, cv_accuracy, trained_at)
+    Full rich prediction for one match with feedback calibration applied.
     """
     engine = _get_engine()
     if engine is None or not engine.is_trained:
@@ -297,20 +332,29 @@ def predict_match(home_team_id: int, away_team_id: int,
             cur, home_team_id, away_team_id, league_id, season_id
         )
 
-        proba = engine.predict_proba(fv)
+        raw_proba = engine.predict_proba(fv)
         top_feats = engine.get_top_features(fv, n=6)
+
+        # Apply feedback calibration
+        proba_dict = {
+            "home_win": raw_proba["home_win"],
+            "draw":     raw_proba["draw"],
+            "away_win": raw_proba["away_win"],
+        }
+        calibrated = _apply_calibration(proba_dict)
+
+        # Re-derive outcome + confidence from calibrated probs
+        predicted_outcome, confidence, confidence_score = _outcome_from_probs(calibrated)
 
         home_xg = _compute_venue_xg(home_feats, away_feats, "home")
         away_xg = _compute_venue_xg(away_feats, home_feats, "away")
-
         factors = _key_factors(home_feats, away_feats, home_name, away_name)
 
         def cmp(feats, venue_key):
             return {
                 "attack":    round(feats.get("attack_strength",   1.0), 3),
                 "defence":   round(feats.get("defence_strength",  1.0), 3),
-                "form":      round(feats.get(f"{venue_key}_form_score",
-                                             feats.get("form_score", 0.5)), 3),
+                "form":      round(feats.get(f"{venue_key}_form_score", feats.get("form_score", 0.5)), 3),
                 "possession":round(feats.get("possession", 50.0), 1),
                 "goals_pg":  round(feats.get("goals_for_pg", 0.0), 2),
                 "concede_pg":round(feats.get("goals_against_pg", 0.0), 2),
@@ -323,6 +367,7 @@ def predict_match(home_team_id: int, away_team_id: int,
                 "clean_sheet_rate": round(feats.get("clean_sheet_rate", 0.0), 3),
             }
 
+        cal = get_calibrator()
         return {
             "match": {
                 "home_team":  home_name,
@@ -332,14 +377,15 @@ def predict_match(home_team_id: int, away_team_id: int,
                 "home_team_id": home_team_id,
                 "away_team_id": away_team_id,
             },
-            "probabilities": {
-                "home_win": proba["home_win"],
-                "draw":     proba["draw"],
-                "away_win": proba["away_win"],
+            "probabilities": calibrated,
+            "raw_probabilities": {
+                "home_win": raw_proba["home_win"],
+                "draw":     raw_proba["draw"],
+                "away_win": raw_proba["away_win"],
             },
-            "predicted_outcome":  proba["predicted_outcome"],
-            "confidence":         proba["confidence"],
-            "confidence_score":   proba["confidence_score"],
+            "predicted_outcome":  predicted_outcome,
+            "confidence":         confidence,
+            "confidence_score":   confidence_score,
             "expected_goals": {
                 "home_xg": home_xg,
                 "away_xg": away_xg,
@@ -360,9 +406,12 @@ def predict_match(home_team_id: int, away_team_id: int,
             },
             "top_features": top_feats,
             "model_info": {
-                "n_trained_on":   _meta.get("n_samples", 0),
-                "cv_accuracy":    _meta.get("cv_accuracy"),
-                "trained_at":     _meta.get("trained_at"),
+                "n_trained_on":          _meta.get("n_samples", 0),
+                "cv_accuracy":           _meta.get("cv_accuracy"),
+                "trained_at":            _meta.get("trained_at"),
+                "calibrated":            cal.is_fitted,
+                "calibrator_samples":    _meta.get("calibrator_samples", 0),
+                "calibrator_accuracy":   _meta.get("calibrator_accuracy"),
             },
         }
     finally:
@@ -372,12 +421,6 @@ def predict_match(home_team_id: int, away_team_id: int,
 # ─── Upcoming fixtures ────────────────────────────────────────────────────────
 
 def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
-    """
-    Predict all upcoming (unplayed) fixtures, optionally filtered by league.
-    Returns list of rich prediction dicts, each containing all fields from
-    predict_match() plus fixture_id, match_date, and gameweek.
-    Returns empty list if model is not trained.
-    """
     engine = _get_engine()
     if engine is None or not engine.is_trained:
         return []
@@ -389,16 +432,12 @@ def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
             SELECT m.id, m.home_team_id, m.away_team_id,
                    m.league_id, m.season_id, m.match_date, m.gameweek
             FROM matches m
-            WHERE m.home_score IS NULL
-              AND m.match_date >= CURRENT_DATE
+            WHERE m.home_score IS NULL AND m.match_date >= CURRENT_DATE
         """
         params = []
         if league_id:
-            query += " AND m.league_id = %s"
-            params.append(league_id)
-        query += " ORDER BY m.match_date ASC LIMIT %s"
-        params.append(limit)
-
+            query += " AND m.league_id = %s"; params.append(league_id)
+        query += " ORDER BY m.match_date ASC LIMIT %s"; params.append(limit)
         cur.execute(query, params)
         fixtures = cur.fetchall()
         conn.close()
@@ -406,15 +445,11 @@ def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
         results = []
         for fx in fixtures:
             try:
-                pred = predict_match(
-                    fx["home_team_id"],
-                    fx["away_team_id"],
-                    fx["league_id"],
-                    fx["season_id"],
-                )
-                pred["fixture_id"]   = fx["id"]
-                pred["match_date"]   = str(fx["match_date"]) if fx["match_date"] else None
-                pred["gameweek"]     = fx["gameweek"]
+                pred = predict_match(fx["home_team_id"], fx["away_team_id"],
+                                     fx["league_id"], fx["season_id"])
+                pred["fixture_id"] = fx["id"]
+                pred["match_date"] = str(fx["match_date"]) if fx["match_date"] else None
+                pred["gameweek"]   = fx["gameweek"]
                 results.append(pred)
             except Exception:
                 continue
@@ -424,16 +459,7 @@ def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
         return []
 
 
-# ─── Fast upcoming predictions (single DB round-trip via DataCache) ───────────
-
 def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
-    """
-    Bulk predict all upcoming fixtures using DataCache — one DB connection,
-    all feature computations in memory.  ~10-30x faster than predict_upcoming()
-    on large fixture lists.  Falls back to predict_upcoming() on any error.
-
-    Returns the same schema as predict_upcoming().
-    """
     eng = _get_engine()
     if eng is None or not eng.is_trained:
         return []
@@ -441,27 +467,23 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
     conn = get_connection()
     cur  = conn.cursor()
     try:
-        # 1. Fetch upcoming fixtures
         query = """
             SELECT m.id, m.home_team_id, m.away_team_id,
                    m.league_id, m.season_id, m.match_date, m.gameweek,
                    ht.name AS home_name, at.name AS away_name,
                    ht.logo_url AS home_logo, at.logo_url AS away_logo,
-                   l.name  AS league_name, s.name AS season_name
+                   l.name AS league_name, s.name AS season_name
             FROM matches m
             JOIN teams   ht ON ht.id = m.home_team_id
             JOIN teams   at ON at.id = m.away_team_id
             JOIN leagues l  ON l.id  = m.league_id
             JOIN seasons s  ON s.id  = m.season_id
-            WHERE m.home_score IS NULL
-              AND m.match_date >= CURRENT_DATE
+            WHERE m.home_score IS NULL AND m.match_date >= CURRENT_DATE
         """
         params = []
         if league_id:
-            query += " AND m.league_id = %s"
-            params.append(league_id)
-        query += " ORDER BY m.match_date ASC LIMIT %s"
-        params.append(limit)
+            query += " AND m.league_id = %s"; params.append(league_id)
+        query += " ORDER BY m.match_date ASC LIMIT %s"; params.append(limit)
         cur.execute(query, params)
         fixtures = [dict(r) for r in cur.fetchall()]
 
@@ -469,11 +491,9 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
             conn.close()
             return []
 
-        # 2. Bulk-load all features into DataCache (one DB round-trip)
         cache = DataCache(cur)
         conn.close()
 
-        # 3. Build feature vectors and predict for each fixture
         results = []
         for fx in fixtures:
             try:
@@ -482,13 +502,19 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                 lid  = fx["league_id"]
                 sid  = fx["season_id"]
 
-                # Use _build_match_features() — EXACTLY the same function used
-                # during training. This guarantees feature names, order and
-                # values are identical to what the model was trained on.
                 fv, feat_names, home_feats, away_feats, h2h = _build_match_features(
                     cache, htid, atid, lid, sid
                 )
-                proba = eng.predict_proba(fv)
+                raw_proba = eng.predict_proba(fv)
+
+                # Apply feedback calibration
+                proba_dict = {
+                    "home_win": raw_proba["home_win"],
+                    "draw":     raw_proba["draw"],
+                    "away_win": raw_proba["away_win"],
+                }
+                calibrated = _apply_calibration(proba_dict)
+                predicted_outcome, confidence, confidence_score = _outcome_from_probs(calibrated)
 
                 home_xg = _compute_venue_xg(home_feats, away_feats, "home")
                 away_xg = _compute_venue_xg(away_feats, home_feats, "away")
@@ -509,24 +535,27 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                         "home_team_id": htid,
                         "away_team_id": atid,
                     },
-                    "probabilities": {
-                        "home_win": proba["home_win"],
-                        "draw":     proba["draw"],
-                        "away_win": proba["away_win"],
+                    "probabilities":     calibrated,
+                    "raw_probabilities": {
+                        "home_win": raw_proba["home_win"],
+                        "draw":     raw_proba["draw"],
+                        "away_win": raw_proba["away_win"],
                     },
-                    "predicted_outcome":  proba["predicted_outcome"],
-                    "confidence":         proba["confidence"],
-                    "confidence_score":   proba["confidence_score"],
+                    "predicted_outcome":  predicted_outcome,
+                    "confidence":         confidence,
+                    "confidence_score":   confidence_score,
                     "expected_goals": {
-                        "home_xg":        home_xg,
-                        "away_xg":        away_xg,
+                        "home_xg":         home_xg,
+                        "away_xg":         away_xg,
                         "predicted_score": f"{round(home_xg)}-{round(away_xg)}",
                     },
                     "key_factors": factors,
                     "model_info": {
-                        "n_trained_on": _meta.get("n_samples", 0),
-                        "cv_accuracy":  _meta.get("cv_accuracy"),
-                        "trained_at":   _meta.get("trained_at"),
+                        "n_trained_on":        _meta.get("n_samples", 0),
+                        "cv_accuracy":         _meta.get("cv_accuracy"),
+                        "trained_at":          _meta.get("trained_at"),
+                        "calibrated":          get_calibrator().is_fitted,
+                        "calibrator_samples":  _meta.get("calibrator_samples", 0),
                     },
                 })
             except Exception:
@@ -537,32 +566,25 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
     except Exception:
         try: conn.close()
         except Exception: pass
-        # Graceful fallback to the original (slower) method
         return predict_upcoming(league_id=league_id, limit=limit)
 
 
 # ─── Status ───────────────────────────────────────────────────────────────────
 
 def get_status() -> dict:
-    """
-    Return current model status dict:
-    - model_trained (bool)
-    - trained_at (ISO timestamp or None)
-    - n_samples (int: number of matches trained on)
-    - train_accuracy (float or None)
-    - cv_accuracy (float or None)
-    - n_features (int)
-    - feature_names (first 20, for inspection)
-    """
     engine = _get_engine()
+    cal    = get_calibrator()
     return {
-        "model_trained":   engine is not None and engine.is_trained,
-        "trained_at":      _meta.get("trained_at"),
-        "n_samples":       _meta.get("n_samples", 0),
-        "train_accuracy":  _meta.get("train_accuracy"),
-        "cv_accuracy":     _meta.get("cv_accuracy"),
-        "n_features":      len(_meta.get("feature_names", [])),
-        "feature_names":   _meta.get("feature_names", [])[:20],
+        "model_trained":         engine is not None and engine.is_trained,
+        "trained_at":            _meta.get("trained_at"),
+        "n_samples":             _meta.get("n_samples", 0),
+        "train_accuracy":        _meta.get("train_accuracy"),
+        "cv_accuracy":           _meta.get("cv_accuracy"),
+        "n_features":            len(_meta.get("feature_names", [])),
+        "feature_names":         _meta.get("feature_names", [])[:20],
+        "calibrated":            cal.is_fitted,
+        "calibrator_samples":    cal.n_samples,
+        "calibrator_accuracy":   cal.post_accuracy,
     }
 
 
