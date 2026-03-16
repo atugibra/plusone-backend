@@ -2,17 +2,18 @@
 Predictions API Route
 ======================
 Endpoints:
-  GET  /api/predictions/status         → model status + accuracy
-  POST /api/predictions/train          → train/retrain from all DB history
-  POST /api/predictions/predict        → rich prediction for one matchup (by team IDs)
-  GET  /api/predictions/upcoming       → predict all upcoming fixtures
-  GET  /api/predictions/public         → public-facing predictions with bet recommendations
-  GET  /api/predictions/fixtures       → list upcoming fixtures to pick from
-  POST /api/predictions/generate       → legacy rule-based prediction (by team names)
-  GET  /api/predictions/results        → recent completed match results
-  GET  /api/predictions/accuracy       → accuracy trend by gameweek
+  GET  /api/predictions/status          → model status + accuracy
+  POST /api/predictions/train           → train/retrain from all DB history
   GET  /api/predictions/training-status → poll background training status
-  POST /api/predictions/consensus      → dynamic multi-engine consensus prediction
+  POST /api/predictions/recalibrate     → fit feedback calibrator from prediction_log
+  POST /api/predictions/predict         → rich prediction for one matchup (by team IDs)
+  GET  /api/predictions/upcoming        → predict all upcoming fixtures
+  GET  /api/predictions/public          → public-facing predictions with bet recommendations
+  GET  /api/predictions/fixtures        → list upcoming fixtures to pick from
+  POST /api/predictions/generate        → legacy rule-based prediction (by team names)
+  GET  /api/predictions/results         → recent completed match results
+  GET  /api/predictions/accuracy        → accuracy trend by gameweek
+  POST /api/predictions/consensus       → dynamic multi-engine consensus prediction
 """
 
 import time
@@ -92,6 +93,36 @@ def training_status():
     if not state:
         return {"status": "idle", "message": "No training has been triggered yet."}
     return state
+
+
+# ─── Feedback Calibration ─────────────────────────────────────────────────────
+
+@router.post("/recalibrate")
+def recalibrate():
+    """
+    Fit the feedback calibrator from evaluated prediction_log rows.
+
+    Workflow:
+      1. POST /api/predictions/upcoming      → generates predictions
+      2. Wait for matches to complete
+      3. POST /api/prediction-log/evaluate   → grades predictions vs real results
+      4. POST /api/predictions/recalibrate   → THIS endpoint
+         Calibrator learns from mistakes and adjusts future probabilities.
+
+    Requires at least 15 evaluated predictions.
+    Safe to call repeatedly — each call refits on all available data.
+    The calibrator is automatically applied to all future predictions.
+    """
+    try:
+        from ml.prediction_engine import recalibrate_from_log
+        result = recalibrate_from_log()
+        if not result.get("success"):
+            raise HTTPException(status_code=422, detail=result.get("reason", "Calibration failed."))
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Auto-log helper ──────────────────────────────────────────────────────────
