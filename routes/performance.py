@@ -5,12 +5,8 @@ GET /api/performance             — Overall metrics (Brier, RPS, accuracy, ROI)
 GET /api/performance/drift       — Rolling 20-match Brier score over time
 GET /api/performance/calibration — Calibration bin table
 GET /api/performance/per-league  — Per-league accuracy and Brier breakdown
-GET /api/performance/confusion   — Confusion matrix (where is the model wrong?)
+GET /api/performance/confusion   — Confusion matrix
 GET /api/performance/markets     — Market accuracy (BTTS, Over 2.5)
-
-All metrics are computed from the `prediction_log` table in Supabase.
-Only rows where actual IS NOT NULL are included for accuracy metrics.
-Per-league shows ALL leagues that have any predictions (evaluated or not).
 """
 
 import logging
@@ -24,10 +20,7 @@ router = APIRouter()
 log    = logging.getLogger(__name__)
 
 
-# ─── Helper: load completed predictions from DB ───────────────────────────────
-
 def _load_completed(cur, league: str = None) -> pd.DataFrame:
-    """Load evaluated predictions (actual result known) from prediction_log."""
     query = """
         SELECT
             id, home_team, away_team, league, match_date,
@@ -59,7 +52,6 @@ def _load_completed(cur, league: str = None) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame([dict(r) for r in rows])
-
     df = df.rename(columns={
         "home_win_prob": "prob_home_win",
         "draw_prob":     "prob_draw",
@@ -86,11 +78,10 @@ def _load_completed(cur, league: str = None) -> pd.DataFrame:
 
 
 def _load_all_predictions(cur) -> pd.DataFrame:
-    """Load ALL predictions (evaluated or not) for per-league counts."""
     try:
         cur.execute("""
             SELECT league,
-                   COUNT(*)                                        AS total_predictions,
+                   COUNT(*) AS total_predictions,
                    SUM(CASE WHEN actual IS NOT NULL THEN 1 ELSE 0 END) AS evaluated
             FROM prediction_log
             WHERE league IS NOT NULL
@@ -146,7 +137,6 @@ def get_overall_performance(league: str = None):
             })
 
     roi = MetricsEngine.roi(roi_records) if roi_records else {}
-
     return {**summary, "roi": roi, "league": league or "All Leagues"}
 
 
@@ -208,12 +198,6 @@ def get_calibration():
 
 @router.get("/per-league")
 def get_per_league():
-    """
-    Per-league breakdown. Shows ALL leagues that have predictions.
-    Leagues with evaluated results show accuracy/Brier/RPS.
-    Leagues with only pending predictions show prediction counts only.
-    Threshold lowered to 1 evaluated match (from 5) so small leagues appear.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
@@ -225,7 +209,6 @@ def get_per_league():
     if df_all.empty:
         return {"message": "No predictions yet.", "leagues": []}
 
-    # Build metrics for evaluated leagues
     evaluated_metrics = {}
     if not df_completed.empty and "league" in df_completed.columns:
         for league, grp in df_completed.groupby("league"):
@@ -239,7 +222,6 @@ def get_per_league():
                 "rps":        round(MetricsEngine.rps(probs, outcomes), 4),
             }
 
-    # Merge all leagues with metrics
     rows = []
     for _, row in df_all.iterrows():
         league    = row["league"]
@@ -247,16 +229,15 @@ def get_per_league():
         evaluated = int(row["evaluated"])
         metrics   = evaluated_metrics.get(league, {})
         rows.append({
-            "league":             league,
-            "matches":            total,
-            "evaluated":          evaluated,
-            "accuracy":           metrics.get("accuracy"),
-            "brier":              metrics.get("brier"),
-            "rps":                metrics.get("rps"),
-            "has_results":        evaluated > 0,
+            "league":      league,
+            "matches":     total,
+            "evaluated":   evaluated,
+            "accuracy":    metrics.get("accuracy"),
+            "brier":       metrics.get("brier"),
+            "rps":         metrics.get("rps"),
+            "has_results": evaluated > 0,
         })
 
-    # Sort: evaluated leagues first (by brier), then pending
     rows.sort(key=lambda x: (not x["has_results"], x.get("brier") or 999))
     return {"leagues": rows}
 
@@ -295,29 +276,28 @@ def get_market_accuracy():
         cur.execute("""
             SELECT
                 league,
-                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)            AS btts_total,
-                SUM(CASE WHEN btts_correct      THEN 1 ELSE 0 END)          AS btts_correct,
-                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL)        AS over25_total,
-                SUM(CASE WHEN over_2_5_correct  THEN 1 ELSE 0 END)          AS over25_correct,
-                AVG(home_xg)  FILTER (WHERE home_xg IS NOT NULL)            AS avg_home_xg,
-                AVG(away_xg)  FILTER (WHERE away_xg IS NOT NULL)            AS avg_away_xg,
-                AVG(btts_yes) FILTER (WHERE btts_yes IS NOT NULL)           AS avg_btts_prob,
-                AVG(over_2_5) FILTER (WHERE over_2_5 IS NOT NULL)           AS avg_over25_prob
+                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)         AS btts_total,
+                SUM(CASE WHEN btts_correct      THEN 1 ELSE 0 END)       AS btts_correct,
+                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL)     AS over25_total,
+                SUM(CASE WHEN over_2_5_correct  THEN 1 ELSE 0 END)       AS over25_correct,
+                AVG(home_xg)  FILTER (WHERE home_xg IS NOT NULL)         AS avg_home_xg,
+                AVG(away_xg)  FILTER (WHERE away_xg IS NOT NULL)         AS avg_away_xg,
+                AVG(btts_yes) FILTER (WHERE btts_yes IS NOT NULL)        AS avg_btts_prob,
+                AVG(over_2_5) FILTER (WHERE over_2_5 IS NOT NULL)        AS avg_over25_prob
             FROM prediction_log
             GROUP BY league
             ORDER BY btts_total DESC NULLS LAST
         """)
         rows = cur.fetchall()
 
-        # Overall totals
         cur.execute("""
             SELECT
-                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)        AS btts_total,
-                SUM(CASE WHEN btts_correct      THEN 1 ELSE 0 END)      AS btts_correct,
-                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL)    AS over25_total,
-                SUM(CASE WHEN over_2_5_correct  THEN 1 ELSE 0 END)      AS over25_correct,
-                AVG(home_xg)  FILTER (WHERE home_xg IS NOT NULL)        AS avg_home_xg,
-                AVG(away_xg)  FILTER (WHERE away_xg IS NOT NULL)        AS avg_away_xg
+                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)     AS btts_total,
+                SUM(CASE WHEN btts_correct      THEN 1 ELSE 0 END)   AS btts_correct,
+                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL) AS over25_total,
+                SUM(CASE WHEN over_2_5_correct  THEN 1 ELSE 0 END)   AS over25_correct,
+                AVG(home_xg) FILTER (WHERE home_xg IS NOT NULL)      AS avg_home_xg,
+                AVG(away_xg) FILTER (WHERE away_xg IS NOT NULL)      AS avg_away_xg
             FROM prediction_log
         """)
         totals = cur.fetchone()
@@ -329,8 +309,8 @@ def get_market_accuracy():
 
     overall = {}
     if totals:
-        bt = int(totals["btts_total"]    or 0)
-        ot = int(totals["over25_total"]  or 0)
+        bt = int(totals["btts_total"]   or 0)
+        ot = int(totals["over25_total"] or 0)
         overall = {
             "btts": {
                 "total":        bt,
@@ -353,17 +333,17 @@ def get_market_accuracy():
         if bt == 0 and ot == 0:
             continue
         by_league.append({
-            "league":           r["league"] or "Unknown",
-            "btts_total":       bt,
-            "btts_correct":     int(r["btts_correct"]  or 0),
-            "btts_accuracy":    _pct(r["btts_correct"],  bt),
-            "over25_total":     ot,
-            "over25_correct":   int(r["over25_correct"] or 0),
-            "over25_accuracy":  _pct(r["over25_correct"], ot),
-            "avg_home_xg":      round(float(r["avg_home_xg"]  or 0), 2),
-            "avg_away_xg":      round(float(r["avg_away_xg"]  or 0), 2),
-            "avg_btts_prob":    round(float(r["avg_btts_prob"] or 0), 3),
-            "avg_over25_prob":  round(float(r["avg_over25_prob"] or 0), 3),
+            "league":          r["league"] or "Unknown",
+            "btts_total":      bt,
+            "btts_correct":    int(r["btts_correct"]  or 0),
+            "btts_accuracy":   _pct(r["btts_correct"],  bt),
+            "over25_total":    ot,
+            "over25_correct":  int(r["over25_correct"] or 0),
+            "over25_accuracy": _pct(r["over25_correct"], ot),
+            "avg_home_xg":     round(float(r["avg_home_xg"]  or 0), 2),
+            "avg_away_xg":     round(float(r["avg_away_xg"]  or 0), 2),
+            "avg_btts_prob":   round(float(r["avg_btts_prob"] or 0), 3),
+            "avg_over25_prob": round(float(r["avg_over25_prob"] or 0), 3),
         })
 
     return {"overall": overall, "by_league": by_league}
