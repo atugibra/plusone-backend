@@ -240,7 +240,7 @@ class FeedbackCalibrator:
             conn = get_connection()
             cur  = conn.cursor()
             cur.execute(
-                "SELECT model_bytes, n_samples, accuracy FROM ml_models WHERE name = %s",
+                "SELECT model_bytes, n_samples, cv_accuracy FROM ml_models WHERE name = %s",
                 (self.DB_KEY,)
             )
             row = cur.fetchone()
@@ -249,7 +249,7 @@ class FeedbackCalibrator:
                 return False
             self._cal       = pickle.loads(row["model_bytes"])
             self.n_samples  = int(row["n_samples"] or 0)
-            self.post_accuracy = float(row["accuracy"] or 0)
+            self.post_accuracy = float(row["cv_accuracy"] or 0)
             log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%)",
                      self.n_samples, self.post_accuracy * 100)
             return True
