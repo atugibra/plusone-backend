@@ -90,7 +90,70 @@ def get_league_averages(cur, league_id, season_id):
     }
 
 
-# ─── Recent form ──────────────────────────────────────────────────────────────
+# ─── League style (base rates per league) ─────────────────────────────────────
+
+def compute_league_style(cur, league_id):
+    """
+    Compute the characteristic style of a league from its historical results.
+    These tell the model what "normal" looks like in each competition:
+      - Serie A is defensive (low goals, high draw rate)
+      - Bundesliga is open (high goals, lower draw rate)
+      - Some leagues have higher home advantage than others
+
+    Returns dict with 6 features keyed by name.
+    Falls back to global football averages if no data is available.
+    Uses ALL completed matches for the league regardless of season (more data
+    = more stable base rates; draws from the same matches table).
+    """
+    DEFAULTS = {
+        "league_home_win_rate":      0.44,
+        "league_draw_rate":          0.25,
+        "league_away_win_rate":      0.31,
+        "league_goals_pg":           2.70,
+        "league_btts_rate":          0.50,
+        "league_home_advantage_score": 1.42,  # HW% / AW%
+    }
+    try:
+        cur.execute("""
+            SELECT
+                COUNT(*)                                                 AS n,
+                SUM(CASE WHEN home_score  > away_score THEN 1 ELSE 0 END) AS hw,
+                SUM(CASE WHEN home_score  = away_score THEN 1 ELSE 0 END) AS d,
+                SUM(CASE WHEN home_score  < away_score THEN 1 ELSE 0 END) AS aw,
+                AVG(home_score::float + away_score::float)                AS avg_goals,
+                SUM(CASE WHEN home_score > 0 AND away_score > 0 THEN 1 ELSE 0 END)
+                                                                         AS btts
+            FROM matches
+            WHERE league_id = %s
+              AND home_score IS NOT NULL
+              AND away_score IS NOT NULL
+        """, (league_id,))
+        row = cur.fetchone()
+        if not row or not row["n"] or int(row["n"]) < 10:
+            return DEFAULTS
+
+        n    = int(row["n"])
+        hw   = float(row["hw"] or 0)
+        d    = float(row["d"]  or 0)
+        aw   = float(row["aw"] or 0)
+        goals = _f(row["avg_goals"], 2.70)
+        btts  = float(row["btts"] or 0)
+
+        hw_rate = hw / n
+        aw_rate = aw / n
+        return {
+            "league_home_win_rate":      round(hw_rate,              4),
+            "league_draw_rate":          round(d / n,                4),
+            "league_away_win_rate":      round(aw_rate,              4),
+            "league_goals_pg":           round(goals,                4),
+            "league_btts_rate":          round(btts / n,             4),
+            "league_home_advantage_score": round(
+                _safe_div(hw_rate, aw_rate, DEFAULTS["league_home_advantage_score"]), 4
+            ),
+        }
+    except Exception:
+        return DEFAULTS
+
 
 def compute_form(cur, team_id, venue=None, n=5):
     """
@@ -683,12 +746,13 @@ def build_team_features(cur, team_id, league_id, season_id, league_avgs=None):
 
 def build_match_features(cur, home_team_id, away_team_id, league_id, season_id):
     """
-    Combine home + away team features + per-feature differentials into a
-    single flat feature vector ready for the ML model.
+    Combine home + away team features + per-feature differentials + league-style
+    context into a single flat feature vector ready for the ML model.
 
     Also returns raw home/away feature dicts for the rich prediction output.
     """
     avgs = get_league_averages(cur, league_id, season_id)
+    style = compute_league_style(cur, league_id)   # ← league-level base rates
 
     home_feats = build_team_features(cur, home_team_id, league_id, season_id, avgs)
     away_feats = build_team_features(cur, away_team_id, league_id, season_id, avgs)
@@ -708,6 +772,32 @@ def build_match_features(cur, home_team_id, away_team_id, league_id, season_id):
     for k, v in h2h.items():
         if k != "h2h_last_5":
             vector[k] = _f(v)
+
+    # ── League-style context (6 features) ──────────────────────────────────
+    # These anchor the prediction to the specific league's characteristics:
+    # the model learns that 44% home wins is "normal" for Serie A but slightly
+    # above par for the Bundesliga. Without these, cross-league comparisons
+    # produce miscalibrated probabilities.
+    vector.update(style)
+
+    # ── League-relative team strength (4 features) ─────────────────────────
+    # How does each team's attack/defence compare to THIS league's average?
+    # Useful for teams playing in multiple competitions — their raw stats are
+    # normalised to the competition they're currently playing in.
+    lg_goals = style["league_goals_pg"] or 2.70
+    half_goals = lg_goals / 2            # rough expected team goals/game
+    vector["home_attack_rel_league"] = _safe_div(
+        home_feats.get("goals_for_pg", 0.0), half_goals, 1.0
+    )
+    vector["away_attack_rel_league"] = _safe_div(
+        away_feats.get("goals_for_pg", 0.0), half_goals, 1.0
+    )
+    vector["home_defence_rel_league"] = _safe_div(
+        half_goals, home_feats.get("goals_against_pg", half_goals) or half_goals, 1.0
+    )
+    vector["away_defence_rel_league"] = _safe_div(
+        half_goals, away_feats.get("goals_against_pg", half_goals) or half_goals, 1.0
+    )
 
     # Match-level constant: home advantage exists in all football data
     vector["home_advantage"] = 1.0

@@ -15,6 +15,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.metrics import accuracy_score
+from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
 
@@ -37,8 +38,11 @@ class EnsemblePredictor:
         self.n_samples = 0
         self.feature_importances_ = {}
 
-        # XGBoost — handles imbalanced classes well, fast, interpretable
-        xgb = XGBClassifier(
+        # XGBoost — handles imbalanced classes well, fast, interpretable.
+        # NOTE: sample_weight is passed at fit() time so XGB treats all
+        # classes (Home Win / Draw / Away Win) with equal importance.
+        # We calibrate it isotonically so its raw logits become true probs.
+        xgb_base = XGBClassifier(
             n_estimators=300,
             max_depth=5,
             learning_rate=0.05,
@@ -48,25 +52,25 @@ class EnsemblePredictor:
             random_state=42,
             n_jobs=-1,
         )
+        xgb_cal = CalibratedClassifierCV(xgb_base, cv=3, method="isotonic")
 
-        # RandomForest — diverse learner, good at irregular boundaries
+        # RandomForest — diverse learner, good at irregular boundaries.
+        # class_weight='balanced' already handles the HW/Draw/AW imbalance.
         rf = RandomForestClassifier(
             n_estimators=200,
             max_depth=8,
             min_samples_leaf=5,
-            class_weight="balanced",   # handles draw class imbalance
+            class_weight="balanced",
             random_state=42,
             n_jobs=-1,
         )
-
-        # Calibrate RF to produce proper probabilities
         rf_cal = CalibratedClassifierCV(rf, cv=3, method="isotonic")
 
-        # Soft vote: weighted toward XGBoost (generally more accurate on tabular data)
+        # Soft vote: equal weight — both models are now calibrated equally.
         self.model = VotingClassifier(
-            estimators=[("xgb", xgb), ("rf", rf_cal)],
+            estimators=[("xgb", xgb_cal), ("rf", rf_cal)],
             voting="soft",
-            weights=[2, 1],      # XGB gets 2x weight
+            weights=[1, 1],
         )
 
     def train(self, X, y, feature_names=None, cv_folds=5):
@@ -91,14 +95,24 @@ class EnsemblePredictor:
         # Scale features (helps RF, doesn't hurt XGB)
         X_scaled = self.scaler_.fit_transform(X)
 
-        # Cross-validation accuracy
+        # Compute balanced sample weights so XGBoost and RF treat
+        # Home Win / Draw / Away Win with equal importance during training.
+        # Without this, XGBoost (no built-in class weighting for multi-class)
+        # collapses to always predicting the majority class (Home Win ~44%).
+        sample_weights = compute_sample_weight(class_weight="balanced", y=y)
+
+        # Cross-validation accuracy (with sample weights)
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(self.model, X_scaled, y, cv=skf,
-                                    scoring="accuracy", n_jobs=-1)
+        cv_scores = cross_val_score(
+            self.model, X_scaled, y, cv=skf,
+            scoring="accuracy",
+            fit_params={"sample_weight": sample_weights},
+            n_jobs=-1,
+        )
         self.cv_accuracy = float(np.mean(cv_scores))
 
-        # Final fit on all data
-        self.model.fit(X_scaled, y)
+        # Final fit on all data (pass balanced weights so XGB sees all classes equally)
+        self.model.fit(X_scaled, y, sample_weight=sample_weights)
         y_pred = self.model.predict(X_scaled)
         self.train_accuracy = float(accuracy_score(y, y_pred))
         self.is_trained = True
@@ -145,11 +159,11 @@ class EnsemblePredictor:
         aw = prob_map.get(2, 0.34)
 
         # ── Probability floor ──────────────────────────────────────────────────
-        # XGBoost collapses one class to near-zero when the team has no squad
-        # or standings data in the DB (all-zero feature vector). This produced
-        # the "0% Home Win" bug seen in production. Apply a 5% floor per class
-        # then re-normalise so probabilities still sum to 1.0.
-        MIN_PROB = 0.05
+        # Apply a 2% floor (down from 5%) — just enough to avoid true-zero
+        # probabilities breaking log-loss, but small enough not to steal
+        # significant probability from correctly-predicted minority classes
+        # (a 5% floor on 3 classes consumes 9% of probability budget).
+        MIN_PROB = 0.02
         hw = max(hw, MIN_PROB)
         dr = max(dr, MIN_PROB)
         aw = max(aw, MIN_PROB)

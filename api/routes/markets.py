@@ -48,16 +48,10 @@ def _run_dc_training():
 # ─── Helper: log DC prediction to prediction_log ──────────────────────────────
 
 def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
-                        league: str, match_date, predicted_outcome: str,
-                        confidence: str, confidence_score: float,
-                        home_win_prob: float, draw_prob: float,
-                        away_win_prob: float):
-    """
-    Write one prediction row to prediction_log (if not already logged).
-    Uses ON CONFLICT (match_id) DO NOTHING so repeated /upcoming calls
-    don't create duplicate rows for the same fixture.
-    Safe to call from a background thread.
-    """
+                       league: str, match_date, predicted_outcome: str,
+                       confidence: str, confidence_score: float,
+                       home_win_prob: float, draw_prob: float,
+                       away_win_prob: float):
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -70,15 +64,17 @@ def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
             """, (
-                match_id, home_team, away_team, league, match_date,
-                predicted_outcome, confidence, round(confidence_score, 4),
-                round(home_win_prob, 4), round(draw_prob, 4), round(away_win_prob, 4),
+                int(match_id),
+                str(home_team), str(away_team), str(league), match_date,
+                str(predicted_outcome), str(confidence),
+                float(confidence_score),
+                float(home_win_prob), float(draw_prob), float(away_win_prob),
             ))
             conn.commit()
         finally:
             conn.close()
     except Exception as exc:
-        log.warning("prediction_log insert failed: %s", exc)
+        log.exception("prediction_log insert failed")
 
 
 
@@ -244,9 +240,9 @@ def upcoming_dc_predictions(
             threading.Thread(
                 target=_log_prediction_bg,
                 args=(
-                    fx["id"], fx["home_team"], fx["away_team"],
-                    fx["league"], fx["match_date"], outcome,
-                    confidence, lead, hw, dr, aw,
+                    int(fx["id"]), str(fx["home_team"]), str(fx["away_team"]),
+                    str(fx["league"]), fx["match_date"], str(outcome),
+                    str(confidence), float(lead), float(hw), float(dr), float(aw),
                 ),
                 daemon=True,
             ).start()

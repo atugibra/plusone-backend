@@ -11,6 +11,18 @@ from routes import leagues, teams, matches, standings, squad_stats, player_stats
 
 load_dotenv()
 
+# ─── Numpy → psycopg2 type adapters ──────────────────────────────────────────
+# Prevents "schema np does not exist" errors when numpy float64/int64 values
+# are passed directly to psycopg2 inserts across the entire app.
+import numpy as np
+import psycopg2.extensions
+
+psycopg2.extensions.register_adapter(np.float64, lambda x: psycopg2.extensions.AsIs(float(x)))
+psycopg2.extensions.register_adapter(np.float32, lambda x: psycopg2.extensions.AsIs(float(x)))
+psycopg2.extensions.register_adapter(np.int64,   lambda x: psycopg2.extensions.AsIs(int(x)))
+psycopg2.extensions.register_adapter(np.int32,   lambda x: psycopg2.extensions.AsIs(int(x)))
+psycopg2.extensions.register_adapter(np.bool_,   lambda x: psycopg2.extensions.AsIs(bool(x)))
+
 
 # ─── HTTPS redirect middleware ─────────────────────────────────────────────────
 # Railway/Render terminates TLS at its edge proxy and forwards plain HTTP to the

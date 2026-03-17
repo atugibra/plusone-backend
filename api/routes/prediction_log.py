@@ -14,23 +14,29 @@ Endpoints:
 SQL to run ONCE in Supabase SQL Editor:
 ----------------------------------------
   CREATE TABLE IF NOT EXISTS prediction_log (
-      id              SERIAL PRIMARY KEY,
-      match_id        INT,            -- references matches(id), nullable (future fixtures)
-      home_team       TEXT NOT NULL,
-      away_team       TEXT NOT NULL,
-      league          TEXT,
-      match_date      DATE,
-      predicted       TEXT NOT NULL,  -- 'Home Win' / 'Draw' / 'Away Win'
-      confidence      TEXT,           -- 'High' / 'Medium' / 'Low'
+      id               SERIAL PRIMARY KEY,
+      match_id         INT,
+      home_team        TEXT NOT NULL,
+      away_team        TEXT NOT NULL,
+      league           TEXT,
+      match_date       DATE,
+      predicted        TEXT NOT NULL,
+      confidence       TEXT,
       confidence_score FLOAT,
-      home_win_prob   FLOAT,
-      draw_prob       FLOAT,
-      away_win_prob   FLOAT,
-      actual          TEXT,           -- filled in by /evaluate after match
-      correct         BOOLEAN,        -- filled in by /evaluate
-      evaluated_at    TIMESTAMPTZ,
-      created_at      TIMESTAMPTZ DEFAULT NOW(),
-      -- Per-engine picks (added for Dynamic Consensus Engine tracking)
+      home_win_prob    FLOAT,
+      draw_prob        FLOAT,
+      away_win_prob    FLOAT,
+      actual           TEXT,
+      correct          BOOLEAN,
+      correct_score    TEXT,
+      evaluated_at     TIMESTAMPTZ,
+      created_at       TIMESTAMPTZ DEFAULT NOW(),
+      home_xg          FLOAT,
+      away_xg          FLOAT,
+      btts_yes         FLOAT,
+      over_2_5         FLOAT,
+      btts_correct     BOOLEAN,
+      over_2_5_correct BOOLEAN,
       dc_predicted_outcome     TEXT,
       ml_predicted_outcome     TEXT,
       legacy_predicted_outcome TEXT,
@@ -38,17 +44,22 @@ SQL to run ONCE in Supabase SQL Editor:
       ml_correct               BOOLEAN,
       legacy_correct           BOOLEAN
   );
-  CREATE INDEX IF NOT EXISTS prediction_log_match_id_idx ON prediction_log(match_id);
-  CREATE INDEX IF NOT EXISTS prediction_log_correct_idx  ON prediction_log(correct);
-  CREATE INDEX IF NOT EXISTS prediction_log_date_idx     ON prediction_log(match_date);
 
-  -- If the table already exists, add the per-engine columns:
+  -- If table already exists, run these:
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS home_xg          FLOAT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS away_xg          FLOAT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS btts_yes         FLOAT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS over_2_5         FLOAT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS btts_correct     BOOLEAN;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS over_2_5_correct BOOLEAN;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_predicted_outcome     TEXT;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_predicted_outcome     TEXT;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_predicted_outcome TEXT;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_correct               BOOLEAN;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_correct               BOOLEAN;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_correct           BOOLEAN;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS correct_score    TEXT;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS evaluated_at     TIMESTAMPTZ;
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -62,29 +73,28 @@ router = APIRouter()
 # ─── Request models ───────────────────────────────────────────────────────────
 
 class RecordRequest(BaseModel):
-    """Payload sent by the frontend/engine when a prediction is made."""
-    match_id:        Optional[int]   = None
-    home_team:       str
-    away_team:       str
-    league:          Optional[str]   = None
-    match_date:      Optional[str]   = None   # ISO date string "YYYY-MM-DD"
-    predicted:       str                      # "Home Win" / "Draw" / "Away Win"
-    confidence:      Optional[str]   = None
+    match_id:         Optional[int]   = None
+    home_team:        str
+    away_team:        str
+    league:           Optional[str]   = None
+    match_date:       Optional[str]   = None
+    predicted:        str
+    confidence:       Optional[str]   = None
     confidence_score: Optional[float] = None
-    home_win_prob:   Optional[float] = None
-    draw_prob:       Optional[float] = None
-    away_win_prob:   Optional[float] = None
-    # Per-engine picks from the consensus endpoint
-    dc_predicted_outcome:     Optional[str] = None
-    ml_predicted_outcome:     Optional[str] = None
-    legacy_predicted_outcome: Optional[str] = None
+    home_win_prob:    Optional[float] = None
+    draw_prob:        Optional[float] = None
+    away_win_prob:    Optional[float] = None
+    btts_yes:         Optional[float] = None
+    over_2_5:         Optional[float] = None
+    home_xg:          Optional[float] = None
+    away_xg:          Optional[float] = None
 
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
 
 def _outcome_label(home_score: int, away_score: int) -> str:
-    if home_score > away_score:  return "Home Win"
-    if away_score > home_score:  return "Away Win"
+    if home_score > away_score: return "Home Win"
+    if away_score > home_score: return "Away Win"
     return "Draw"
 
 
@@ -92,10 +102,6 @@ def _outcome_label(home_score: int, away_score: int) -> str:
 
 @router.post("/record")
 def record_prediction(req: RecordRequest):
-    """
-    Save one prediction to the log before the match is played.
-    Call this immediately after /api/predictions/predict returns.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
@@ -104,16 +110,15 @@ def record_prediction(req: RecordRequest):
                 (match_id, home_team, away_team, league, match_date,
                  predicted, confidence, confidence_score,
                  home_win_prob, draw_prob, away_win_prob,
-                 dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 btts_yes, over_2_5, home_xg, away_xg)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
         """, (
             req.match_id, req.home_team, req.away_team,
-            req.league,
-            req.match_date,
+            req.league, req.match_date,
             req.predicted, req.confidence, req.confidence_score,
             req.home_win_prob, req.draw_prob, req.away_win_prob,
-            req.dc_predicted_outcome, req.ml_predicted_outcome, req.legacy_predicted_outcome,
+            req.btts_yes, req.over_2_5, req.home_xg, req.away_xg,
         ))
         row = cur.fetchone()
         conn.commit()
@@ -130,101 +135,67 @@ def record_prediction(req: RecordRequest):
 @router.post("/evaluate")
 def evaluate_predictions():
     """
-    Scan all un-evaluated prediction_log rows whose match has now completed
-    (i.e. matches table has home_score populated) and mark them correct/wrong.
-
-    Handles two cases:
-      1. match_id is set  → direct JOIN on matches.id
-      2. match_id is NULL → fuzzy match on home_team / away_team / match_date
-
-    Safe to call repeatedly — only updates rows where actual IS NULL.
-    Returns how many rows were evaluated.
+    Grade all un-evaluated prediction_log rows whose match has now completed.
+    Grades: outcome correct/wrong, BTTS correct/wrong, Over 2.5 correct/wrong.
+    Safe to call repeatedly.
     """
     conn = get_connection()
     cur  = conn.cursor()
     try:
         cur.execute("""
-            -- Case 1: match_id is known
-            SELECT pl.id, pl.predicted, m.home_score, m.away_score
+            SELECT pl.id, pl.predicted, pl.btts_yes, pl.over_2_5,
+                   pl.dc_predicted_outcome, pl.ml_predicted_outcome,
+                   pl.legacy_predicted_outcome,
+                   m.home_score, m.away_score
             FROM prediction_log pl
             JOIN matches m ON m.id = pl.match_id
-            WHERE pl.actual IS NULL
+            WHERE pl.correct IS NULL
               AND m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
-
-            UNION
-
-            -- Case 2: match_id NULL, date is known
-            SELECT pl.id, pl.predicted, m.home_score, m.away_score
-            FROM prediction_log pl
-            JOIN matches m
-              ON pl.match_id IS NULL
-             AND pl.match_date IS NOT NULL
-             AND m.match_date = pl.match_date
-             AND m.home_score IS NOT NULL
-             AND m.away_score IS NOT NULL
-             AND EXISTS (
-                   SELECT 1 FROM teams t
-                   WHERE t.id = m.home_team_id
-                     AND LOWER(t.name) LIKE '%' || LOWER(pl.home_team) || '%'
-             )
-             AND EXISTS (
-                   SELECT 1 FROM teams t
-                   WHERE t.id = m.away_team_id
-                     AND LOWER(t.name) LIKE '%' || LOWER(pl.away_team) || '%'
-             )
-            WHERE pl.actual IS NULL
-
-            UNION
-
-            -- Case 3: both match_id and match_date NULL → use created_at ±3 days
-            SELECT pl.id, pl.predicted, m.home_score, m.away_score
-            FROM prediction_log pl
-            JOIN matches m
-              ON pl.match_id IS NULL
-             AND pl.match_date IS NULL
-             AND m.home_score IS NOT NULL
-             AND m.away_score IS NOT NULL
-             AND m.match_date BETWEEN (pl.created_at::date - INTERVAL '30 days')
-                                  AND (pl.created_at::date + INTERVAL '30 days')
-             AND EXISTS (
-                   SELECT 1 FROM teams t
-                   WHERE t.id = m.home_team_id
-                     AND LOWER(t.name) LIKE '%' || LOWER(pl.home_team) || '%'
-             )
-             AND EXISTS (
-                   SELECT 1 FROM teams t
-                   WHERE t.id = m.away_team_id
-                     AND LOWER(t.name) LIKE '%' || LOWER(pl.away_team) || '%'
-             )
-            WHERE pl.actual IS NULL
         """)
         rows = cur.fetchall()
 
         updated = 0
         for r in rows:
-            actual  = _outcome_label(int(r["home_score"]), int(r["away_score"]))
-            correct = (actual == r["predicted"])
-            # Grade each individual engine pick if it was recorded
+            home_score  = int(r["home_score"])
+            away_score  = int(r["away_score"])
+            actual      = _outcome_label(home_score, away_score)
+            correct     = (actual == r["predicted"])
+            correct_score = f"{home_score}-{away_score}"
+            total_goals = home_score + away_score
+            both_scored = home_score > 0 and away_score > 0
+
+            # Market grading
+            btts_correct     = None
+            over_2_5_correct = None
+            if r["btts_yes"] is not None:
+                btts_pred        = float(r["btts_yes"]) > 0.5
+                btts_correct     = (btts_pred == both_scored)
+            if r["over_2_5"] is not None:
+                over_pred        = float(r["over_2_5"]) > 0.5
+                over_2_5_correct = (over_pred == (total_goals > 2))
+
+            # Per-engine outcome grading
+            dc_correct     = (r["dc_predicted_outcome"]     == actual) if r["dc_predicted_outcome"]     else None
+            ml_correct     = (r["ml_predicted_outcome"]     == actual) if r["ml_predicted_outcome"]     else None
+            legacy_correct = (r["legacy_predicted_outcome"] == actual) if r["legacy_predicted_outcome"] else None
+
             cur.execute("""
                 UPDATE prediction_log
-                SET actual       = %s,
-                    correct      = %s,
-                    evaluated_at = NOW(),
-                    dc_correct     = CASE
-                                       WHEN dc_predicted_outcome     IS NOT NULL
-                                       THEN dc_predicted_outcome     = %s
-                                       ELSE NULL END,
-                    ml_correct     = CASE
-                                       WHEN ml_predicted_outcome     IS NOT NULL
-                                       THEN ml_predicted_outcome     = %s
-                                       ELSE NULL END,
-                    legacy_correct = CASE
-                                       WHEN legacy_predicted_outcome IS NOT NULL
-                                       THEN legacy_predicted_outcome = %s
-                                       ELSE NULL END
+                SET actual            = %s,
+                    correct           = %s,
+                    correct_score     = %s,
+                    evaluated_at      = NOW(),
+                    btts_correct      = %s,
+                    over_2_5_correct  = %s,
+                    dc_correct        = %s,
+                    ml_correct        = %s,
+                    legacy_correct    = %s
                 WHERE id = %s
-            """, (actual, correct, actual, actual, actual, r["id"]))
+            """, (actual, correct, correct_score,
+                  btts_correct, over_2_5_correct,
+                  dc_correct, ml_correct, legacy_correct,
+                  r["id"]))
             updated += 1
 
         conn.commit()
@@ -243,84 +214,92 @@ def evaluate_predictions():
 
 @router.get("/accuracy")
 def real_world_accuracy(
-    league:    Optional[str] = Query(None, description="Filter by league name"),
-    last_n:    int           = Query(50,   description="Consider last N evaluated predictions"),
+    league: Optional[str] = Query(None),
+    last_n: int           = Query(50),
 ):
-    """
-    Real-world accuracy computed from evaluated prediction_log rows.
-    Unlike cv_accuracy (training data), this reflects actual match outcomes.
-    Returns overall accuracy + breakdown by predicted outcome + recent trend.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
-        base = """
-            FROM prediction_log
-            WHERE correct IS NOT NULL
-        """
+        base   = " FROM prediction_log WHERE correct IS NOT NULL"
         params: list = []
         if league:
             base += " AND league = %s"; params.append(league)
 
-        # Overall accuracy
         cur.execute("SELECT COUNT(*) AS total, SUM(CASE WHEN correct THEN 1 ELSE 0 END) AS correct_count" + base, params)
-        overall = cur.fetchone()
+        overall       = cur.fetchone()
         total         = int(overall["total"] or 0)
         correct_count = int(overall["correct_count"] or 0)
         overall_pct   = round(correct_count / total * 100, 1) if total else None
 
-        # Accuracy by predicted outcome
+        # By predicted outcome
         cur.execute("""
-            SELECT predicted,
-                   COUNT(*) AS total,
+            SELECT predicted, COUNT(*) AS total,
                    SUM(CASE WHEN correct THEN 1 ELSE 0 END) AS correct_count
         """ + base + " GROUP BY predicted ORDER BY predicted", params)
         by_outcome = [
             {
-                "predicted":   r["predicted"],
-                "total":       int(r["total"]),
-                "correct":     int(r["correct_count"] or 0),
-                "accuracy_pct": round(int(r["correct_count"] or 0) / int(r["total"]) * 100, 1)
-                               if int(r["total"]) > 0 else None,
-            }
-            for r in cur.fetchall()
-        ]
-
-        # Accuracy by confidence tier
-        cur.execute("""
-            SELECT confidence,
-                   COUNT(*) AS total,
-                   SUM(CASE WHEN correct THEN 1 ELSE 0 END) AS correct_count
-        """ + base + " AND confidence IS NOT NULL GROUP BY confidence ORDER BY confidence", params)
-        by_confidence = [
-            {
-                "confidence": r["confidence"],
-                "total":      int(r["total"]),
-                "correct":    int(r["correct_count"] or 0),
+                "predicted":    r["predicted"],
+                "total":        int(r["total"]),
+                "correct":      int(r["correct_count"] or 0),
                 "accuracy_pct": round(int(r["correct_count"] or 0) / int(r["total"]) * 100, 1)
                                 if int(r["total"]) > 0 else None,
             }
             for r in cur.fetchall()
         ]
 
-        # Rolling accuracy on last N evaluated predictions (trend)
+        # By confidence tier
         cur.execute("""
-            SELECT correct, evaluated_at
-        """ + base + f" ORDER BY evaluated_at DESC LIMIT {last_n}", params)
-        recent = cur.fetchall()
-        if recent:
-            recent_correct = sum(1 for r in recent if r["correct"])
-            recent_pct     = round(recent_correct / len(recent) * 100, 1)
-        else:
-            recent_pct = None
+            SELECT confidence, COUNT(*) AS total,
+                   SUM(CASE WHEN correct THEN 1 ELSE 0 END) AS correct_count
+        """ + base + " AND confidence IS NOT NULL GROUP BY confidence ORDER BY confidence", params)
+        by_confidence = [
+            {
+                "confidence":   r["confidence"],
+                "total":        int(r["total"]),
+                "correct":      int(r["correct_count"] or 0),
+                "accuracy_pct": round(int(r["correct_count"] or 0) / int(r["total"]) * 100, 1)
+                                if int(r["total"]) > 0 else None,
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Market accuracy
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)            AS btts_total,
+                SUM(CASE WHEN btts_correct     THEN 1 ELSE 0 END)           AS btts_correct,
+                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL)        AS over25_total,
+                SUM(CASE WHEN over_2_5_correct THEN 1 ELSE 0 END)           AS over25_correct
+        """ + base, params)
+        mkt = cur.fetchone()
+        btts_total    = int(mkt["btts_total"]    or 0)
+        over25_total  = int(mkt["over25_total"]  or 0)
+        market_accuracy = {
+            "btts": {
+                "total":        btts_total,
+                "correct":      int(mkt["btts_correct"]  or 0),
+                "accuracy_pct": round(int(mkt["btts_correct"] or 0) / btts_total * 100, 1) if btts_total else None,
+            },
+            "over_2_5": {
+                "total":        over25_total,
+                "correct":      int(mkt["over25_correct"] or 0),
+                "accuracy_pct": round(int(mkt["over25_correct"] or 0) / over25_total * 100, 1) if over25_total else None,
+            },
+        }
+
+        # Rolling last N
+        cur.execute("SELECT correct, evaluated_at" + base + f" ORDER BY evaluated_at DESC LIMIT {last_n}", params)
+        recent     = cur.fetchall()
+        recent_pct = round(sum(1 for r in recent if r["correct"]) / len(recent) * 100, 1) if recent else None
 
         return {
-            "total_evaluated":  total,
-            "correct":          correct_count,
-            "overall_accuracy": overall_pct,
-            f"last_{last_n}_accuracy": recent_pct,
-            "by_outcome":       by_outcome,
-            "by_confidence":    by_confidence,
+            "total_evaluated":          total,
+            "correct":                  correct_count,
+            "overall_accuracy":         overall_pct,
+            f"last_{last_n}_accuracy":  recent_pct,
+            "by_outcome":               by_outcome,
+            "by_confidence":            by_confidence,
+            "market_accuracy":          market_accuracy,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -332,16 +311,12 @@ def real_world_accuracy(
 
 @router.get("")
 def list_prediction_log(
-    league:    Optional[str] = Query(None),
-    correct:   Optional[bool] = Query(None, description="true=right, false=wrong, omit=all"),
-    evaluated: Optional[bool] = Query(None, description="true=evaluated only, false=pending"),
+    league:    Optional[str]  = Query(None),
+    correct:   Optional[bool] = Query(None),
+    evaluated: Optional[bool] = Query(None),
     limit:     int            = Query(50),
     offset:    int            = Query(0),
 ):
-    """
-    Return prediction log rows with optional filters.
-    Useful for an admin panel or dashboard table.
-    """
     conn = get_connection()
     cur  = conn.cursor()
     try:
