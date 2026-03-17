@@ -102,13 +102,24 @@ class EnsemblePredictor:
         sample_weights = compute_sample_weight(class_weight="balanced", y=y)
 
         # Cross-validation accuracy (with sample weights)
+        # sklearn ≥1.4 replaced fit_params= with params=; try new API first,
+        # fall back to old API so we work with any installed version.
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(
-            self.model, X_scaled, y, cv=skf,
-            scoring="accuracy",
-            fit_params={"sample_weight": sample_weights},
-            n_jobs=-1,
-        )
+        try:
+            cv_scores = cross_val_score(
+                self.model, X_scaled, y, cv=skf,
+                scoring="accuracy",
+                params={"sample_weight": sample_weights},
+                n_jobs=-1,
+            )
+        except TypeError:
+            # sklearn < 1.4 uses fit_params=
+            cv_scores = cross_val_score(
+                self.model, X_scaled, y, cv=skf,
+                scoring="accuracy",
+                fit_params={"sample_weight": sample_weights},
+                n_jobs=-1,
+            )
         self.cv_accuracy = float(np.mean(cv_scores))
 
         # Final fit on all data (pass balanced weights so XGB sees all classes equally)

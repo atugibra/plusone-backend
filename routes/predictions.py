@@ -159,6 +159,30 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
 
         conn = get_connection()
         cur  = conn.cursor()
+
+        # ── Deduplication: skip if already logged ────────────────────────────
+        if match_id is not None:
+            # Prefer match_id dedup (most reliable for /predict and /upcoming)
+            cur.execute(
+                "SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1",
+                (match_id,)
+            )
+            if cur.fetchone():
+                log.debug("Skipping duplicate log for match_id=%s", match_id)
+                return
+        elif home_team and away_team:
+            # Fallback: same teams predicted within the last hour (consensus / nameless)
+            cur.execute("""
+                SELECT id FROM prediction_log
+                WHERE home_team = %s AND away_team = %s
+                  AND created_at >= NOW() - INTERVAL '1 hour'
+                LIMIT 1
+            """, (home_team, away_team))
+            if cur.fetchone():
+                log.debug("Skipping duplicate log for %s vs %s (already logged within 1 hour)",
+                          home_team, away_team)
+                return
+
         cur.execute("""
             INSERT INTO prediction_log
                 (match_id, home_team, away_team, league, match_date,
@@ -567,6 +591,22 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
         weights = _fetch_engine_weights(conn)
         weight_source = "dynamic_historical" if weights != _DEFAULT_WEIGHTS else "default_fallback"
 
+        # ── 1b. Resolve team / league / season names BEFORE engine calls ───────
+        # This ensures real names are logged even when the ML engine fails.
+        _cur = conn.cursor()
+        _cur.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)",
+                     (req.home_team_id, req.away_team_id))
+        _name_map = {r["id"]: r["name"] for r in _cur.fetchall()}
+        home_name   = _name_map.get(req.home_team_id, f"Team {req.home_team_id}")
+        away_name   = _name_map.get(req.away_team_id, f"Team {req.away_team_id}")
+        _cur.execute("SELECT name FROM leagues WHERE id = %s", (req.league_id,))
+        _lg = _cur.fetchone()
+        league_name = _lg["name"] if _lg else ""
+        _cur.execute("SELECT name FROM seasons WHERE id = %s", (req.season_id,))
+        _ss = _cur.fetchone()
+        season_name = _ss["name"] if _ss else ""
+        _cur.close()
+
         # ── 2. DC Engine ───────────────────────────────────────────────────────
         try:
             from ml.dc_engine import predict_dc_match
@@ -590,10 +630,8 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             weights["dc"] = 0.0
 
         # ── 3. ML Engine ───────────────────────────────────────────────────────
-        home_name = f"Team {req.home_team_id}"
-        away_name = f"Team {req.away_team_id}"
-        league_name = ""
-        season_name = ""
+        # home_name / away_name / league_name / season_name already resolved above;
+        # only refine from ML result if it provides richer detail.
         expected_goals = {}
         try:
             import ml.prediction_engine as ml_engine
@@ -611,10 +649,11 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             ml_probs = {k: round(v / s, 4) for k, v in ml_probs.items()}
             ml_outcome = ml_raw.get("predicted_outcome", "Home Win")
             mi = ml_raw.get("match", {})
-            home_name      = mi.get("home_team", home_name)
-            away_name      = mi.get("away_team", away_name)
-            league_name    = mi.get("league", "")
-            season_name    = mi.get("season", "")
+            # Refine names from ML result only if it returns valid strings
+            home_name   = mi.get("home_team")  or home_name
+            away_name   = mi.get("away_team")  or away_name
+            league_name = mi.get("league")     or league_name
+            season_name = mi.get("season")     or season_name
             expected_goals = ml_raw.get("expected_goals", {})
         except Exception as exc:
             log.warning("Consensus: ML error: %s", exc)

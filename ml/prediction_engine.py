@@ -306,6 +306,7 @@ def predict_match(home_team_id: int, away_team_id: int,
                   league_id: int, season_id: int) -> dict:
     """
     Full rich prediction for one match with feedback calibration applied.
+    Uses the same batch_features path as training to guarantee feature-count consistency.
     """
     engine = _get_engine()
     if engine is None or not engine.is_trained:
@@ -314,6 +315,7 @@ def predict_match(home_team_id: int, away_team_id: int,
     conn = get_connection()
     cur  = conn.cursor()
     try:
+        # ── 1. Resolve names (always from DB, never fall back to "Team N") ──────
         cur.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)",
                     (home_team_id, away_team_id))
         name_map = {r["id"]: r["name"] for r in cur.fetchall()}
@@ -328,13 +330,24 @@ def predict_match(home_team_id: int, away_team_id: int,
         ss_row = cur.fetchone()
         season_name = ss_row["name"] if ss_row else ""
 
-        cur.execute("SELECT id FROM matches WHERE home_team_id = %s AND away_team_id = %s AND season_id = %s LIMIT 1",
-                    (home_team_id, away_team_id, season_id))
+        cur.execute(
+            "SELECT id FROM matches WHERE home_team_id = %s AND away_team_id = %s"
+            " AND season_id = %s LIMIT 1",
+            (home_team_id, away_team_id, season_id),
+        )
         match_row = cur.fetchone()
         match_id_or_none = match_row["id"] if match_row else None
 
-        fv, feat_names, home_feats, away_feats, h2h = build_match_features(
-            cur, home_team_id, away_team_id, league_id, season_id
+        # ── 2. Build features via BATCH path (identical to training) ────────────
+        # This guarantees the feature vector has the exact same shape / ordering
+        # as the vectors used when the model's StandardScaler was fitted.
+        from ml.batch_features import DataCache, _build_match_features as _batch_build
+        cache = DataCache(cur)          # bulk-loads all tables (no more DB calls needed)
+        conn.close()                    # cache holds everything in memory
+        conn = None
+
+        fv, feat_names, home_feats, away_feats, h2h = _batch_build(
+            cache, home_team_id, away_team_id, league_id, season_id
         )
 
         raw_proba = engine.predict_proba(fv)
@@ -421,7 +434,10 @@ def predict_match(home_team_id: int, away_team_id: int,
             },
         }
     finally:
-        conn.close()
+        if conn:
+            try: conn.close()
+            except: pass
+
 
 
 # ─── Upcoming fixtures ────────────────────────────────────────────────────────
