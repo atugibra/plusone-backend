@@ -133,9 +133,36 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         match_info = result.get("match", {})
         probs      = result.get("probabilities", {})
 
-        home_team = match_info.get("home_team") or result.get("home_team")
-        away_team = match_info.get("away_team") or result.get("away_team")
-        league    = match_info.get("league")    or result.get("league")
+        home_team    = match_info.get("home_team") or result.get("home_team")
+        away_team    = match_info.get("away_team") or result.get("away_team")
+        home_team_id = match_info.get("home_team_id") or result.get("home_team_id")
+        away_team_id = match_info.get("away_team_id") or result.get("away_team_id")
+        league       = match_info.get("league")    or result.get("league")
+
+        # If names are missing but we have IDs, look them up from DB
+        if (not home_team or not away_team or not league) and (home_team_id or away_team_id):
+            try:
+                conn_inner = get_connection()
+                cur_inner  = conn_inner.cursor()
+                if not home_team or not away_team:
+                    ids = [x for x in [home_team_id, away_team_id] if x]
+                    if len(ids) == 2:
+                        cur_inner.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)", tuple(ids))
+                    else:
+                        cur_inner.execute("SELECT id, name FROM teams WHERE id = %s", (ids[0],))
+                    name_map  = {r["id"]: r["name"] for r in cur_inner.fetchall()}
+                    home_team = home_team or name_map.get(home_team_id)
+                    away_team = away_team or name_map.get(away_team_id)
+                if not league:
+                    league_id = match_info.get("league_id") or result.get("league_id")
+                    if league_id:
+                        cur_inner.execute("SELECT name FROM leagues WHERE id = %s", (league_id,))
+                        lg_row = cur_inner.fetchone()
+                        league = lg_row["name"] if lg_row else None
+                conn_inner.close()
+            except Exception:
+                pass
+
         predicted = result.get("predicted_outcome")
 
         match_date = (
