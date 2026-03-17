@@ -101,6 +101,9 @@ def train_model():
         conn3 = get_connection()
         cur3  = conn3.cursor()
         feat_names = []
+        conn3 = get_connection()
+        cur3  = conn3.cursor()
+        feat_names = []
         try:
             cur3.execute("""
                 SELECT m.id, m.home_team_id, m.away_team_id, m.league_id, m.season_id
@@ -111,15 +114,17 @@ def train_model():
             """)
             sample = cur3.fetchone()
             if sample:
-                _, feat_names, _, _, _ = build_match_features(
-                    cur3,
+                from ml.batch_features import DataCache, _build_match_features as _batch_build
+                cache = DataCache(cur3)
+                _, feat_names, _, _, _ = _batch_build(
+                    cache,
                     sample["home_team_id"],
                     sample["away_team_id"],
                     sample["league_id"],
                     sample["season_id"],
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Could not extract feature names during training: %s", exc)
         finally:
             conn3.close()
 
