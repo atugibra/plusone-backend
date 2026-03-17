@@ -112,8 +112,8 @@ class EnsemblePredictor:
                 params={"sample_weight": sample_weights},
                 n_jobs=-1,
             )
-        except TypeError:
-            # sklearn < 1.4 uses fit_params=
+        except (TypeError, ValueError):
+            # sklearn < 1.4 uses fit_params= and raises ValueError/TypeError if params is passed
             cv_scores = cross_val_score(
                 self.model, X_scaled, y, cv=skf,
                 scoring="accuracy",
