@@ -328,6 +328,11 @@ def predict_match(home_team_id: int, away_team_id: int,
         ss_row = cur.fetchone()
         season_name = ss_row["name"] if ss_row else ""
 
+        cur.execute("SELECT id FROM matches WHERE home_team_id = %s AND away_team_id = %s AND season_id = %s LIMIT 1",
+                    (home_team_id, away_team_id, season_id))
+        match_row = cur.fetchone()
+        match_id_or_none = match_row["id"] if match_row else None
+
         fv, feat_names, home_feats, away_feats, h2h = build_match_features(
             cur, home_team_id, away_team_id, league_id, season_id
         )
@@ -370,6 +375,7 @@ def predict_match(home_team_id: int, away_team_id: int,
         cal = get_calibrator()
         return {
             "match": {
+                "match_id":   match_id_or_none,
                 "home_team":  home_name,
                 "away_team":  away_name,
                 "league":     league_name,
