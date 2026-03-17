@@ -215,18 +215,18 @@ class FeedbackCalibrator:
         try:
             from database import get_connection
             import base64
-            blob = base64.b64encode(pickle.dumps(self._cal)).decode("utf-8")
+            byte_data = pickle.dumps(self._cal)
             conn = get_connection()
             cur  = conn.cursor()
             cur.execute("""
-                INSERT INTO ml_models (key, model_blob, n_samples, accuracy, trained_at)
+                INSERT INTO ml_models (name, model_bytes, n_samples, accuracy, created_at)
                 VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE
-                  SET model_blob = EXCLUDED.model_blob,
+                ON CONFLICT (name) DO UPDATE
+                  SET model_bytes = EXCLUDED.model_bytes,
                       n_samples  = EXCLUDED.n_samples,
                       accuracy   = EXCLUDED.accuracy,
-                      trained_at = NOW()
-            """, (self.DB_KEY, blob, self.n_samples, self.post_accuracy))
+                      created_at = NOW()
+            """, (self.DB_KEY, byte_data, self.n_samples, self.post_accuracy))
             conn.commit()
             conn.close()
             log.info("FeedbackCalibrator saved to DB.")
@@ -237,19 +237,17 @@ class FeedbackCalibrator:
         """Load calibrator from DB. Returns True if successful."""
         try:
             from database import get_connection
-            import base64
             conn = get_connection()
             cur  = conn.cursor()
             cur.execute(
-                "SELECT model_blob, n_samples, accuracy FROM ml_models WHERE key = %s",
+                "SELECT model_bytes, n_samples, accuracy FROM ml_models WHERE name = %s",
                 (self.DB_KEY,)
             )
             row = cur.fetchone()
             conn.close()
-            if not row or not row["model_blob"]:
+            if not row or not row["model_bytes"]:
                 return False
-            blob = base64.b64decode(row["model_blob"].encode("utf-8"))
-            self._cal       = pickle.loads(blob)
+            self._cal       = pickle.loads(row["model_bytes"])
             self.n_samples  = int(row["n_samples"] or 0)
             self.post_accuracy = float(row["accuracy"] or 0)
             log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%)",

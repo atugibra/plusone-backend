@@ -111,8 +111,10 @@ def train_model():
             """)
             sample = cur3.fetchone()
             if sample:
-                _, feat_names, _, _, _ = build_match_features(
-                    cur3,
+                from ml.batch_features import DataCache, _build_match_features as _batch_build
+                cache = DataCache(cur3)
+                _, feat_names, _, _, _ = _batch_build(
+                    cache,
                     sample["home_team_id"],
                     sample["away_team_id"],
                     sample["league_id"],
@@ -333,8 +335,13 @@ def predict_match(home_team_id: int, away_team_id: int,
         match_row = cur.fetchone()
         match_id_or_none = match_row["id"] if match_row else None
 
-        fv, feat_names, home_feats, away_feats, h2h = build_match_features(
-            cur, home_team_id, away_team_id, league_id, season_id
+        from ml.batch_features import DataCache, _build_match_features as _batch_build
+        cache = DataCache(cur)
+        conn.close()
+        conn = None
+
+        fv, feat_names, home_feats, away_feats, h2h = _batch_build(
+            cache, home_team_id, away_team_id, league_id, season_id
         )
 
         raw_proba = engine.predict_proba(fv)
@@ -420,7 +427,9 @@ def predict_match(home_team_id: int, away_team_id: int,
             },
         }
     finally:
-        conn.close()
+        if conn:
+            try: conn.close()
+            except: pass
 
 
 # ─── Upcoming fixtures ────────────────────────────────────────────────────────
