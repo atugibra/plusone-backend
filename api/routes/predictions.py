@@ -183,6 +183,50 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
 
         conn = get_connection()
         cur  = conn.cursor()
+
+        # ── Deduplication / Upsert ───────────────────────────────────────────
+        # Check for an existing row for the same teams within the last 24 hours.
+        # This covers both:
+        #   (a) /predict already logged this match with match_id=NULL →
+        #       if we now have a real match_id, UPDATE that row instead of inserting.
+        #   (b) /upcoming already logged with a real match_id →
+        #       skip entirely to avoid duplicates.
+        cur.execute("""
+            SELECT id, match_id FROM prediction_log
+            WHERE home_team = %s AND away_team = %s
+              AND created_at >= NOW() - INTERVAL '24 hours'
+            LIMIT 1
+        """, (home_team, away_team))
+        existing = cur.fetchone()
+
+        if existing:
+            existing_id       = existing["id"]
+            existing_match_id = existing["match_id"]
+            if match_id is not None and existing_match_id is None:
+                # Upgrade the NULL row with the real match_id
+                cur.execute(
+                    "UPDATE prediction_log SET match_id = %s WHERE id = %s",
+                    (match_id, existing_id)
+                )
+                conn.commit()
+                log.info("Updated match_id=%s for existing log row id=%s (%s vs %s)",
+                         match_id, existing_id, home_team, away_team)
+            else:
+                log.debug("Skipping duplicate log for %s vs %s (existing id=%s)",
+                          home_team, away_team, existing_id)
+            return
+
+        # Also guard against exact match_id collision (belt-and-suspenders)
+        if match_id is not None:
+            cur.execute(
+                "SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1",
+                (match_id,)
+            )
+            if cur.fetchone():
+                log.debug("Skipping duplicate log for match_id=%s", match_id)
+                return
+        # ────────────────────────────────────────────────────────────────────
+
         cur.execute("""
             INSERT INTO prediction_log
                 (match_id, home_team, away_team, league, match_date,
@@ -206,6 +250,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
+
     except Exception as exc:
         log.error("Could not log prediction: %s", exc, exc_info=True)
         if conn:
