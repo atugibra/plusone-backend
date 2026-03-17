@@ -532,6 +532,7 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                     "match_date":   str(fx["match_date"]) if fx["match_date"] else None,
                     "gameweek":     fx["gameweek"],
                     "match": {
+                        "match_id":     fx["id"],
                         "home_team":    fx["home_name"],
                         "away_team":    fx["away_name"],
                         "home_logo":    fx["home_logo"],

@@ -2,6 +2,7 @@ import os
 import sys
 
 # Add the backend directory to sys.path
+import psycopg2
 sys.path.append(os.path.join(os.path.dirname(__file__), 'api'))
 
 from database import get_connection
@@ -27,8 +28,19 @@ def fix_match_ids():
             
             match = cur.fetchone()
             if match:
-                cur.execute("UPDATE prediction_log SET match_id = %s WHERE id = %s", (match['id'], row['id']))
-                updated += 1
+                try:
+                    # Savepoint to catch duplicate constraint errors gracefully
+                    cur.execute("SAVEPOINT sp_update")
+                    cur.execute("UPDATE prediction_log SET match_id = %s WHERE id = %s", (match['id'], row['id']))
+                    cur.execute("RELEASE SAVEPOINT sp_update")
+                    updated += 1
+                except psycopg2.errors.UniqueViolation:
+                    # Duplicate found - just rollback this specific savepoint and continue
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_update")
+                    print(f"Skipping ID {row['id']} - Match ID {match['id']} already exists (Unique constraint)")
+                    # Optionally delete the row since it's a duplicate prediction
+                    # cur.execute("DELETE FROM prediction_log WHERE id = %s", (row['id'],))
+
                 
         conn.commit()
         print(f"✅ Successfully backfilled {updated} missing match_ids in prediction_log.")
