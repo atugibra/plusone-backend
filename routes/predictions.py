@@ -58,6 +58,7 @@ class ConsensusRequest(BaseModel):
     away_team_id: int
     league_id:    int
     season_id:    int
+    match_id:     Optional[int] = None   # allows prediction_log grading after match completes
 
 
 # ─── ML Routes ────────────────────────────────────────────────────────────────
@@ -775,7 +776,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
                 "match":             result["match"],
                 "markets":           result["markets"],
             },
-            None,
+            req.match_id,   # now stores the fixture ID so evaluation can grade it
         )
 
         return result
