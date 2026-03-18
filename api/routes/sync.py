@@ -63,7 +63,7 @@ def safe_age_int(val):
 router = APIRouter()
 
 
-from api.routes.prediction_log import do_evaluate_predictions
+from routes.prediction_log import do_evaluate_predictions
 
 def _auto_evaluate_predictions(conn) -> int:
     """
