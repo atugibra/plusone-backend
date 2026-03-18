@@ -63,6 +63,8 @@ def safe_age_int(val):
 router = APIRouter()
 
 
+from routes.prediction_log import do_evaluate_predictions
+
 def _auto_evaluate_predictions(conn) -> int:
     """
     Grade all unevaluated prediction_log rows whose match is now complete.
@@ -70,29 +72,7 @@ def _auto_evaluate_predictions(conn) -> int:
     Returns the number of rows updated.
     """
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT pl.id, pl.predicted, m.home_score, m.away_score
-            FROM prediction_log pl
-            JOIN matches m ON m.id = pl.match_id
-            WHERE pl.actual IS NULL
-              AND m.home_score IS NOT NULL
-              AND m.away_score IS NOT NULL
-        """)
-        rows = cur.fetchall()
-        updated = 0
-        for r in rows:
-            hs = int(r["home_score"]); as_ = int(r["away_score"])
-            if hs > as_:  actual = "Home Win"
-            elif as_ > hs: actual = "Away Win"
-            else:          actual = "Draw"
-            correct = (actual == r["predicted"])
-            cur.execute("""
-                UPDATE prediction_log
-                SET actual = %s, correct = %s, evaluated_at = NOW()
-                WHERE id = %s
-            """, (actual, correct, r["id"]))
-            updated += 1
+        updated = do_evaluate_predictions(conn)
         conn.commit()
         return updated
     except Exception as e:

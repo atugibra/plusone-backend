@@ -219,13 +219,13 @@ class FeedbackCalibrator:
             conn = get_connection()
             cur  = conn.cursor()
             cur.execute("""
-                INSERT INTO ml_models (name, model_bytes, n_samples, cv_accuracy, trained_at)
+                INSERT INTO ml_models (name, model_bytes, n_samples, cv_accuracy, created_at)
                 VALUES (%s, %s, %s, %s, NOW())
                 ON CONFLICT (name) DO UPDATE
                   SET model_bytes = EXCLUDED.model_bytes,
                       n_samples   = EXCLUDED.n_samples,
                       cv_accuracy = EXCLUDED.cv_accuracy,
-                      trained_at  = NOW()
+                      created_at  = NOW()
             """, (self.DB_KEY, byte_data, self.n_samples, self.post_accuracy))
             conn.commit()
             conn.close()

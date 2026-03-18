@@ -130,18 +130,30 @@ def record_prediction(req: RecordRequest):
         conn.close()
 
 
-# ─── POST /evaluate ───────────────────────────────────────────────────────────
+# ─── Helper for evaluation ────────────────────────────────────────────────────
 
-@router.post("/evaluate")
-def evaluate_predictions():
+def do_evaluate_predictions(conn) -> int:
     """
-    Grade all un-evaluated prediction_log rows whose match has now completed.
-    Grades: outcome correct/wrong, BTTS correct/wrong, Over 2.5 correct/wrong.
-    Safe to call repeatedly.
+    Grade un-evaluated prediction_log rows whose match has now completed.
+    First tries to link any missing match_ids.
     """
-    conn = get_connection()
-    cur  = conn.cursor()
+    cur = conn.cursor()
     try:
+        # 1. Backfill missing match_ids by matching team names and proximity dates
+        cur.execute("""
+            UPDATE prediction_log pl
+            SET match_id = m.id
+            FROM matches m
+            JOIN teams ht ON ht.id = m.home_team_id
+            JOIN teams at ON at.id = m.away_team_id
+            WHERE pl.match_id IS NULL
+              AND pl.home_team = ht.name
+              AND pl.away_team = at.name
+              AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '3 days')
+              AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '3 days')
+        """)
+
+        # 2. Grade all un-evaluated rows
         cur.execute("""
             SELECT pl.id, pl.predicted, pl.btts_yes, pl.over_2_5,
                    pl.dc_predicted_outcome, pl.ml_predicted_outcome,
@@ -169,11 +181,9 @@ def evaluate_predictions():
             btts_correct     = None
             over_2_5_correct = None
             if r["btts_yes"] is not None:
-                btts_pred        = float(r["btts_yes"]) > 0.5
-                btts_correct     = (btts_pred == both_scored)
+                btts_correct = ((float(r["btts_yes"]) > 0.5) == both_scored)
             if r["over_2_5"] is not None:
-                over_pred        = float(r["over_2_5"]) > 0.5
-                over_2_5_correct = (over_pred == (total_goals > 2))
+                over_2_5_correct = ((float(r["over_2_5"]) > 0.5) == (total_goals > 2))
 
             # Per-engine outcome grading
             dc_correct     = (r["dc_predicted_outcome"]     == actual) if r["dc_predicted_outcome"]     else None
@@ -197,7 +207,23 @@ def evaluate_predictions():
                   dc_correct, ml_correct, legacy_correct,
                   r["id"]))
             updated += 1
+        return updated
+    finally:
+        cur.close()
 
+
+# ─── POST /evaluate ───────────────────────────────────────────────────────────
+
+@router.post("/evaluate")
+def evaluate_predictions():
+    """
+    Grade all un-evaluated prediction_log rows whose match has now completed.
+    Grades: outcome correct/wrong, BTTS correct/wrong, Over 2.5 correct/wrong.
+    Safe to call repeatedly.
+    """
+    conn = get_connection()
+    try:
+        updated = do_evaluate_predictions(conn)
         conn.commit()
         return {
             "evaluated": updated,
