@@ -58,6 +58,7 @@ class ConsensusRequest(BaseModel):
     away_team_id: int
     league_id:    int
     season_id:    int
+    match_id:     Optional[int] = None   # passed from frontend for gradeability
 
 
 # ─── ML Routes ────────────────────────────────────────────────────────────────
@@ -778,7 +779,7 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
                 "match":             result["match"],
                 "markets":           result["markets"],
             },
-            None,
+            req.match_id,   # store fixture ID so evaluation can grade it later
         )
 
         return result
@@ -790,6 +791,253 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
     finally:
         try: conn.close()
         except: pass
+
+
+# ─── Auto-consensus background job ──────────────────────────────────────────
+
+_AUTO_CONSENSUS_INTERVAL_HOURS = 6   # fallback default (hours)
+_auto_consensus_state: dict = {"last_run": None, "last_count": 0, "last_error": None, "interval_hours": _AUTO_CONSENSUS_INTERVAL_HOURS}
+
+
+def _get_consensus_interval_hours() -> int:
+    """Read consensus_interval_hours from app_settings table, fallback to default."""
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT value FROM app_settings WHERE key = 'consensus_interval_hours' LIMIT 1
+        """)
+        row = cur.fetchone()
+        conn.close()
+        if row and row["value"]:
+            hours = int(row["value"])
+            return max(1, min(hours, 168))   # clamp between 1h and 7 days
+    except Exception:
+        pass   # table may not exist yet, use default
+    return _AUTO_CONSENSUS_INTERVAL_HOURS
+
+
+def _run_consensus_for_fixture(fx: dict, conn) -> bool:
+    """
+    Run the full Dynamic Consensus Engine (DC + ML + Legacy) for a single
+    upcoming fixture dict (same fields as predict_upcoming_fast returns).
+    Logs the result to prediction_log via _log_prediction_to_db.
+    Returns True if a prediction was logged/updated.
+    """
+    import math
+    home_team_id = fx["home_team_id"]
+    away_team_id = fx["away_team_id"]
+    league_id    = fx["league_id"]
+    season_id    = fx["season_id"]
+    fixture_id   = fx["id"]
+    home_name    = fx.get("home_name", f"Team {home_team_id}")
+    away_name    = fx.get("away_name", f"Team {away_team_id}")
+    league_name  = fx.get("league_name", "")
+    season_name  = fx.get("season_name", "")
+
+    errors = []
+    weights = _fetch_engine_weights(conn)
+
+    # ── DC ──────────────────────────────────────────────────────────────────
+    try:
+        from ml.dc_engine import predict_dc_match
+        dc_raw = predict_dc_match(home_team_id, away_team_id)
+        if "error" in dc_raw:
+            raise RuntimeError(dc_raw["error"])
+        blended_key = dc_raw.get("calibrated") or dc_raw.get("blended") or {}
+        dc_probs = {
+            "home_win": float(blended_key.get("home_win", 0.35)),
+            "draw":     float(blended_key.get("draw",     0.30)),
+            "away_win": float(blended_key.get("away_win", 0.35)),
+        }
+        s = sum(dc_probs.values()) or 1
+        dc_probs = {k: round(v / s, 4) for k, v in dc_probs.items()}
+        dc_outcome = _OUTCOME_LABELS[[dc_probs["home_win"], dc_probs["draw"], dc_probs["away_win"]].index(max(dc_probs.values()))]
+    except Exception as exc:
+        log.debug("Auto-consensus: DC error for %s vs %s: %s", home_name, away_name, exc)
+        errors.append(f"dc: {exc}")
+        dc_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+        dc_outcome = "Home Win"
+        weights["dc"] = 0.0
+
+    # ── ML ──────────────────────────────────────────────────────────────────
+    expected_goals = {}
+    try:
+        import ml.prediction_engine as ml_engine
+        ml_raw = ml_engine.predict_match(home_team_id, away_team_id, league_id, season_id)
+        if "error" in ml_raw:
+            raise RuntimeError(ml_raw["error"])
+        ml_probs_inner = ml_raw.get("probabilities", {})
+        ml_probs = {
+            "home_win": float(ml_probs_inner.get("home_win", 0.35)),
+            "draw":     float(ml_probs_inner.get("draw",     0.30)),
+            "away_win": float(ml_probs_inner.get("away_win", 0.35)),
+        }
+        s = sum(ml_probs.values()) or 1
+        ml_probs   = {k: round(v / s, 4) for k, v in ml_probs.items()}
+        ml_outcome = ml_raw.get("predicted_outcome", "Home Win")
+        mi = ml_raw.get("match", {})
+        home_name    = mi.get("home_team", home_name)
+        away_name    = mi.get("away_team", away_name)
+        league_name  = mi.get("league", league_name)
+        season_name  = mi.get("season", season_name)
+        expected_goals = ml_raw.get("expected_goals", {})
+    except Exception as exc:
+        log.debug("Auto-consensus: ML error for %s vs %s: %s", home_name, away_name, exc)
+        errors.append(f"ml: {exc}")
+        ml_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+        ml_outcome = "Home Win"
+        weights["ml"] = 0.0
+
+    # ── Legacy ──────────────────────────────────────────────────────────────
+    try:
+        legacy_raw     = _run_legacy_inline(conn, home_team_id, away_team_id)
+        legacy_probs   = {k: v for k, v in legacy_raw.items() if k in ("home_win", "draw", "away_win")}
+        legacy_outcome = legacy_raw.get("predicted_outcome", "Home Win")
+    except Exception as exc:
+        log.debug("Auto-consensus: Legacy error for %s vs %s: %s", home_name, away_name, exc)
+        errors.append(f"legacy: {exc}")
+        legacy_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+        legacy_outcome = "Home Win"
+        weights["legacy"] = 0.0
+
+    # ── Blend ───────────────────────────────────────────────────────────────
+    w_sum = sum(weights.values())
+    weights = dict(_DEFAULT_WEIGHTS) if w_sum < 0.01 else {k: round(v / w_sum, 4) for k, v in weights.items()}
+    blended = _blend_probs(dc_probs, ml_probs, legacy_probs, weights)
+
+    prob_list = [blended["home_win"], blended["draw"], blended["away_win"]]
+    consensus_outcome = _OUTCOME_LABELS[prob_list.index(max(prob_list))]
+    confidence_score, confidence_label = _entropy_confidence(blended)
+
+    home_xg  = float(expected_goals.get("home_xg", 1.35))
+    away_xg  = float(expected_goals.get("away_xg", 1.10))
+    btts_yes = max(0.0, min(1.0, round(
+        1 - math.exp(-home_xg) - math.exp(-away_xg) + math.exp(-(home_xg + away_xg)), 4)))
+    over_2_5 = max(0.0, min(1.0, round(
+        1 - sum(math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k)
+                for k in range(3)), 4)))
+
+    _log_prediction_to_db(
+        {
+            "probabilities":    {"home_win": blended["home_win"], "draw": blended["draw"], "away_win": blended["away_win"]},
+            "predicted_outcome": consensus_outcome,
+            "confidence":        confidence_label,
+            "confidence_score":  confidence_score,
+            "match": {
+                "home_team":    home_name,
+                "away_team":    away_name,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "league":       league_name,
+                "season":       season_name,
+            },
+            "markets": {
+                "btts_yes": btts_yes,
+                "over_2_5": over_2_5,
+                "home_xg":  round(home_xg, 2),
+                "away_xg":  round(away_xg, 2),
+            },
+        },
+        fixture_id,   # real match_id — enables grading
+    )
+    return True
+
+
+def auto_consensus_job():
+    """
+    Fetch all upcoming fixtures (next 7 days, unplayed) and run the
+    Dynamic Consensus Engine on each. Results are automatically written
+    to prediction_log (with dedup — existing rows are updated, not duplicated).
+    This function is safe to call from a background thread.
+    """
+    global _auto_consensus_state
+    _auto_consensus_state["last_error"] = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT m.id, m.home_team_id, m.away_team_id,
+                   m.league_id, m.season_id, m.match_date,
+                   ht.name AS home_name, at.name AS away_name,
+                   l.name  AS league_name, s.name AS season_name
+            FROM   matches m
+            JOIN   teams   ht ON ht.id = m.home_team_id
+            JOIN   teams   at ON at.id = m.away_team_id
+            JOIN   leagues l  ON l.id  = m.league_id
+            JOIN   seasons s  ON s.id  = m.season_id
+            WHERE  m.home_score IS NULL
+              AND  m.match_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+            ORDER  BY m.match_date ASC
+        """)
+        fixtures = [dict(r) for r in cur.fetchall()]
+        log.info("Auto-consensus job: found %d upcoming fixtures", len(fixtures))
+
+        count = 0
+        for fx in fixtures:
+            try:
+                _run_consensus_for_fixture(fx, conn)
+                count += 1
+            except Exception as exc:
+                log.warning("Auto-consensus: skipped fixture id=%s (%s vs %s): %s",
+                            fx.get("id"), fx.get("home_name"), fx.get("away_name"), exc)
+
+        conn.close()
+        import datetime
+        _auto_consensus_state["last_run"]   = datetime.datetime.utcnow().isoformat() + "Z"
+        _auto_consensus_state["last_count"] = count
+        log.info("Auto-consensus job: logged/updated %d predictions", count)
+    except Exception as exc:
+        log.error("Auto-consensus job failed: %s", exc, exc_info=True)
+        _auto_consensus_state["last_error"] = str(exc)
+
+
+def _schedule_auto_consensus(interval_hours: int = None):
+    """Recurring threading.Timer. Re-reads interval from app_settings each cycle
+    so admin changes take effect on the next run without a server restart."""
+    def _run_and_reschedule():
+        try:
+            auto_consensus_job()
+        finally:
+            # always re-read from DB so live setting changes are picked up
+            _schedule_auto_consensus()
+    # Read fresh interval from DB every cycle
+    effective_hours = interval_hours or _get_consensus_interval_hours()
+    _auto_consensus_state["interval_hours"] = effective_hours
+    t = threading.Timer(effective_hours * 3600, _run_and_reschedule)
+    t.daemon = True
+    t.name   = "auto-consensus-scheduler"
+    t.start()
+    log.info("Auto-consensus next run in %dh (reads DB setting each cycle)", effective_hours)
+
+
+@router.post("/auto-consensus")
+def trigger_auto_consensus():
+    """Manually trigger the automatic consensus prediction job."""
+    t = threading.Thread(target=auto_consensus_job, daemon=True, name="auto-consensus-manual")
+    t.start()
+    return {"started": True, "message": "Auto-consensus job started. Upcoming fixtures will be predicted and logged."}
+
+
+@router.get("/auto-consensus/status")
+def auto_consensus_status():
+    """Return status of the last auto-consensus run, including live DB interval setting."""
+    return {
+        "interval_hours":      _get_consensus_interval_hours(),   # live DB value
+        "interval_hours_live": _auto_consensus_state.get("interval_hours", _AUTO_CONSENSUS_INTERVAL_HOURS),
+        **{k: v for k, v in _auto_consensus_state.items() if k != "interval_hours"},
+    }
+
+
+# ── Start the scheduler when this module is imported ─────────────────────────
+# Runs once 2 minutes after startup so the server finishes initialising first,
+# then every 6 hours thereafter.
+_initial_timer = threading.Timer(120, lambda: (_schedule_auto_consensus(), auto_consensus_job()))
+_initial_timer.daemon = True
+_initial_timer.name   = "auto-consensus-init"
+_initial_timer.start()
+log.info("Auto-consensus scheduler registered: first run in 2 min, then every %dh",
+         _AUTO_CONSENSUS_INTERVAL_HOURS)
 
 
 # ─── Legacy Rule-based Route ──────────────────────────────────────────────────
