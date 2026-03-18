@@ -186,15 +186,32 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         cur  = conn.cursor()
 
         # ── Deduplication / Upsert ───────────────────────────────────────────
-        # Check for an existing row for the same teams within the last 7 days.
-        # This covers matches scheduled several days in advance.
-        cur.execute("""
-            SELECT id, match_id, actual FROM prediction_log
-            WHERE home_team = %s AND away_team = %s
-              AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
-            ORDER BY created_at DESC LIMIT 1
-        """, (home_team, away_team))
-        existing = cur.fetchone()
+        existing = None
+
+        # 1. Prefer matching exactly by match_id if provided
+        if match_id is not None:
+            cur.execute("""
+                SELECT id, match_id, actual 
+                FROM prediction_log 
+                WHERE match_id = %s 
+                LIMIT 1
+            """, (match_id,))
+            existing = cur.fetchone()
+
+        # 2. Fallback to team names + time window if no exact match_id found
+        if not existing:
+            # This covers matches scheduled several days in advance.
+            cur.execute("""
+                SELECT id, match_id, actual FROM prediction_log
+                WHERE home_team = %s AND away_team = %s
+                  AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
+                ORDER BY created_at DESC LIMIT 1
+            """, (home_team, away_team))
+            row = cur.fetchone()
+            
+            # Only use this fallback row if we aren't stealing it from a different known match
+            if row and (row["match_id"] is None or row["match_id"] == match_id):
+                existing = row
 
         if existing:
             existing_id       = existing["id"]
@@ -205,10 +222,12 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 log.debug("Skipping update for %s vs %s (already graded)", home_team, away_team)
                 return
 
+            new_id_to_set = match_id if match_id is not None else existing_match_id
+
             # Update the existing un-graded prediction with the fresh probabilities
             cur.execute("""
                 UPDATE prediction_log SET
-                    match_id = COALESCE(%s, match_id),
+                    match_id = %s,
                     predicted = %s,
                     confidence = %s,
                     confidence_score = %s,
@@ -223,7 +242,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                     league = COALESCE(%s, league)
                 WHERE id = %s
             """, (
-                match_id,
+                new_id_to_set,
                 predicted,
                 result.get("confidence"),
                 float(result.get("confidence_score") or 0),
