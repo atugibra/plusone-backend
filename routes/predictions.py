@@ -188,9 +188,64 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         conn = get_connection()
         cur  = conn.cursor()
 
-        # ── Deduplication: skip if already logged ────────────────────────────
+        # ── Deduplication / Upsert ───────────────────────────────────────────
+        # Check for an existing row for the same teams within the last 7 days.
+        cur.execute("""
+            SELECT id, match_id, actual FROM prediction_log
+            WHERE home_team = %s AND away_team = %s
+              AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
+            ORDER BY created_at DESC LIMIT 1
+        """, (home_team, away_team))
+        existing = cur.fetchone()
+
+        if existing:
+            existing_id       = existing["id"]
+            existing_actual   = existing["actual"]
+            existing_match_id = existing["match_id"]
+
+            if existing_actual is not None:
+                log.debug("Skipping update for %s vs %s (already graded)", home_team, away_team)
+                return
+
+            # Update the existing un-graded prediction with the fresh probabilities
+            cur.execute("""
+                UPDATE prediction_log SET
+                    match_id = COALESCE(%s, match_id),
+                    predicted = %s,
+                    confidence = %s,
+                    confidence_score = %s,
+                    home_win_prob = %s,
+                    draw_prob = %s,
+                    away_win_prob = %s,
+                    btts_yes = %s,
+                    over_2_5 = %s,
+                    home_xg = %s,
+                    away_xg = %s,
+                    match_date = COALESCE(%s, match_date),
+                    league = COALESCE(%s, league)
+                WHERE id = %s
+            """, (
+                match_id,
+                predicted,
+                result.get("confidence"),
+                float(result.get("confidence_score") or 0),
+                float(probs.get("home_win") or 0),
+                float(probs.get("draw") or 0),
+                float(probs.get("away_win") or 0),
+                float(btts_yes) if btts_yes is not None else None,
+                float(over_2_5) if over_2_5 is not None else None,
+                float(home_xg)  if home_xg  is not None else None,
+                float(away_xg)  if away_xg  is not None else None,
+                match_date,
+                league,
+                existing_id
+            ))
+            conn.commit()
+            log.info("Updated future prediction for %s vs %s with fresh data", home_team, away_team)
+            return
+
+        # Also guard against exact match_id collision for newly inserted rows
         if match_id is not None:
-            # Prefer match_id dedup (most reliable for /predict and /upcoming)
             cur.execute(
                 "SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1",
                 (match_id,)
@@ -198,18 +253,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
             if cur.fetchone():
                 log.debug("Skipping duplicate log for match_id=%s", match_id)
                 return
-        elif home_team and away_team:
-            # Fallback: same teams predicted within the last hour (consensus / nameless)
-            cur.execute("""
-                SELECT id FROM prediction_log
-                WHERE home_team = %s AND away_team = %s
-                  AND created_at >= NOW() - INTERVAL '1 hour'
-                LIMIT 1
-            """, (home_team, away_team))
-            if cur.fetchone():
-                log.debug("Skipping duplicate log for %s vs %s (already logged within 1 hour)",
-                          home_team, away_team)
-                return
+        # ────────────────────────────────────────────────────────────────────
 
         cur.execute("""
             INSERT INTO prediction_log

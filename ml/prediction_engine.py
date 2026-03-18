@@ -487,6 +487,13 @@ def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
 
 
 def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
+    from ml.feedback_calibrator import recalibrate_with_feedback
+    try:
+        recalibrate_with_feedback()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("Pre-prediction recalibration failed: %s", exc)
+
     eng = _get_engine()
     if eng is None or not eng.is_trained:
         return []

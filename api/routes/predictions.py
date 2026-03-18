@@ -186,38 +186,63 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         cur  = conn.cursor()
 
         # ── Deduplication / Upsert ───────────────────────────────────────────
-        # Check for an existing row for the same teams within the last 24 hours.
-        # This covers both:
-        #   (a) /predict already logged this match with match_id=NULL →
-        #       if we now have a real match_id, UPDATE that row instead of inserting.
-        #   (b) /upcoming already logged with a real match_id →
-        #       skip entirely to avoid duplicates.
+        # Check for an existing row for the same teams within the last 7 days.
+        # This covers matches scheduled several days in advance.
         cur.execute("""
-            SELECT id, match_id FROM prediction_log
+            SELECT id, match_id, actual FROM prediction_log
             WHERE home_team = %s AND away_team = %s
-              AND created_at >= NOW() - INTERVAL '24 hours'
-            LIMIT 1
+              AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
+            ORDER BY created_at DESC LIMIT 1
         """, (home_team, away_team))
         existing = cur.fetchone()
 
         if existing:
             existing_id       = existing["id"]
+            existing_actual   = existing["actual"]
             existing_match_id = existing["match_id"]
-            if match_id is not None and existing_match_id is None:
-                # Upgrade the NULL row with the real match_id
-                cur.execute(
-                    "UPDATE prediction_log SET match_id = %s WHERE id = %s",
-                    (match_id, existing_id)
-                )
-                conn.commit()
-                log.info("Updated match_id=%s for existing log row id=%s (%s vs %s)",
-                         match_id, existing_id, home_team, away_team)
-            else:
-                log.debug("Skipping duplicate log for %s vs %s (existing id=%s)",
-                          home_team, away_team, existing_id)
+
+            if existing_actual is not None:
+                log.debug("Skipping update for %s vs %s (already graded)", home_team, away_team)
+                return
+
+            # Update the existing un-graded prediction with the fresh probabilities
+            cur.execute("""
+                UPDATE prediction_log SET
+                    match_id = COALESCE(%s, match_id),
+                    predicted = %s,
+                    confidence = %s,
+                    confidence_score = %s,
+                    home_win_prob = %s,
+                    draw_prob = %s,
+                    away_win_prob = %s,
+                    btts_yes = %s,
+                    over_2_5 = %s,
+                    home_xg = %s,
+                    away_xg = %s,
+                    match_date = COALESCE(%s, match_date),
+                    league = COALESCE(%s, league)
+                WHERE id = %s
+            """, (
+                match_id,
+                predicted,
+                result.get("confidence"),
+                float(result.get("confidence_score") or 0),
+                float(probs.get("home_win") or 0),
+                float(probs.get("draw") or 0),
+                float(probs.get("away_win") or 0),
+                float(btts_yes) if btts_yes is not None else None,
+                float(over_2_5) if over_2_5 is not None else None,
+                float(home_xg)  if home_xg  is not None else None,
+                float(away_xg)  if away_xg  is not None else None,
+                match_date,
+                league,
+                existing_id
+            ))
+            conn.commit()
+            log.info("Updated future prediction for %s vs %s with fresh data", home_team, away_team)
             return
 
-        # Also guard against exact match_id collision (belt-and-suspenders)
+        # Also guard against exact match_id collision for newly inserted rows
         if match_id is not None:
             cur.execute(
                 "SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1",
