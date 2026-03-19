@@ -6,7 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
 
-from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance, feedback
+from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance, feedback, settings
 
 
 load_dotenv()
@@ -55,6 +55,60 @@ app = FastAPI(
 
 # Apply HTTPS redirect before CORS so redirects carry the right headers
 app.add_middleware(HTTPSRedirectMiddleware)
+
+
+# ─── X-API-Key middleware ─────────────────────────────────────────────────────
+# Protects all mutating endpoints (POST/PUT/PATCH/DELETE) with a shared secret.
+# Set ADMIN_API_KEY in Railway environment variables.
+# GET and OPTIONS (CORS preflight) are always public.
+
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+_PUBLIC_PREFIXES = [
+    "/api/health",
+    "/api/predictions/public",
+    "/api/predictions/upcoming",
+    "/api/predictions/fixtures",
+    "/api/predictions/results",
+    "/api/predictions/accuracy",
+    "/api/performance",
+    "/api/prediction-log/accuracy",
+    "/api/leagues",
+    "/api/teams",
+    "/api/matches",
+    "/api/standings",
+    "/api/fields",
+    "/api/feedback",
+    "/docs",
+    "/openapi.json",
+]
+
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        method = request.method.upper()
+        path   = request.url.path
+        # Always allow safe methods and CORS preflight
+        if method in ("GET", "HEAD", "OPTIONS"):
+            return await call_next(request)
+        # Allow public feedback POST (user-facing form)
+        if method == "POST" and path.startswith("/api/feedback"):
+            return await call_next(request)
+        # Allow public consensus endpoint (called from frontend without auth)
+        if method == "POST" and path.startswith("/api/predictions/consensus"):
+            return await call_next(request)
+        # Reject if key not configured (misconfiguration guard)
+        if not ADMIN_API_KEY:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content={"detail": "ADMIN_API_KEY not configured on server."})
+        key = request.headers.get("X-API-Key", "")
+        if key != ADMIN_API_KEY:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key."})
+        return await call_next(request)
+
+
+app.add_middleware(APIKeyMiddleware)
 
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -112,6 +166,7 @@ app.include_router(prediction_log.router, prefix="/api/prediction-log", tags=["P
 app.include_router(markets.router,        prefix="/api/markets",         tags=["Markets"])
 app.include_router(performance.router,    prefix="/api/performance",      tags=["Performance"])
 app.include_router(feedback.router,        prefix="/api/feedback",         tags=["Feedback"])
+app.include_router(settings.router,        prefix="/api/settings",          tags=["Settings"])
 
 
 if __name__ == "__main__":
