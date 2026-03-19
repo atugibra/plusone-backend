@@ -54,14 +54,9 @@ def get_connection():
     try:
         return _pool.getconn()
     except psycopg2.pool.PoolError:
-        # Pool exhausted — open a one-off connection as an emergency fallback.
-        log.warning("DB pool exhausted — falling back to direct connection.")
-        p = urlparse(DATABASE_URL)
-        return psycopg2.connect(
-            host=p.hostname, port=p.port or 5432,
-            dbname=p.path.lstrip("/"), user=p.username, password=p.password,
-            sslmode="require", connect_timeout=10, cursor_factory=RealDictCursor,
-        )
+        # Pool exhausted — do NOT spawn unmanaged connections (Supabase 25 max).
+        log.error("DB pool exhausted — raising error to prevent cascading limits.")
+        raise
 
 
 def return_connection(conn):

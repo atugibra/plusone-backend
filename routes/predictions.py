@@ -189,78 +189,45 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         # Per-engine outcomes — populated by consensus predictions only.
         # These are the critical values that drive _fetch_engine_weights()
         # so the dynamic consensus blend can learn from past performance.
-        dc_predicted_outcome     = result.get("dc_predicted_outcome")
-        ml_predicted_outcome     = result.get("ml_predicted_outcome")
-        legacy_predicted_outcome = result.get("legacy_predicted_outcome")
+        engine_picks = result.get("_engine_picks", {})
+        dc_predicted_outcome     = result.get("dc_predicted_outcome") or engine_picks.get("dc")
+        ml_predicted_outcome     = result.get("ml_predicted_outcome") or engine_picks.get("ml")
+        legacy_predicted_outcome = result.get("legacy_predicted_outcome") or engine_picks.get("legacy")
 
         conn = get_connection()
         cur  = conn.cursor()
 
         # ── Deduplication / Upsert ───────────────────────────────────────────
-        existing = None
-
-        # 1. Prefer matching exactly by match_id if provided
+        
         if match_id is not None:
             cur.execute("""
-                SELECT id, match_id, actual 
-                FROM prediction_log 
-                WHERE match_id = %s 
-                LIMIT 1
-            """, (match_id,))
-            existing = cur.fetchone()
-
-        # 2. Fallback to team names + league + time window if no exact match_id found.
-        # Adding league prevents stealing rows from different competitions on the same date
-        # (e.g. two different leagues have Barca vs Real fixtures on the same matchday).
-        if not existing:
-            cur.execute("""
-                SELECT id, match_id, actual FROM prediction_log
-                WHERE home_team = %s AND away_team = %s
-                  AND (league = %s OR league IS NULL)
-                  AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
-                ORDER BY created_at DESC LIMIT 1
-            """, (home_team, away_team, league))
-            row = cur.fetchone()
-            
-            # Only use this fallback row if we aren't stealing it from a different known match
-            if row and (row["match_id"] is None or row["match_id"] == match_id):
-                existing = row
-
-        if existing:
-            existing_id       = existing["id"]
-            existing_actual   = existing["actual"]
-            existing_match_id = existing["match_id"]
-
-            if existing_actual is not None:
-                log.debug("Skipping update for %s vs %s (already graded)", home_team, away_team)
-                return
-
-            new_id_to_set = match_id if match_id is not None else existing_match_id
-
-            # Update the existing un-graded prediction with the fresh probabilities.
-            # Use COALESCE for per-engine outcomes so a re-run doesn't blank them
-            # if only one engine failed on the retry.
-            cur.execute("""
-                UPDATE prediction_log SET
-                    match_id = %s,
-                    predicted = %s,
-                    confidence = %s,
-                    confidence_score = %s,
-                    home_win_prob = %s,
-                    draw_prob = %s,
-                    away_win_prob = %s,
-                    btts_yes = %s,
-                    over_2_5 = %s,
-                    home_xg = %s,
-                    away_xg = %s,
-                    match_date = COALESCE(%s, match_date),
-                    league = COALESCE(%s, league),
-                    dc_predicted_outcome     = COALESCE(%s, dc_predicted_outcome),
-                    ml_predicted_outcome     = COALESCE(%s, ml_predicted_outcome),
-                    legacy_predicted_outcome = COALESCE(%s, legacy_predicted_outcome)
-                WHERE id = %s
+                INSERT INTO prediction_log
+                    (match_id, home_team, away_team, league, match_date,
+                     predicted, confidence, confidence_score,
+                     home_win_prob, draw_prob, away_win_prob,
+                     btts_yes, over_2_5, home_xg, away_xg,
+                     dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (match_id) DO UPDATE SET
+                    predicted = EXCLUDED.predicted,
+                    confidence = EXCLUDED.confidence,
+                    confidence_score = EXCLUDED.confidence_score,
+                    home_win_prob = EXCLUDED.home_win_prob,
+                    draw_prob = EXCLUDED.draw_prob,
+                    away_win_prob = EXCLUDED.away_win_prob,
+                    btts_yes = EXCLUDED.btts_yes,
+                    over_2_5 = EXCLUDED.over_2_5,
+                    home_xg = EXCLUDED.home_xg,
+                    away_xg = EXCLUDED.away_xg,
+                    match_date = COALESCE(EXCLUDED.match_date, prediction_log.match_date),
+                    league = COALESCE(EXCLUDED.league, prediction_log.league),
+                    dc_predicted_outcome = COALESCE(EXCLUDED.dc_predicted_outcome, prediction_log.dc_predicted_outcome),
+                    ml_predicted_outcome = COALESCE(EXCLUDED.ml_predicted_outcome, prediction_log.ml_predicted_outcome),
+                    legacy_predicted_outcome = COALESCE(EXCLUDED.legacy_predicted_outcome, prediction_log.legacy_predicted_outcome)
+                WHERE prediction_log.actual IS NULL
             """, (
-                new_id_to_set,
+                match_id,
+                home_team, away_team, league, match_date,
                 predicted,
                 result.get("confidence"),
                 float(result.get("confidence_score") or 0),
@@ -271,38 +238,24 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 float(over_2_5) if over_2_5 is not None else None,
                 float(home_xg)  if home_xg  is not None else None,
                 float(away_xg)  if away_xg  is not None else None,
-                match_date,
-                league,
                 dc_predicted_outcome,
                 ml_predicted_outcome,
-                legacy_predicted_outcome,
-                existing_id
+                legacy_predicted_outcome
             ))
             conn.commit()
-            log.info("Updated future prediction for %s vs %s with fresh data", home_team, away_team)
+            log.info("Upserted future prediction for %s vs %s with fresh data", home_team, away_team)
             return
 
-        # Also guard against exact match_id collision for newly inserted rows
-        if match_id is not None:
-            cur.execute(
-                "SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1",
-                (match_id,)
-            )
-            if cur.fetchone():
-                log.debug("Skipping duplicate log for match_id=%s", match_id)
-                return
-        # ────────────────────────────────────────────────────────────────────
-
+        # Fallback for manual legacy queries without match_id
         cur.execute("""
             INSERT INTO prediction_log
-                (match_id, home_team, away_team, league, match_date,
+                (home_team, away_team, league, match_date,
                  predicted, confidence, confidence_score,
                  home_win_prob, draw_prob, away_win_prob,
                  btts_yes, over_2_5, home_xg, away_xg,
                  dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            match_id,
             home_team, away_team, league, match_date,
             predicted,
             result.get("confidence"),
@@ -316,7 +269,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
             float(away_xg)  if away_xg  is not None else None,
             dc_predicted_outcome,
             ml_predicted_outcome,
-            legacy_predicted_outcome,
+            legacy_predicted_outcome
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
@@ -483,7 +436,8 @@ def list_prediction_results(
         query = """
             SELECT m.id, m.match_date, m.gameweek, m.score_raw,
                    m.home_score, m.away_score,
-                   ht.name AS home_team, at.name AS away_team,
+                   ht.name AS home_team, ht.logo_url AS home_logo, 
+                   at.name AS away_team, at.logo_url AS away_logo,
                    l.name  AS league,    l.id    AS league_id,
                    s.name  AS season,    s.id    AS season_id
             FROM matches m

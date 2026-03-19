@@ -416,7 +416,6 @@ class DCPredictor:
                       ) * INTERVAL '1 month'
                   )
             ORDER BY m.match_date DESC
-            LIMIT 1500
         """)
         rows = cur.fetchall()
         if not rows:
