@@ -409,13 +409,9 @@ class DCPredictor:
             JOIN teams at ON at.id = m.away_team_id
             WHERE m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
-              AND m.match_date >= CURRENT_DATE - (
-                      SELECT COALESCE(
-                          (SELECT value::int FROM app_settings WHERE key = 'dc_training_months'),
-                          3
-                      ) * INTERVAL '1 month'
-                  )
+              AND m.match_date >= CURRENT_DATE - INTERVAL '3 months'
             ORDER BY m.match_date DESC
+            LIMIT 1500
         """)
         rows = cur.fetchall()
         if not rows:

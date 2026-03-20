@@ -31,7 +31,6 @@ router = APIRouter()
 
 _training_state: dict = {}
 _public_cache: dict = {"data": None, "expires_at": 0.0}
-_cache_lock = threading.Lock()  # guards _public_cache writes against concurrent requests
 
 
 # ─── Request models ───────────────────────────────────────────────────────────
@@ -183,12 +182,6 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
         home_xg  = xg_src.get("home_xg")
         away_xg  = xg_src.get("away_xg")
 
-        # Per-engine outcomes — populated by consensus predictions only.
-        # These drive _fetch_engine_weights() so dynamic blend can learn.
-        dc_predicted_outcome     = result.get("dc_predicted_outcome")
-        ml_predicted_outcome     = result.get("ml_predicted_outcome")
-        legacy_predicted_outcome = result.get("legacy_predicted_outcome")
-
         conn = get_connection()
         cur  = conn.cursor()
 
@@ -205,16 +198,15 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
             """, (match_id,))
             existing = cur.fetchone()
 
-        # 2. Fallback: team names + league + time window — adding league prevents
-        #    cross-competition row stealing when same fixture name appears in 2 leagues.
+        # 2. Fallback to team names + time window if no exact match_id found
         if not existing:
+            # This covers matches scheduled several days in advance.
             cur.execute("""
                 SELECT id, match_id, actual FROM prediction_log
                 WHERE home_team = %s AND away_team = %s
-                  AND (league = %s OR league IS NULL)
                   AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
                 ORDER BY created_at DESC LIMIT 1
-            """, (home_team, away_team, league))
+            """, (home_team, away_team))
             row = cur.fetchone()
             
             # Only use this fallback row if we aren't stealing it from a different known match
@@ -232,8 +224,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
 
             new_id_to_set = match_id if match_id is not None else existing_match_id
 
-            # Update the existing un-graded prediction with fresh probabilities.
-            # COALESCE for per-engine outcomes: avoid blanking on retry.
+            # Update the existing un-graded prediction with the fresh probabilities
             cur.execute("""
                 UPDATE prediction_log SET
                     match_id = %s,
@@ -248,10 +239,7 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                     home_xg = %s,
                     away_xg = %s,
                     match_date = COALESCE(%s, match_date),
-                    league = COALESCE(%s, league),
-                    dc_predicted_outcome     = COALESCE(%s, dc_predicted_outcome),
-                    ml_predicted_outcome     = COALESCE(%s, ml_predicted_outcome),
-                    legacy_predicted_outcome = COALESCE(%s, legacy_predicted_outcome)
+                    league = COALESCE(%s, league)
                 WHERE id = %s
             """, (
                 new_id_to_set,
@@ -267,9 +255,6 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 float(away_xg)  if away_xg  is not None else None,
                 match_date,
                 league,
-                dc_predicted_outcome,
-                ml_predicted_outcome,
-                legacy_predicted_outcome,
                 existing_id
             ))
             conn.commit()
@@ -292,9 +277,8 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
                 (match_id, home_team, away_team, league, match_date,
                  predicted, confidence, confidence_score,
                  home_win_prob, draw_prob, away_win_prob,
-                 btts_yes, over_2_5, home_xg, away_xg,
-                 dc_predicted_outcome, ml_predicted_outcome, legacy_predicted_outcome)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 btts_yes, over_2_5, home_xg, away_xg)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             match_id,
             home_team, away_team, league, match_date,
@@ -308,9 +292,6 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
             float(over_2_5) if over_2_5 is not None else None,
             float(home_xg)  if home_xg  is not None else None,
             float(away_xg)  if away_xg  is not None else None,
-            dc_predicted_outcome,
-            ml_predicted_outcome,
-            legacy_predicted_outcome,
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
@@ -409,9 +390,7 @@ def public_predictions(
     try:
         raw = predict_upcoming_fast(league_id=None, limit=100)
         enriched = _derive_best_bets(raw)
-        with _cache_lock:
-            _public_cache["data"]       = enriched
-            _public_cache["expires_at"] = now + 900
+        _public_cache = {"data": enriched, "expires_at": now + 900}
         if league_id:
             enriched = [p for p in enriched if (p.get("match") or {}).get("league_id") == league_id]
         return {
@@ -794,21 +773,6 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
             1 - sum(math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k)
                     for k in range(3)), 4)))
 
-        # ── 8b. Look up match_date for proper deduplication & evaluation ────────
-        # The frontend sends match_id from the fixtures list; use it to fetch the
-        # exact scheduled date so prediction_log.match_date is never NULL.
-        match_date = None
-        if req.match_id:
-            try:
-                _md_cur = conn.cursor()
-                _md_cur.execute("SELECT match_date FROM matches WHERE id = %s", (req.match_id,))
-                _md_row = _md_cur.fetchone()
-                if _md_row:
-                    match_date = str(_md_row["match_date"])
-                _md_cur.close()
-            except Exception:
-                pass
-
         result = {
             "match": {
                 "home_team":    home_name,
@@ -817,7 +781,6 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
                 "away_team_id": req.away_team_id,
                 "league":       league_name,
                 "season":       season_name,
-                "match_date":   match_date,
             },
             "consensus": {
                 "home_win":          blended["home_win"],

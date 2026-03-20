@@ -57,34 +57,6 @@ app = FastAPI(
 app.add_middleware(HTTPSRedirectMiddleware)
 
 
-# ─── X-API-Key middleware ─────────────────────────────────────────────────────
-# Set ADMIN_API_KEY in Railway environment variables.
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-
-
-class APIKeyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        method = request.method.upper()
-        path   = request.url.path
-        if method in ("GET", "HEAD", "OPTIONS"):
-            return await call_next(request)
-        if method == "POST" and path.startswith("/api/feedback"):
-            return await call_next(request)
-        if method == "POST" and path.startswith("/api/predictions/consensus"):
-            return await call_next(request)
-        if not ADMIN_API_KEY:
-            from fastapi.responses import JSONResponse
-            return JSONResponse(status_code=503, content={"detail": "ADMIN_API_KEY not configured on server."})
-        key = request.headers.get("X-API-Key", "")
-        if key != ADMIN_API_KEY:
-            from fastapi.responses import JSONResponse
-            return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key."})
-        return await call_next(request)
-
-
-app.add_middleware(APIKeyMiddleware)
-
-
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 # IMPORTANT: FastAPI's CORSMiddleware does NOT support glob/wildcard patterns
 # like "https://*.vercel.app" in allow_origins — it does exact string matching.
