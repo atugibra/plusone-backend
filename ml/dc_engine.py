@@ -38,15 +38,20 @@ log = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 CFG = {
-    "dc_time_decay_xi":   0.0018,
-    "dc_max_goals":       10,
-    "elo_k_base":         40,
-    "elo_home_advantage": 60,
-    "elo_start":          1500,
-    "elo_mov_factor":     0.25,
-    "mc_simulations":     50_000,
-    "ensemble_weights":   [0.45, 0.30, 0.25],
-    "min_kelly_edge":     0.03,
+    "dc_time_decay_xi":     0.0018,
+    "dc_max_goals":         10,
+    "elo_k_base":           40,
+    "elo_home_advantage":   60,
+    "elo_start":            1500,
+    "elo_mov_factor":       0.25,
+    "mc_simulations":       50_000,
+    "ensemble_weights":     [0.45, 0.30, 0.25],
+    "min_kelly_edge":       0.03,
+    # How many months of match history to use for DC training.
+    # 9 months ≈ 1 full football season.  Override via app_settings key
+    # 'dc_lookback_months' (integer, 1–120).  Increasing this gives more
+    # data but may dilute the time-decay weighting.
+    "dc_lookback_months":   9,
 }
 
 HOME_ADVANTAGE = 1.22
@@ -56,6 +61,27 @@ LEAGUE_AVG_GOALS = 1.35
 
 _dc_predictor = None
 _dc_meta: dict = {}
+
+
+def _get_lookback_months() -> int:
+    """
+    Read dc_lookback_months from app_settings (allows live changes without
+    restarting the server). Falls back to CFG default (9 months).
+    """
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT value FROM app_settings WHERE key = 'dc_lookback_months' LIMIT 1"
+        )
+        row = cur.fetchone()
+        conn.close()
+        if row and row["value"]:
+            val = int(row["value"])
+            return max(1, min(val, 120))   # clamp to 1–120 months
+    except Exception:
+        pass
+    return CFG["dc_lookback_months"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,8 +416,11 @@ class DCPredictor:
 
     # ── Load fixtures from DB ─────────────────────────────────────────────────
     @staticmethod
-    def _load_fixtures(cur) -> pd.DataFrame:
-        """Load last 2 years of completed matches with team names."""
+    def _load_fixtures(cur, months: int = None) -> pd.DataFrame:
+        """Load completed matches within the configured lookback window."""
+        if months is None:
+            months = _get_lookback_months()
+        log.info("DCPredictor: loading fixtures with %d-month lookback", months)
         cur.execute("""
             SELECT
                 m.id,
@@ -409,10 +438,10 @@ class DCPredictor:
             JOIN teams at ON at.id = m.away_team_id
             WHERE m.home_score IS NOT NULL
               AND m.away_score IS NOT NULL
-              AND m.match_date >= CURRENT_DATE - INTERVAL '3 months'
+              AND m.match_date >= CURRENT_DATE - (%(months)s || ' months')::INTERVAL
             ORDER BY m.match_date DESC
-            LIMIT 1500
-        """)
+            LIMIT 5000
+        """, {"months": months})
         rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
@@ -424,9 +453,10 @@ class DCPredictor:
         return df
 
     # ── Fit all models ────────────────────────────────────────────────────────
-    def fit(self, cur):
+    def fit(self, cur, months: int = None):
+        months   = months or _get_lookback_months()
         log.info("DCPredictor: loading fixtures from DB…")
-        fixtures = self._load_fixtures(cur)
+        fixtures = self._load_fixtures(cur, months=months)
         if fixtures.empty or len(fixtures) < 20:
             log.warning("DCPredictor: not enough fixtures (%d). Skipping.", len(fixtures))
             return self

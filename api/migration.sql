@@ -80,3 +80,12 @@ ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS over_2_5                 FLO
 ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS btts_correct             BOOLEAN;
 ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS over_2_5_correct         BOOLEAN;
 
+
+-- ─── 6. app_settings — seed DC lookback window ───────────────────────────────
+-- Change the value here or via PUT /api/settings/dc_lookback_months to tune
+-- how many months of history the DC engine uses.  Default = 9 (≈ 1 season).
+INSERT INTO app_settings (key, value, description)
+VALUES ('dc_lookback_months', '9', 'Number of months of match history used to train the Dixon-Coles DC engine. Default 9 ≈ 1 full season.')
+ON CONFLICT (key) DO NOTHING;
+
+
