@@ -19,7 +19,8 @@ Endpoints:
 import time
 import logging
 import threading
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
@@ -30,7 +31,33 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 _training_state: dict = {}
-_public_cache: dict = {"data": None, "expires_at": 0.0}
+_public_cache:   dict = {"data": None, "expires_at": 0.0}
+
+# ── Rate limiter (sliding window, in-memory, no extra deps) ───────────────────
+_RATE_WINDOW = 60        # seconds
+_RATE_MAX    = 60        # requests per window per IP
+_rate_store: dict = {}   # ip → [timestamp, ...]
+
+
+def _check_rate_limit(ip: str) -> None:
+    """Raise HTTP 429 if `ip` has exceeded the rate limit."""
+    now    = time.time()
+    cutoff = now - _RATE_WINDOW
+    hits   = _rate_store.get(ip, [])
+    hits   = [t for t in hits if t > cutoff]
+    if len(hits) >= _RATE_MAX:
+        retry_after = int(_RATE_WINDOW - (now - hits[0]))
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    hits.append(now)
+    _rate_store[ip] = hits
+    if len(_rate_store) > 500:
+        stale = [k for k, v in _rate_store.items() if not any(t > cutoff for t in v)]
+        for k in stale:
+            _rate_store.pop(k, None)
 
 
 # ─── Request models ───────────────────────────────────────────────────────────

@@ -19,7 +19,8 @@ Endpoints:
 import time
 import logging
 import threading
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
@@ -30,7 +31,38 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 _training_state: dict = {}
-_public_cache: dict = {"data": None, "expires_at": 0.0}
+_public_cache:   dict = {"data": None, "expires_at": 0.0}
+
+# ─── Rate limiter (sliding window, in-memory, no extra deps) ──────────────────
+# Allows MAX_REQUESTS calls per IP within WINDOW_SECONDS before returning 429.
+# The store is cleaned up lazily to avoid unbounded memory growth.
+
+_RATE_WINDOW  = 60       # seconds
+_RATE_MAX     = 60       # requests per window per IP
+_rate_store:  dict = {}  # ip → [timestamp, ...]
+
+
+def _check_rate_limit(ip: str) -> None:
+    """Raise HTTP 429 if `ip` has exceeded the rate limit."""
+    now    = time.time()
+    cutoff = now - _RATE_WINDOW
+    hits   = _rate_store.get(ip, [])
+    # Purge old entries
+    hits   = [t for t in hits if t > cutoff]
+    if len(hits) >= _RATE_MAX:
+        retry_after = int(_RATE_WINDOW - (now - hits[0]))
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+    hits.append(now)
+    _rate_store[ip] = hits
+    # Lazy cleanup: evict stale IPs roughly every 500 calls
+    if len(_rate_store) > 500:
+        stale = [k for k, v in _rate_store.items() if not any(t > cutoff for t in v)]
+        for k in stale:
+            _rate_store.pop(k, None)
 
 
 # ─── Request models ───────────────────────────────────────────────────────────
@@ -389,9 +421,14 @@ def _derive_best_bets(predictions: list) -> list:
 
 @router.get("/public")
 def public_predictions(
+    request:   Request,
     league_id: Optional[int] = Query(None),
     limit:     int           = Query(30),
 ):
+    # Per-IP rate limit: 60 requests per 60-second window
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
     global _public_cache
     now = time.time()
     if _public_cache["data"] is not None and now < _public_cache["expires_at"]:
@@ -411,6 +448,8 @@ def public_predictions(
             "cached":       False,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
