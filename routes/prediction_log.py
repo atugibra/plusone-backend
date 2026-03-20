@@ -139,7 +139,9 @@ def do_evaluate_predictions(conn) -> int:
     """
     cur = conn.cursor()
     try:
-        # 1. Backfill missing match_ids by matching team names and proximity dates
+        # 1. Backfill missing match_ids by matching team names (case-insensitive)
+        #    and a ±7 day window so minor name differences or missing match_date
+        #    don't leave rows permanently un-linked.
         cur.execute("""
             UPDATE prediction_log pl
             SET match_id = m.id
@@ -147,10 +149,36 @@ def do_evaluate_predictions(conn) -> int:
             JOIN teams ht ON ht.id = m.home_team_id
             JOIN teams at ON at.id = m.away_team_id
             WHERE pl.match_id IS NULL
-              AND pl.home_team = ht.name
-              AND pl.away_team = at.name
-              AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '3 days')
-              AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '3 days')
+              AND LOWER(pl.home_team) = LOWER(ht.name)
+              AND LOWER(pl.away_team) = LOWER(at.name)
+              AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
+              AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+        """)
+
+        # 1b. Fallback: ILIKE fuzzy match for rows still without a match_id
+        #     (handles "Manchester City" vs "Manchester City FC" etc.)
+        cur.execute("""
+            UPDATE prediction_log pl
+            SET match_id = (
+                SELECT m.id FROM matches m
+                JOIN teams ht ON ht.id = m.home_team_id
+                JOIN teams at ON at.id = m.away_team_id
+                WHERE ht.name ILIKE '%' || pl.home_team || '%'
+                  AND at.name ILIKE '%' || pl.away_team || '%'
+                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
+                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+                LIMIT 1
+            )
+            WHERE pl.match_id IS NULL
+              AND EXISTS (
+                SELECT 1 FROM matches m
+                JOIN teams ht ON ht.id = m.home_team_id
+                JOIN teams at ON at.id = m.away_team_id
+                WHERE ht.name ILIKE '%' || pl.home_team || '%'
+                  AND at.name ILIKE '%' || pl.away_team || '%'
+                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
+                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+              )
         """)
 
         # 2. Grade all un-evaluated rows

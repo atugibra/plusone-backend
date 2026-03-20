@@ -128,17 +128,29 @@ def recalibrate():
 
 # ─── Auto-log helper ──────────────────────────────────────────────────────────
 
-def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
+def _log_prediction_to_db(
+    result: dict,
+    match_id: Optional[int] = None,
+    dc_outcome: Optional[str] = None,
+    ml_outcome: Optional[str] = None,
+    legacy_outcome: Optional[str] = None,
+    predicted_score: Optional[str] = None,
+):
+    """
+    Persist one prediction to prediction_log with full deduplication/upsert logic.
+    Extra per-engine outcomes are written so the feedback calibration loop has
+    per-engine accuracy data to work with.
+    """
     conn = None
     try:
         match_info = result.get("match", {})
         probs      = result.get("probabilities", {})
 
-        home_team    = match_info.get("home_team") or result.get("home_team")
-        away_team    = match_info.get("away_team") or result.get("away_team")
+        home_team    = match_info.get("home_team")    or result.get("home_team")
+        away_team    = match_info.get("away_team")    or result.get("away_team")
         home_team_id = match_info.get("home_team_id") or result.get("home_team_id")
         away_team_id = match_info.get("away_team_id") or result.get("away_team_id")
-        league       = match_info.get("league")    or result.get("league")
+        league       = match_info.get("league")       or result.get("league")
 
         # If names are missing but we have IDs, look them up from DB
         if (not home_team or not away_team or not league) and (home_team_id or away_team_id):
@@ -166,10 +178,11 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
 
         predicted = result.get("predicted_outcome")
 
+        # match_date: try all known keys
         match_date = (
             result.get("match_date")
-            or match_info.get("date")
             or match_info.get("match_date")
+            or match_info.get("date")
         )
 
         if not predicted or not home_team or not away_team:
@@ -193,12 +206,10 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
 
         # 1. Prefer matching exactly by match_id if provided
         if match_id is not None:
-            cur.execute("""
-                SELECT id, match_id, actual 
-                FROM prediction_log 
-                WHERE match_id = %s 
-                LIMIT 1
-            """, (match_id,))
+            cur.execute(
+                "SELECT id, match_id, actual FROM prediction_log WHERE match_id = %s LIMIT 1",
+                (match_id,)
+            )
             existing = cur.fetchone()
 
         # 2. Fallback to team names + time window if no exact match_id found
@@ -206,94 +217,94 @@ def _log_prediction_to_db(result: dict, match_id: Optional[int] = None):
             cur.execute("""
                 SELECT id, match_id, actual FROM prediction_log
                 WHERE home_team = %s AND away_team = %s
-                  AND (match_date >= CURRENT_DATE - INTERVAL '1 day' OR created_at >= NOW() - INTERVAL '7 days')
+                  AND (match_date >= CURRENT_DATE - INTERVAL '1 day'
+                       OR created_at >= NOW() - INTERVAL '7 days')
                 ORDER BY created_at DESC LIMIT 1
             """, (home_team, away_team))
             row = cur.fetchone()
-            
             # Only use this fallback row if we aren't stealing it from a different known match
             if row and (row["match_id"] is None or row["match_id"] == match_id):
                 existing = row
 
         if existing:
-            existing_id       = existing["id"]
-            existing_actual   = existing["actual"]
-            existing_match_id = existing["match_id"]
-
-            if existing_actual is not None:
+            if existing["actual"] is not None:
                 log.debug("Skipping update for %s vs %s (already graded)", home_team, away_team)
                 return
 
-            new_id_to_set = match_id if match_id is not None else existing_match_id
-
-            # Update the existing un-graded prediction with the fresh probabilities
+            new_id_to_set = match_id if match_id is not None else existing["match_id"]
             cur.execute("""
                 UPDATE prediction_log SET
-                    match_id = %s,
-                    predicted = %s,
-                    confidence = %s,
-                    confidence_score = %s,
-                    home_win_prob = %s,
-                    draw_prob = %s,
-                    away_win_prob = %s,
-                    btts_yes = %s,
-                    over_2_5 = %s,
-                    home_xg = %s,
-                    away_xg = %s,
-                    match_date = COALESCE(%s, match_date),
-                    league = COALESCE(%s, league)
+                    match_id                  = %s,
+                    predicted                 = %s,
+                    confidence                = %s,
+                    confidence_score          = %s,
+                    home_win_prob             = %s,
+                    draw_prob                 = %s,
+                    away_win_prob             = %s,
+                    btts_yes                  = %s,
+                    over_2_5                  = %s,
+                    home_xg                   = %s,
+                    away_xg                   = %s,
+                    match_date                = COALESCE(%s, match_date),
+                    league                    = COALESCE(%s, league),
+                    dc_predicted_outcome      = COALESCE(%s, dc_predicted_outcome),
+                    ml_predicted_outcome      = COALESCE(%s, ml_predicted_outcome),
+                    legacy_predicted_outcome  = COALESCE(%s, legacy_predicted_outcome),
+                    predicted_score           = COALESCE(%s, predicted_score)
                 WHERE id = %s
             """, (
-                new_id_to_set,
-                predicted,
+                new_id_to_set, predicted,
                 result.get("confidence"),
                 float(result.get("confidence_score") or 0),
                 float(probs.get("home_win") or 0),
-                float(probs.get("draw") or 0),
+                float(probs.get("draw")     or 0),
                 float(probs.get("away_win") or 0),
                 float(btts_yes) if btts_yes is not None else None,
                 float(over_2_5) if over_2_5 is not None else None,
                 float(home_xg)  if home_xg  is not None else None,
                 float(away_xg)  if away_xg  is not None else None,
-                match_date,
-                league,
-                existing_id
+                match_date, league,
+                dc_outcome, ml_outcome, legacy_outcome, predicted_score,
+                existing["id"],
             ))
             conn.commit()
-            log.info("Updated future prediction for %s vs %s with fresh data", home_team, away_team)
+            log.info("Updated prediction for %s vs %s", home_team, away_team)
             return
 
-        # Also guard against exact match_id collision for newly inserted rows
+        # Guard against exact match_id collision for newly inserted rows
         if match_id is not None:
-            cur.execute(
-                "SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1",
-                (match_id,)
-            )
+            cur.execute("SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1", (match_id,))
             if cur.fetchone():
                 log.debug("Skipping duplicate log for match_id=%s", match_id)
                 return
-        # ────────────────────────────────────────────────────────────────────
 
         cur.execute("""
             INSERT INTO prediction_log
                 (match_id, home_team, away_team, league, match_date,
                  predicted, confidence, confidence_score,
                  home_win_prob, draw_prob, away_win_prob,
-                 btts_yes, over_2_5, home_xg, away_xg)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 btts_yes, over_2_5, home_xg, away_xg,
+                 dc_predicted_outcome, ml_predicted_outcome,
+                 legacy_predicted_outcome, predicted_score)
+            VALUES
+                (%s, %s, %s, %s, %s,
+                 %s, %s, %s,
+                 %s, %s, %s,
+                 %s, %s, %s, %s,
+                 %s, %s,
+                 %s, %s)
         """, (
-            match_id,
-            home_team, away_team, league, match_date,
-            predicted,
-            result.get("confidence"),
+            match_id, home_team, away_team, league, match_date,
+            predicted, result.get("confidence"),
             float(result.get("confidence_score") or 0),
             float(probs.get("home_win") or 0),
-            float(probs.get("draw") or 0),
+            float(probs.get("draw")     or 0),
             float(probs.get("away_win") or 0),
             float(btts_yes) if btts_yes is not None else None,
             float(over_2_5) if over_2_5 is not None else None,
             float(home_xg)  if home_xg  is not None else None,
             float(away_xg)  if away_xg  is not None else None,
+            dc_outcome, ml_outcome, legacy_outcome, predicted_score,
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
@@ -825,6 +836,18 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
         }
 
         # ── 9. Log directly (synchronous) ──────────────────────────────────────
+        # Fetch match_date from DB so it's stored even when caller didn't supply it.
+        _match_date = None
+        if req.match_id:
+            try:
+                _cur_date = conn.cursor()
+                _cur_date.execute("SELECT match_date FROM matches WHERE id = %s", (req.match_id,))
+                _dr = _cur_date.fetchone()
+                if _dr and _dr["match_date"]:
+                    _match_date = str(_dr["match_date"])
+            except Exception:
+                pass
+
         consensus = result["consensus"]
         _log_prediction_to_db(
             {
@@ -836,10 +859,14 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
                 "predicted_outcome": consensus["predicted_outcome"],
                 "confidence":        consensus["confidence"],
                 "confidence_score":  consensus["confidence_score"],
-                "match":             result["match"],
+                "match":             {**result["match"], "match_date": _match_date},
                 "markets":           result["markets"],
             },
-            req.match_id,   # now stores the fixture ID so evaluation can grade it
+            match_id=req.match_id,
+            dc_outcome=dc_outcome,
+            ml_outcome=ml_outcome,
+            legacy_outcome=legacy_outcome,
+            predicted_score=f"{round(home_xg)}-{round(away_xg)}",
         )
 
         return result
@@ -853,7 +880,219 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
         except: pass
 
 
-# ─── Legacy Rule-based Route ──────────────────────────────────────────────────
+# ─── Auto-consensus background job ────────────────────────────────────────────
+
+_AUTO_CONSENSUS_INTERVAL_HOURS = 6
+_auto_consensus_state: dict = {
+    "last_run":       None,
+    "last_count":     0,
+    "last_error":     None,
+    "interval_hours": _AUTO_CONSENSUS_INTERVAL_HOURS,
+}
+
+
+def _get_consensus_interval_hours() -> int:
+    """Read consensus_interval_hours from app_settings, fallback to default."""
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("SELECT value FROM app_settings WHERE key = 'consensus_interval_hours' LIMIT 1")
+        row = cur.fetchone()
+        conn.close()
+        if row and row["value"]:
+            return max(1, min(int(row["value"]), 168))
+    except Exception:
+        pass
+    return _AUTO_CONSENSUS_INTERVAL_HOURS
+
+
+def _run_consensus_for_fixture(fx: dict, conn) -> bool:
+    import math
+    home_team_id = fx["home_team_id"]
+    away_team_id = fx["away_team_id"]
+    league_id    = fx["league_id"]
+    season_id    = fx["season_id"]
+    fixture_id   = fx["id"]
+    home_name    = fx.get("home_name", f"Team {home_team_id}")
+    away_name    = fx.get("away_name", f"Team {away_team_id}")
+    league_name  = fx.get("league_name", "")
+    season_name  = fx.get("season_name", "")
+
+    weights = _fetch_engine_weights(conn)
+
+    # DC
+    try:
+        from ml.dc_engine import predict_dc_match
+        dc_raw      = predict_dc_match(home_team_id, away_team_id)
+        if "error" in dc_raw: raise RuntimeError(dc_raw["error"])
+        bk          = dc_raw.get("calibrated") or dc_raw.get("blended") or {}
+        dc_probs    = {"home_win": float(bk.get("home_win", 0.35)), "draw": float(bk.get("draw", 0.30)), "away_win": float(bk.get("away_win", 0.35))}
+        s           = sum(dc_probs.values()) or 1
+        dc_probs    = {k: round(v / s, 4) for k, v in dc_probs.items()}
+        dc_outcome  = _OUTCOME_LABELS[[dc_probs["home_win"], dc_probs["draw"], dc_probs["away_win"]].index(max(dc_probs.values()))]
+    except Exception as exc:
+        dc_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}; dc_outcome = "Home Win"; weights["dc"] = 0.0
+        log.debug("Auto-consensus: DC error for %s vs %s: %s", home_name, away_name, exc)
+
+    # ML
+    expected_goals = {}
+    try:
+        import ml.prediction_engine as ml_engine
+        ml_raw     = ml_engine.predict_match(home_team_id, away_team_id, league_id, season_id)
+        if "error" in ml_raw: raise RuntimeError(ml_raw["error"])
+        mpi        = ml_raw.get("probabilities", {})
+        ml_probs   = {"home_win": float(mpi.get("home_win", 0.35)), "draw": float(mpi.get("draw", 0.30)), "away_win": float(mpi.get("away_win", 0.35))}
+        s          = sum(ml_probs.values()) or 1
+        ml_probs   = {k: round(v / s, 4) for k, v in ml_probs.items()}
+        ml_outcome = ml_raw.get("predicted_outcome", "Home Win")
+        mi         = ml_raw.get("match", {})
+        home_name  = mi.get("home_team", home_name); away_name = mi.get("away_team", away_name)
+        league_name = mi.get("league", league_name); season_name = mi.get("season", season_name)
+        expected_goals = ml_raw.get("expected_goals", {})
+    except Exception as exc:
+        ml_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}; ml_outcome = "Home Win"; weights["ml"] = 0.0
+        log.debug("Auto-consensus: ML error for %s vs %s: %s", home_name, away_name, exc)
+
+    # Legacy
+    try:
+        legacy_raw    = _run_legacy_inline(conn, home_team_id, away_team_id)
+        legacy_probs  = {k: v for k, v in legacy_raw.items() if k in ("home_win", "draw", "away_win")}
+        legacy_outcome = legacy_raw.get("predicted_outcome", "Home Win")
+    except Exception as exc:
+        legacy_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}; legacy_outcome = "Home Win"; weights["legacy"] = 0.0
+        log.debug("Auto-consensus: Legacy error for %s vs %s: %s", home_name, away_name, exc)
+
+    w_sum   = sum(weights.values())
+    weights = dict(_DEFAULT_WEIGHTS) if w_sum < 0.01 else {k: round(v / w_sum, 4) for k, v in weights.items()}
+    blended = _blend_probs(dc_probs, ml_probs, legacy_probs, weights)
+    prob_list = [blended["home_win"], blended["draw"], blended["away_win"]]
+    consensus_outcome = _OUTCOME_LABELS[prob_list.index(max(prob_list))]
+    confidence_score, confidence_label = _entropy_confidence(blended)
+
+    home_xg  = float(expected_goals.get("home_xg", 1.35))
+    away_xg  = float(expected_goals.get("away_xg", 1.10))
+    btts_yes = max(0.0, min(1.0, round(
+        1 - math.exp(-home_xg) - math.exp(-away_xg) + math.exp(-(home_xg + away_xg)), 4)))
+    over_2_5 = max(0.0, min(1.0, round(
+        1 - sum(math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k)
+                for k in range(3)), 4)))
+
+    _log_prediction_to_db(
+        {
+            "probabilities":     {"home_win": blended["home_win"], "draw": blended["draw"], "away_win": blended["away_win"]},
+            "predicted_outcome": consensus_outcome,
+            "confidence":        confidence_label,
+            "confidence_score":  confidence_score,
+            "match": {
+                "home_team":    home_name,
+                "away_team":    away_name,
+                "home_team_id": home_team_id,
+                "away_team_id": away_team_id,
+                "league":       league_name,
+                "season":       season_name,
+                "match_date":   str(fx.get("match_date")) if fx.get("match_date") else None,
+            },
+            "markets": {
+                "btts_yes": btts_yes,
+                "over_2_5": over_2_5,
+                "home_xg":  round(home_xg, 2),
+                "away_xg":  round(away_xg, 2),
+            },
+        },
+        match_id=fixture_id,
+        dc_outcome=dc_outcome,
+        ml_outcome=ml_outcome,
+        legacy_outcome=legacy_outcome,
+        predicted_score=f"{round(home_xg)}-{round(away_xg)}",
+    )
+    return True
+
+
+def auto_consensus_job():
+    """
+    Fetch all upcoming fixtures (next 7 days, unplayed) and run the
+    Dynamic Consensus Engine on each. Results are automatically written
+    to prediction_log (with dedup — existing rows are updated, not duplicated).
+    Safe to call from a background thread.
+    """
+    global _auto_consensus_state
+    _auto_consensus_state["last_error"] = None
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT m.id, m.home_team_id, m.away_team_id,
+                   m.league_id, m.season_id, m.match_date,
+                   ht.name AS home_name, at.name AS away_name,
+                   l.name  AS league_name, s.name AS season_name
+            FROM   matches m
+            JOIN   teams   ht ON ht.id = m.home_team_id
+            JOIN   teams   at ON at.id = m.away_team_id
+            JOIN   leagues l  ON l.id  = m.league_id
+            JOIN   seasons s  ON s.id  = m.season_id
+            WHERE  m.home_score IS NULL
+              AND  m.match_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+            ORDER  BY m.match_date ASC
+        """)
+        fixtures = [dict(r) for r in cur.fetchall()]
+        log.info("Auto-consensus job: found %d upcoming fixtures", len(fixtures))
+
+        count = 0
+        for fx in fixtures:
+            try:
+                _run_consensus_for_fixture(fx, conn)
+                count += 1
+            except Exception as exc:
+                log.warning("Auto-consensus: skipped fixture id=%s (%s vs %s): %s",
+                            fx.get("id"), fx.get("home_name"), fx.get("away_name"), exc)
+
+        conn.close()
+        import datetime
+        _auto_consensus_state["last_run"]   = datetime.datetime.utcnow().isoformat() + "Z"
+        _auto_consensus_state["last_count"] = count
+        log.info("Auto-consensus job: logged/updated %d predictions", count)
+    except Exception as exc:
+        log.error("Auto-consensus job failed: %s", exc, exc_info=True)
+        _auto_consensus_state["last_error"] = str(exc)
+
+
+def _schedule_auto_consensus(interval_hours: int = None):
+    def _run_and_reschedule():
+        try: auto_consensus_job()
+        finally: _schedule_auto_consensus()
+    effective_hours = interval_hours or _get_consensus_interval_hours()
+    _auto_consensus_state["interval_hours"] = effective_hours
+    t = threading.Timer(effective_hours * 3600, _run_and_reschedule)
+    t.daemon = True; t.name = "auto-consensus-scheduler"
+    t.start()
+    log.info("Auto-consensus next run in %dh", effective_hours)
+
+
+@router.post("/auto-consensus")
+def trigger_auto_consensus():
+    """Manually trigger the automatic consensus prediction job for upcoming fixtures."""
+    t = threading.Thread(target=auto_consensus_job, daemon=True, name="auto-consensus-manual")
+    t.start()
+    return {"started": True, "message": "Auto-consensus job started. Upcoming fixtures will be predicted and logged."}
+
+
+@router.get("/auto-consensus/status")
+def auto_consensus_status():
+    """Return status of the last auto-consensus run."""
+    return {
+        "interval_hours":      _get_consensus_interval_hours(),
+        "interval_hours_live": _auto_consensus_state.get("interval_hours", _AUTO_CONSENSUS_INTERVAL_HOURS),
+        **{k: v for k, v in _auto_consensus_state.items() if k != "interval_hours"},
+    }
+
+
+# Start the scheduler 2 mins after import so the server finishes initialising first.
+_initial_timer = threading.Timer(120, lambda: (_schedule_auto_consensus(), auto_consensus_job()))
+_initial_timer.daemon = True
+_initial_timer.name   = "auto-consensus-init"
+_initial_timer.start()
+log.info("Auto-consensus scheduler registered: first run in 2 min, then every %dh",
+         _AUTO_CONSENSUS_INTERVAL_HOURS)
 
 def _safe_div(a, b, default=0.0):
     try: return float(a) / float(b) if b else default

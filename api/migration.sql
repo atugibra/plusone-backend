@@ -58,3 +58,25 @@ CREATE INDEX IF NOT EXISTS prediction_log_date_idx     ON prediction_log(match_d
  
  ALTER TABLE teams
    ADD COLUMN IF NOT EXISTS logo_url TEXT;
+
+
+-- ─── 5. prediction_log — new columns for per-engine outcomes & predicted score ─
+-- Run these if you already created the prediction_log table previously.
+-- They are safe to run multiple times (IF NOT EXISTS).
+
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS predicted_score           TEXT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_predicted_outcome      TEXT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_predicted_outcome      TEXT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_predicted_outcome  TEXT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_correct                BOOLEAN;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_correct                BOOLEAN;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_correct            BOOLEAN;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS correct_score             TEXT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS evaluated_at              TIMESTAMPTZ;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS home_xg                  FLOAT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS away_xg                  FLOAT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS btts_yes                 FLOAT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS over_2_5                 FLOAT;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS btts_correct             BOOLEAN;
+ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS over_2_5_correct         BOOLEAN;
+
