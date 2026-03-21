@@ -250,6 +250,7 @@ def _log_prediction_to_db(
                 SELECT id, match_id, actual FROM prediction_log
                 WHERE home_team = %s AND away_team = %s
                   AND (match_date >= CURRENT_DATE - INTERVAL '1 day'
+                       OR match_date >= CURRENT_DATE
                        OR created_at >= NOW() - INTERVAL '7 days')
                 ORDER BY created_at DESC LIMIT 1
             """, (home_team, away_team))
@@ -1070,11 +1071,14 @@ def auto_consensus_job():
             JOIN   leagues l  ON l.id  = m.league_id
             JOIN   seasons s  ON s.id  = m.season_id
             WHERE  m.home_score IS NULL
-              AND  m.match_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+              AND  m.match_date BETWEEN CURRENT_DATE - INTERVAL '1 day' AND CURRENT_DATE + INTERVAL '30 days'
             ORDER  BY m.match_date ASC
         """)
         fixtures = [dict(r) for r in cur.fetchall()]
-        log.info("Auto-consensus job: found %d upcoming fixtures", len(fixtures))
+        if not fixtures:
+            log.warning("Auto-consensus job: no upcoming fixtures found in next 30 days — check match_date values in DB")
+        else:
+            log.info("Auto-consensus job: found %d upcoming fixtures", len(fixtures))
 
         count = 0
         for fx in fixtures:
