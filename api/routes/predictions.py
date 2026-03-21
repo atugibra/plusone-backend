@@ -243,7 +243,6 @@ def _log_prediction_to_db(
                 SELECT id, match_id, actual FROM prediction_log
                 WHERE home_team = %s AND away_team = %s
                   AND (match_date >= CURRENT_DATE - INTERVAL '1 day'
-                       OR match_date >= CURRENT_DATE
                        OR created_at >= NOW() - INTERVAL '7 days')
                 ORDER BY created_at DESC LIMIT 1
             """, (home_team, away_team))
@@ -915,6 +914,21 @@ def _get_consensus_interval_hours() -> int:
     return _AUTO_CONSENSUS_INTERVAL_HOURS
 
 
+def _get_consensus_lookback_days() -> int:
+    """Read consensus_lookback_days from app_settings, fallback to 30."""
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("SELECT value FROM app_settings WHERE key = 'consensus_lookback_days' LIMIT 1")
+        row = cur.fetchone()
+        conn.close()
+        if row and row["value"]:
+            return max(1, min(int(row["value"]), 365))
+    except Exception:
+        pass
+    return 30
+
+
 def _run_consensus_for_fixture(fx: dict, conn) -> bool:
     """
     Run the full Dynamic Consensus Engine (DC + ML + Legacy) for a single
@@ -1059,6 +1073,7 @@ def auto_consensus_job():
     try:
         conn = get_connection()
         cur  = conn.cursor()
+        lookback_days = _get_consensus_lookback_days()
         cur.execute("""
             SELECT m.id, m.home_team_id, m.away_team_id,
                    m.league_id, m.season_id, m.match_date,
@@ -1070,14 +1085,11 @@ def auto_consensus_job():
             JOIN   leagues l  ON l.id  = m.league_id
             JOIN   seasons s  ON s.id  = m.season_id
             WHERE  m.home_score IS NULL
-              AND  m.match_date BETWEEN CURRENT_DATE - INTERVAL '1 day' AND CURRENT_DATE + INTERVAL '30 days'
+              AND  m.match_date BETWEEN CURRENT_DATE AND CURRENT_DATE + (INTERVAL '1 day' * %s)
             ORDER  BY m.match_date ASC
-        """)
+        """, (lookback_days,))
         fixtures = [dict(r) for r in cur.fetchall()]
-        if not fixtures:
-            log.warning("Auto-consensus job: no upcoming fixtures found in next 30 days — check match_date values in DB")
-        else:
-            log.info("Auto-consensus job: found %d upcoming fixtures", len(fixtures))
+        log.info("Auto-consensus job: found %d upcoming fixtures (window: %d days)", len(fixtures), lookback_days)
 
         count = 0
         for fx in fixtures:

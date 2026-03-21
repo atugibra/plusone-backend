@@ -89,3 +89,16 @@ VALUES ('dc_lookback_months', '9', 'Number of months of match history used to tr
 ON CONFLICT (key) DO NOTHING;
 
 
+-- ─── 7. app_settings — auto-consensus fixture window ─────────────────────────
+-- Controls how many days AHEAD the auto-consensus job scans for upcoming
+-- fixtures when auto-filling prediction_log.
+-- The original 7-day window was too narrow — matches scheduled >1 week out
+-- were never picked up.  Setting to 30 covers full monthly gameweek schedules.
+-- Adjustable any time via the admin Settings panel.
+INSERT INTO app_settings (key, value, description)
+VALUES (
+    'consensus_lookback_days',
+    '30',
+    'How many days ahead the auto-consensus job scans for upcoming fixtures. Increase if fixtures are scheduled further out. Default 30.'
+)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
