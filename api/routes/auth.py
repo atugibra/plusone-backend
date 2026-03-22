@@ -33,6 +33,7 @@ class CreateUserRequest(BaseModel):
     email: str
     password: str
     role: Optional[str] = "user"   # 'user' | 'admin'
+    phone: Optional[str] = None
 
 class ChangeRoleRequest(BaseModel):
     role: str
@@ -50,7 +51,7 @@ def login(payload: LoginRequest):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, email, password_hash, role FROM users WHERE email = %s LIMIT 1",
+            "SELECT id, email, password_hash, role, phone FROM users WHERE email = %s LIMIT 1",
             (payload.email.lower().strip(),),
         )
         user = cur.fetchone()
@@ -73,6 +74,7 @@ def login(payload: LoginRequest):
             "id":    user["id"],
             "email": user["email"],
             "role":  user["role"],
+            "phone": user.get("phone"),
         },
     }
 
@@ -110,11 +112,11 @@ def create_user(
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO users (email, password_hash, role)
-            VALUES (%s, %s, %s)
-            RETURNING id, email, role, created_at
+            INSERT INTO users (email, password_hash, role, phone)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, email, role, phone, created_at
             """,
-            (email, hashed, payload.role),
+            (email, hashed, payload.role, payload.phone),
         )
         new_user = cur.fetchone()
         conn.commit()
@@ -135,6 +137,7 @@ def create_user(
             "id":         new_user["id"],
             "email":      new_user["email"],
             "role":       new_user["role"],
+            "phone":      new_user.get("phone"),
             "created_at": new_user["created_at"].isoformat() if new_user["created_at"] else None,
         },
     }
@@ -143,10 +146,20 @@ def create_user(
 @router.get("/api/auth/me")
 def me(user: dict = Depends(get_current_user)):
     """Return the currently authenticated user's profile."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, email, role, phone FROM users WHERE id = %s LIMIT 1", (user["id"],))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found.")
     return {
-        "id":    user["id"],
-        "email": user["email"],
-        "role":  user["role"],
+        "id":    row["id"],
+        "email": row["email"],
+        "role":  row["role"],
+        "phone": row.get("phone"),
     }
 
 
@@ -157,7 +170,7 @@ def list_users(_admin: dict = Depends(require_admin)):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, email, role, created_at FROM users ORDER BY id"
+            "SELECT id, email, role, phone, created_at FROM users ORDER BY id"
         )
         rows = cur.fetchall()
     finally:
@@ -169,6 +182,7 @@ def list_users(_admin: dict = Depends(require_admin)):
                 "id":         r["id"],
                 "email":      r["email"],
                 "role":       r["role"],
+                "phone":      r.get("phone"),
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }
             for r in rows
