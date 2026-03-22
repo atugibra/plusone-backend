@@ -43,11 +43,15 @@ class EnsemblePredictor:
         # classes (Home Win / Draw / Away Win) with equal importance.
         # We calibrate it isotonically so its raw logits become true probs.
         xgb_base = XGBClassifier(
-            n_estimators=300,
+            n_estimators=400,           # more trees → smoother decision surface
             max_depth=5,
-            learning_rate=0.05,
+            learning_rate=0.04,         # slightly lower lr to pair with more trees
             subsample=0.8,
             colsample_bytree=0.8,
+            min_child_weight=3,         # prevents splits on tiny leaf nodes
+            gamma=0.1,                  # minimum gain required to make a split
+            reg_alpha=0.1,              # L1 regularization (feature sparsity)
+            reg_lambda=1.5,             # L2 regularization (weight decay)
             eval_metric="mlogloss",
             random_state=42,
             n_jobs=-1,
@@ -73,13 +77,18 @@ class EnsemblePredictor:
             weights=[1, 1],
         )
 
-    def train(self, X, y, feature_names=None, cv_folds=5):
+    def train(self, X, y, feature_names=None, cv_folds=5, match_dates=None):
         """
         Train ensemble on (X, y).
         X: list of feature vectors
         y: list of labels (0=Home Win, 1=Draw, 2=Away Win)
         feature_names: optional list of feature name strings
+        match_dates: optional list of date objects/strings — used to apply
+                     exponential recency decay so recent matches matter more.
+                     Formula: weight *= exp(-days_ago / 365)
+                     A match from 1yr ago gets 37% weight vs a recent match.
         """
+        import datetime
         X = np.array(X, dtype=float)
         y = np.array(y, dtype=int)
 
@@ -101,7 +110,25 @@ class EnsemblePredictor:
         # collapses to always predicting the majority class (Home Win ~44%).
         sample_weights = compute_sample_weight(class_weight="balanced", y=y)
 
+        # Apply exponential recency decay if match_dates provided.
+        # Recent matches are 3x more influential than 3-year-old data.
+        if match_dates is not None and len(match_dates) == len(y):
+            today = datetime.date.today()
+            for i, d in enumerate(match_dates):
+                try:
+                    if isinstance(d, str):
+                        d = datetime.date.fromisoformat(str(d)[:10])
+                    elif hasattr(d, "date"):
+                        d = d.date()
+                    days_ago = max((today - d).days, 0)
+                    recency = float(np.exp(-days_ago / 365.0))
+                    sample_weights[i] *= recency
+                except Exception:
+                    pass  # silently keep original weight if date is malformed
+
         # Cross-validation accuracy (with sample weights)
+        # sklearn ≥1.4 replaced fit_params= with params=; try new API first,
+        # fall back to old API so we work with any installed version.
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         try:
             cv_scores = cross_val_score(
@@ -111,6 +138,7 @@ class EnsemblePredictor:
                 n_jobs=-1,
             )
         except (TypeError, ValueError):
+            # sklearn < 1.4 uses fit_params= and raises ValueError/TypeError if params is passed
             cv_scores = cross_val_score(
                 self.model, X_scaled, y, cv=skf,
                 scoring="accuracy",

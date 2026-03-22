@@ -98,7 +98,7 @@ def train_model():
     cur  = conn.cursor()
     try:
         t0 = time.time()
-        X, y, match_ids, errors = build_training_dataset_fast(cur, skip_errors=True)
+        X, y, match_ids, match_dates, errors = build_training_dataset_fast(cur, skip_errors=True)
         conn.close()
 
         if len(X) < 20:
@@ -110,9 +110,6 @@ def train_model():
 
         model = EnsemblePredictor()
 
-        conn3 = get_connection()
-        cur3  = conn3.cursor()
-        feat_names = []
         conn3 = get_connection()
         cur3  = conn3.cursor()
         feat_names = []
@@ -136,11 +133,12 @@ def train_model():
                     sample["season_id"],
                 )
         except Exception as exc:
-            log.warning("Could not extract feature names during training: %s", exc)
+            import logging
+            logging.getLogger(__name__).warning("Could not extract feature names during training: %s", exc)
         finally:
             conn3.close()
 
-        model.train(X, y, feature_names=feat_names or None)
+        model.train(X, y, feature_names=feat_names or None, match_dates=match_dates)
         model.save()
         save_to_db(model)
 

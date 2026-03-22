@@ -281,11 +281,13 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n
 
     if not matches:
         return {"form_score": 0.5, "goals_scored_avg": 1.35,
-                "goals_conceded_avg": 1.35, "win_streak": 0, "results": []}
+                "goals_conceded_avg": 1.35, "win_streak": 0,
+                "results": [], "last3_form_score": 0.5}
 
     pts_total = gf_total = ga_total = 0
     results, streak, streak_active = [], 0, True
-    for r in matches:
+    pts_last3 = 0
+    for i, r in enumerate(matches):
         is_home = r["home_team_id"] == team_id
         gf = _f(r["home_score"] if is_home else r["away_score"])
         ga = _f(r["away_score"] if is_home else r["home_score"])
@@ -293,14 +295,18 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n
         if gf > ga:
             pts_total += 3; results.append("W")
             if streak_active: streak += 1
+            if i < 3: pts_last3 += 3
         elif gf == ga:
             pts_total += 1; results.append("D"); streak_active = False
+            if i < 3: pts_last3 += 1
         else:
             results.append("L"); streak_active = False
 
-    n_actual = len(matches)
+    n_actual  = len(matches)
+    n_last3   = min(n_actual, 3)
     return {
-        "form_score":         _safe_div(pts_total, n_actual * 3, 0.5),
+        "form_score":         _safe_div(pts_total,  n_actual * 3, 0.5),
+        "last3_form_score":   _safe_div(pts_last3,  n_last3  * 3, 0.5),
         "goals_scored_avg":   _safe_div(gf_total,  n_actual, 1.2),
         "goals_conceded_avg": _safe_div(ga_total,  n_actual, 1.2),
         "win_streak":         streak,
@@ -651,12 +657,24 @@ def _build_team_features(cache: DataCache, team_id: int,
     form_all  = _compute_form(cache, team_id, None,   5)
     form_home = _compute_form(cache, team_id, "home", 5)
     form_away = _compute_form(cache, team_id, "away", 5)
-    feats["form_score"]      = form_all["form_score"]
+    feats["form_score"]       = form_all["form_score"]
+    feats["last3_form_score"] = form_all["last3_form_score"]
+    # momentum: positive = improving, negative = fading
+    feats["form_momentum"]   = form_all["last3_form_score"] - form_all["form_score"]
     feats["form_gf_avg"]     = form_all["goals_scored_avg"]
     feats["form_ga_avg"]     = form_all["goals_conceded_avg"]
     feats["win_streak"]      = _f(form_all["win_streak"])
     feats["home_form_score"] = form_home["form_score"]
     feats["away_form_score"] = form_away["form_score"]
+
+    # ELO-style strength proxy: blend rank, form and points
+    # Normalised to [0, 1] — higher = stronger team right now
+    feats["elo_proxy"] = (
+        feats.get("rank_norm",   0.5) * 0.40
+        + feats["form_score"]        * 0.35
+        + min(feats.get("points_avg", 0.0) / 3.0, 1.0) * 0.25
+    )
+
     feats["xg_estimate"]     = (
         feats.get("shots_on_target_per90", 0.0) * feats.get("goals_per_shot_on_target", 0.0)
         if feats.get("shots_on_target_per90")
@@ -723,6 +741,10 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
 
     vector["home_advantage"] = 1.0
 
+    # ── ELO differential (1 strong feature) ──────────────────────────────
+    # elo_diff > 0  → home team stronger, < 0 → away team stronger
+    vector["elo_diff"] = home_feats.get("elo_proxy", 0.5) - away_feats.get("elo_proxy", 0.5)
+
     feature_names  = sorted(vector.keys())
     feature_values = [vector[k] for k in feature_names]
     return feature_values, feature_names, home_feats, away_feats, h2h
@@ -736,7 +758,8 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
 
     1. Bulk-loads all tables into a DataCache (~6 queries total).
     2. Iterates over completed matches and builds features in-memory.
-    3. Returns X, y, match_ids, errors — identical shape to the original.
+    3. Returns X, y, match_ids, match_dates, errors — match_dates is a list
+       of datetime.date objects used for recency weighting during training.
 
     Expected speed-up: 50–100× vs the original (seconds not minutes).
     """
@@ -750,7 +773,7 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
     ]
     log.info("Building features for %d completed matches…", len(completed))
 
-    X, y, match_ids = [], [], []
+    X, y, match_ids, match_dates = [], [], [], []
     errors = 0
 
     for m in completed:
@@ -763,10 +786,11 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
             hs = _f(m["home_score"]); as_ = _f(m["away_score"])
             label = 0 if hs > as_ else (1 if hs == as_ else 2)
             X.append(fv); y.append(label); match_ids.append(m["id"])
+            match_dates.append(m.get("match_date"))  # datetime.date or None
         except Exception:
             errors += 1
             if not skip_errors:
                 raise
 
     log.info("Dataset built: %d samples, %d errors skipped.", len(X), errors)
-    return X, y, match_ids, errors
+    return X, y, match_ids, match_dates, errors

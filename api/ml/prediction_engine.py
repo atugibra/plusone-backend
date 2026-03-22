@@ -98,7 +98,7 @@ def train_model():
     cur  = conn.cursor()
     try:
         t0 = time.time()
-        X, y, match_ids, errors = build_training_dataset_fast(cur, skip_errors=True)
+        X, y, match_ids, match_dates, errors = build_training_dataset_fast(cur, skip_errors=True)
         conn.close()
 
         if len(X) < 20:
@@ -137,7 +137,7 @@ def train_model():
         finally:
             conn3.close()
 
-        model.train(X, y, feature_names=feat_names or None)
+        model.train(X, y, feature_names=feat_names or None, match_dates=match_dates)
         model.save()
         save_to_db(model)
 
