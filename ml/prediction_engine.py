@@ -59,6 +59,8 @@ def _apply_calibration(probs: dict) -> dict:
     """
     Apply feedback calibrator to raw model probabilities.
     Falls through unchanged if calibrator not fitted yet.
+    Always re-applies a 2% floor after calibration so no outcome
+    can ever display as 0% regardless of what isotonic regression learned.
     """
     try:
         cal = get_calibrator()
@@ -66,7 +68,17 @@ def _apply_calibration(probs: dict) -> dict:
             calibrated = cal.apply(probs)
             _meta["calibrator_samples"]  = cal.n_samples
             _meta["calibrator_accuracy"] = cal.post_accuracy
-            return calibrated
+            # Re-apply floor after calibration (calibrator may squeeze probs to 0)
+            MIN_PROB = 0.02
+            hw = max(calibrated["home_win"], MIN_PROB)
+            dr = max(calibrated["draw"],     MIN_PROB)
+            aw = max(calibrated["away_win"], MIN_PROB)
+            total = hw + dr + aw
+            return {
+                "home_win": round(hw / total, 4),
+                "draw":     round(dr / total, 4),
+                "away_win": round(aw / total, 4),
+            }
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Calibration apply failed: %s", exc)

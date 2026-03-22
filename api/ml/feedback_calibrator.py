@@ -77,6 +77,9 @@ class _IsotonicCalibrator:
                 calibrated[:, k] = self.calibrators[k].predict(probs[:, k])
             else:
                 calibrated[:, k] = probs[:, k]
+        # Apply a 2% probability floor so isotonic regression can never collapse
+        # an outcome to exactly 0% (which breaks UI display and log-loss)
+        calibrated = np.maximum(calibrated, 0.02)
         # Re-normalise so probabilities sum to 1
         row_sums = calibrated.sum(axis=1, keepdims=True)
         row_sums = np.where(row_sums < 1e-8, 1.0, row_sums)
@@ -275,3 +278,24 @@ def reset_calibrator():
     """Force reload on next get_calibrator() call (called after recalibration)."""
     global _calibrator
     _calibrator = None
+
+
+def recalibrate_with_feedback():
+    """
+    Convenience function imported by prediction_engine.predict_upcoming_fast().
+    Fits the feedback calibrator from prediction_log and reloads the singleton.
+    Silently skips if there aren't enough evaluated predictions yet.
+    """
+    cal = FeedbackCalibrator()
+    result = cal.fit_from_db()
+    if result.get("success"):
+        cal.save()
+        reset_calibrator()  # force singleton reload on next prediction
+        log.info(
+            "recalibrate_with_feedback: %d samples, %.1f%% → %.1f%%",
+            cal.n_samples,
+            result["pre_accuracy_pct"],
+            result["post_accuracy_pct"],
+        )
+    else:
+        log.debug("recalibrate_with_feedback skipped: %s", result.get("reason", "unknown"))
