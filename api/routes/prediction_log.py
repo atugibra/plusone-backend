@@ -153,6 +153,10 @@ def do_evaluate_predictions(conn) -> int:
               AND LOWER(pl.away_team) = LOWER(at.name)
               AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
               AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+              AND NOT EXISTS (
+                  SELECT 1 FROM prediction_log ex
+                  WHERE ex.match_id = m.id AND ex.id != pl.id
+              )
         """)
 
         # 1b. Fallback: ILIKE fuzzy match for rows still without a match_id
@@ -167,6 +171,10 @@ def do_evaluate_predictions(conn) -> int:
                   AND at.name ILIKE '%' || pl.away_team || '%'
                   AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
                   AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM prediction_log ex
+                      WHERE ex.match_id = m.id AND ex.id != pl.id
+                  )
                 LIMIT 1
             )
             WHERE pl.match_id IS NULL
@@ -178,6 +186,10 @@ def do_evaluate_predictions(conn) -> int:
                   AND at.name ILIKE '%' || pl.away_team || '%'
                   AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
                   AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM prediction_log ex
+                      WHERE ex.match_id = m.id AND ex.id != pl.id
+                  )
               )
         """)
 
