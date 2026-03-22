@@ -1,9 +1,10 @@
 import json
 import re
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from database import get_connection
+from routes.deps import require_admin
 
 def safe_num(val):
     """Safely convert FBref values to a number, returning None for non-numeric."""
@@ -394,7 +395,7 @@ def sync_status():
 
 
 @router.post("/all")
-def sync_all(payload: SyncPayload):
+def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -440,7 +441,7 @@ def sync_all(payload: SyncPayload):
 
 
 @router.post("/fixtures")
-def sync_fixtures(payload: SyncPayload):
+def sync_fixtures(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -462,7 +463,7 @@ def sync_fixtures(payload: SyncPayload):
 
 
 @router.post("/stats")
-def sync_stats(payload: SyncPayload):
+def sync_stats(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -482,7 +483,7 @@ def sync_stats(payload: SyncPayload):
 
 
 @router.post("/player-stats")
-def sync_player_stats(payload: SyncPayload):
+def sync_player_stats(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
     try:

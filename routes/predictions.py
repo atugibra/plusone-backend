@@ -19,13 +19,14 @@ Endpoints:
 import time
 import logging
 import threading
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Request
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Request, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
 import ml.prediction_engine as engine
 from ml.prediction_engine import predict_upcoming_fast
+from routes.deps import require_admin
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -111,7 +112,7 @@ def _run_training_in_background():
 
 
 @router.post("/train")
-def train(req: TrainRequest = None):
+def train(req: TrainRequest = None, _admin: dict = Depends(require_admin)):
     if _training_state.get("status") == "running":
         elapsed = int(time.time() - _training_state.get("started_at", time.time()))
         return {"started": False, "message": f"Training already running ({elapsed}s elapsed). Poll /training-status."}
@@ -131,7 +132,7 @@ def training_status():
 # ─── Feedback Calibration ─────────────────────────────────────────────────────
 
 @router.post("/recalibrate")
-def recalibrate():
+def recalibrate(_admin: dict = Depends(require_admin)):
     """
     Fit the feedback calibrator from evaluated prediction_log rows.
 

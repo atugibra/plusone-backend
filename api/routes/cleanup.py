@@ -1,7 +1,8 @@
 """
 Cleanup endpoints to purge corrupted data from bad syncs.
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from routes.deps import require_admin
 from database import get_connection
 
 router = APIRouter()
@@ -11,7 +12,7 @@ _LEAGUE_REF_TABLES = ["teams", "matches", "team_squad_stats", "scrape_log"]
 
 
 @router.post("/merge-duplicate-leagues")
-def merge_duplicate_leagues():
+def merge_duplicate_leagues(_admin: dict = Depends(require_admin)):
     """
     Find leagues that are case-insensitive duplicates of each other.
     Keep the 'canonical' one (prefers rows with country/fbref_id set, or the lower id).
@@ -71,7 +72,7 @@ def merge_duplicate_leagues():
 
 
 @router.delete("/bad-teams")
-def cleanup_bad_teams():
+def cleanup_bad_teams(_admin: dict = Depends(require_admin)):
     """Remove teams whose names are raw Python dict strings (e.g. {'text': 'Arsenal'})."""
     conn = get_connection()
     cur = conn.cursor()
@@ -103,7 +104,7 @@ def cleanup_bad_teams():
 
 
 @router.delete("/bad-leagues")
-def cleanup_bad_leagues():
+def cleanup_bad_leagues(_admin: dict = Depends(require_admin)):
     """Remove fake leagues created by year-only names (e.g. '2024', '2025')."""
     conn = get_connection()
     cur = conn.cursor()
@@ -145,7 +146,7 @@ def cleanup_bad_leagues():
 
 
 @router.delete("/all")
-def cleanup_all():
+def cleanup_all(_admin: dict = Depends(require_admin)):
     """Run all cleanup operations in one shot."""
     teams_result = cleanup_bad_teams()
     leagues_result = cleanup_bad_leagues()

@@ -62,10 +62,11 @@ SQL to run ONCE in Supabase SQL Editor:
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS evaluated_at     TIMESTAMPTZ;
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
+from routes.deps import require_admin
 
 router = APIRouter()
 
@@ -255,7 +256,7 @@ def do_evaluate_predictions(conn) -> int:
 # ─── POST /evaluate ───────────────────────────────────────────────────────────
 
 @router.post("/evaluate")
-def evaluate_predictions():
+def evaluate_predictions(_admin: dict = Depends(require_admin)):
     """
     Grade all un-evaluated prediction_log rows whose match has now completed.
     Grades: outcome correct/wrong, BTTS correct/wrong, Over 2.5 correct/wrong.

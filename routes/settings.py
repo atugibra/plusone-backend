@@ -13,10 +13,11 @@ Known keys:
 """
 
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from database import get_connection
+from routes.deps import require_admin
 
 log    = logging.getLogger(__name__)
 router = APIRouter()
@@ -62,7 +63,7 @@ def get_setting(key: str):
 
 
 @router.put("/{key}")
-def upsert_setting(key: str, body: SettingUpdate):
+def upsert_setting(key: str, body: SettingUpdate, _admin: dict = Depends(require_admin)):
     """Create or update a setting. Returns the updated row."""
     conn = get_connection()
     cur  = conn.cursor()
