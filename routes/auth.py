@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 
-from auth_utils import hash_password, verify_password, create_access_token
+from auth_utils import hash_password, verify_password, create_access_token  # root-level, not api.auth_utils
 from routes.deps import get_current_user, require_admin
 from database import get_connection
 
