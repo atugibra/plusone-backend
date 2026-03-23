@@ -1,9 +1,10 @@
 """
 User Feedback API
 =================
-POST /api/feedback          — Submit feedback
-GET  /api/feedback          — List all feedback (most recent first)
-PATCH /api/feedback/{id}    — Mark feedback as reviewed (admin)
+POST /api/feedback                  — Submit feedback
+GET  /api/feedback                  — List all feedback (most recent first)
+POST /api/feedback/{id}/reply       — Admin reply to feedback
+PATCH /api/feedback/{id}            — Mark feedback as reviewed (admin)
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,6 +23,11 @@ class FeedbackIn(BaseModel):
     category: str = "general"           # 'prediction', 'feature', 'bug', 'general'
     message: str
     rating: Optional[int] = None        # 1-5 star rating
+
+
+class ReplyIn(BaseModel):
+    reply_text: str
+    admin_email: Optional[str] = None
 
 
 # ── POST /api/feedback ─────────────────────────────────────────────────────────
@@ -93,7 +99,8 @@ def list_feedback(
         where = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
         params.append(limit)
         cur.execute(f"""
-            SELECT id, name, category, message, rating, reviewed, created_at
+            SELECT id, name, email, category, message, rating, reviewed,
+                   reply_text, replied_at, replied_by, created_at
             FROM user_feedback
             {where}
             ORDER BY created_at DESC
@@ -127,6 +134,53 @@ def mark_reviewed(feedback_id: int):
         raise
     except Exception as e:
         conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ── POST /api/feedback/{id}/reply ──────────────────────────────────────────────
+@router.post("/{feedback_id}/reply")
+def reply_to_feedback(feedback_id: int, body: ReplyIn):
+    """Admin replies to a feedback message. Stores reply text and timestamp."""
+    if not body.reply_text.strip():
+        raise HTTPException(status_code=422, detail="Reply cannot be empty.")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        for col, coldef in [
+            ("reply_text",  "TEXT"),
+            ("replied_at",  "TIMESTAMPTZ"),
+            ("replied_by",  "TEXT"),
+        ]:
+            cur.execute(f"""
+                DO $$ BEGIN
+                    ALTER TABLE user_feedback ADD COLUMN IF NOT EXISTS {col} {coldef};
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            """)
+        cur.execute(
+            """
+            UPDATE user_feedback
+               SET reply_text = %s,
+                   replied_at  = NOW(),
+                   replied_by  = %s,
+                   reviewed    = TRUE
+             WHERE id = %s
+            RETURNING id
+            """,
+            (body.reply_text.strip(), body.admin_email or "admin", feedback_id)
+        )
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Feedback not found.")
+        return {"success": True, "id": feedback_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        log.error("feedback reply failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
