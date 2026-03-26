@@ -230,7 +230,11 @@ def _log_prediction_to_db(
             except Exception:
                 pass
 
-        predicted = result.get("predicted_outcome")
+        predicted = (
+            result.get("predicted_outcome")
+            or result.get("prediction")
+            or result.get("consensus", {}).get("predicted_outcome")
+        )
 
         # match_date: try all known keys
         match_date = (
@@ -309,8 +313,8 @@ def _log_prediction_to_db(
                 WHERE id = %s
             """, (
                 new_id_to_set, predicted,
-                result.get("confidence"),
-                float(result.get("confidence_score") or 0),
+                result.get("confidence") or result.get("consensus", {}).get("confidence"),
+                float(result.get("confidence_score") or result.get("consensus", {}).get("confidence_score") or 0),
                 float(probs.get("home_win") or 0),
                 float(probs.get("draw")     or 0),
                 float(probs.get("away_win") or 0),
@@ -354,8 +358,8 @@ def _log_prediction_to_db(
                  %s, %s, %s)
         """, (
             match_id, home_team, away_team, league, match_date,
-            predicted, result.get("confidence"),
-            float(result.get("confidence_score") or 0),
+            predicted, result.get("confidence") or result.get("consensus", {}).get("confidence"),
+            float(result.get("confidence_score") or result.get("consensus", {}).get("confidence_score") or 0),
             float(probs.get("home_win") or 0),
             float(probs.get("draw")     or 0),
             float(probs.get("away_win") or 0),
