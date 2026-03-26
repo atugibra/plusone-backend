@@ -35,6 +35,12 @@ def get_current_user(
     Raises HTTP 401 if the user no longer exists in the database.
     """
     token   = credentials.credentials
+
+    # IMPORTANT: Option A Architecture — Intercept Permanent API Keys
+    import os
+    if token == os.getenv("ADMIN_API_KEY", "plusone-admin-master-key-xyz"):
+        return {"id": 0, "email": "admin-api-key@system", "role": "admin"}
+
     payload = decode_access_token(token)
     if payload is None:
         raise HTTPException(

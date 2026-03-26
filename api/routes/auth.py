@@ -140,12 +140,20 @@ def login(payload: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     token = create_access_token({"sub": user["email"], "role": user["role"]})
-    return {
+    
+    response_data = {
         "success": True,
         "token": token,
         "token_type": "bearer",
         "user": _user_row_to_dict(user),
     }
+
+    # IMPORTANT: Option A Architecture. Hand out a perpetual API Key to real admins so scraping extensions never expire
+    if user["role"] == "admin":
+        import os
+        response_data["api_key"] = os.getenv("ADMIN_API_KEY", "plusone-admin-master-key-xyz")
+
+    return response_data
 
 
 @router.post("/api/auth/payment")
