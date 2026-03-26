@@ -115,6 +115,27 @@ def train(req: TrainRequest = None, _admin: dict = Depends(require_admin)):
     t.start()
     return {"started": True, "message": "Training started. Poll /training-status for progress."}
 
+_enrichment_training_state = {"status": "idle"}
+
+def _run_enrichment_training_in_background():
+    global _enrichment_training_state
+    _enrichment_training_state = {"status": "running", "started_at": time.time()}
+    try:
+        from ml.enrichment_engine import train_enrichment_model
+        result = train_enrichment_model()
+        _enrichment_training_state = {"status": "done", "result": result}
+    except Exception as e:
+        _enrichment_training_state = {"status": "error", "error": str(e)}
+
+@router.post("/train/enrichment")
+def train_enrichment(_admin: dict = Depends(require_admin)):
+    if _enrichment_training_state.get("status") == "running":
+        elapsed = int(time.time() - _enrichment_training_state.get("started_at", time.time()))
+        return {"started": False, "message": f"Enrichment training already running ({elapsed}s elapsed)."}
+    t = threading.Thread(target=_run_enrichment_training_in_background, daemon=True, name="enrichment-training")
+    t.start()
+    return {"started": True, "message": "Enrichment ML training started in the background."}
+
 
 @router.get("/training-status")
 def training_status():

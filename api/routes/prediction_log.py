@@ -42,7 +42,8 @@ SQL to run ONCE in Supabase SQL Editor:
       legacy_predicted_outcome TEXT,
       dc_correct               BOOLEAN,
       ml_correct               BOOLEAN,
-      legacy_correct           BOOLEAN
+      legacy_correct           BOOLEAN,
+      enrichment_correct       BOOLEAN
   );
 
   -- If table already exists, run these:
@@ -58,6 +59,7 @@ SQL to run ONCE in Supabase SQL Editor:
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS dc_correct               BOOLEAN;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS ml_correct               BOOLEAN;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS legacy_correct           BOOLEAN;
+  ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS enrichment_correct       BOOLEAN;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS correct_score    TEXT;
   ALTER TABLE prediction_log ADD COLUMN IF NOT EXISTS evaluated_at     TIMESTAMPTZ;
 """
@@ -198,7 +200,7 @@ def do_evaluate_predictions(conn) -> int:
         cur.execute("""
             SELECT pl.id, pl.predicted, pl.btts_yes, pl.over_2_5,
                    pl.dc_predicted_outcome, pl.ml_predicted_outcome,
-                   pl.legacy_predicted_outcome,
+                   pl.legacy_predicted_outcome, pl.enrichment_predicted_outcome,
                    m.home_score, m.away_score
             FROM prediction_log pl
             JOIN matches m ON m.id = pl.match_id
@@ -227,9 +229,10 @@ def do_evaluate_predictions(conn) -> int:
                 over_2_5_correct = ((float(r["over_2_5"]) > 0.5) == (total_goals > 2))
 
             # Per-engine outcome grading
-            dc_correct     = (r["dc_predicted_outcome"]     == actual) if r["dc_predicted_outcome"]     else None
-            ml_correct     = (r["ml_predicted_outcome"]     == actual) if r["ml_predicted_outcome"]     else None
-            legacy_correct = (r["legacy_predicted_outcome"] == actual) if r["legacy_predicted_outcome"] else None
+            dc_correct         = (r["dc_predicted_outcome"]         == actual) if r["dc_predicted_outcome"]         else None
+            ml_correct         = (r["ml_predicted_outcome"]         == actual) if r["ml_predicted_outcome"]         else None
+            legacy_correct     = (r["legacy_predicted_outcome"]     == actual) if r["legacy_predicted_outcome"]     else None
+            enrichment_correct = (r["enrichment_predicted_outcome"] == actual) if r["enrichment_predicted_outcome"] else None
 
             cur.execute("""
                 UPDATE prediction_log
@@ -241,11 +244,12 @@ def do_evaluate_predictions(conn) -> int:
                     over_2_5_correct  = %s,
                     dc_correct        = %s,
                     ml_correct        = %s,
-                    legacy_correct    = %s
+                    legacy_correct    = %s,
+                    enrichment_correct= %s
                 WHERE id = %s
             """, (actual, correct, correct_score,
                   btts_correct, over_2_5_correct,
-                  dc_correct, ml_correct, legacy_correct,
+                  dc_correct, ml_correct, legacy_correct, enrichment_correct,
                   r["id"]))
             updated += 1
         return updated

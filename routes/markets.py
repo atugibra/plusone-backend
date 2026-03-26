@@ -116,20 +116,14 @@ def upcoming_dc_predictions(
     limit: int               = Query(30,   description="Max fixtures"),
 ):
     """
-    Bulk DC-engine predictions for all upcoming fixtures.
-    Results are cached for 15 minutes so the Free Picks page loads near-instantly
-    after the first request. Cache is busted automatically when DC model is retrained.
+    Bulk Consensus predictions for all upcoming fixtures.
+    Results are cached for 15 minutes to keep the Free Picks page near-instant.
     """
     global _upcoming_cache
 
-    dc = get_dc_predictor()
-    if dc is None or not dc.fitted:
-        raise HTTPException(
-            status_code=503,
-            detail="DC model not trained. Go to Betting Markets and click 'Train Engine' first.",
-        )
+    from ml.consensus_engine import run_consensus
 
-    # Return from cache if still fresh (only cache the default full-list request)
+    # Return from cache if still fresh
     cache_key = (league_id, limit)
     now = time.time()
     if (
@@ -149,7 +143,7 @@ def upcoming_dc_predictions(
                    m.home_team_id, ht.name AS home_team,
                    m.away_team_id, at.name AS away_team,
                    l.id AS league_id, l.name AS league,
-                   s.name AS season
+                   s.name AS season, s.id as season_id
             FROM matches m
             JOIN teams   ht ON ht.id = m.home_team_id
             JOIN teams   at ON at.id = m.away_team_id
@@ -172,36 +166,35 @@ def upcoming_dc_predictions(
     results = []
     for fx in fixtures:
         try:
-            pred = predict_dc_match(fx["home_team_id"], fx["away_team_id"])
+            # ── Switch from DC-specific to 4-Pillar Consensus ──
+            pred = run_consensus(
+                fx["home_team_id"], 
+                fx["away_team_id"], 
+                fx["league_id"], 
+                fx["season_id"]
+            )
+            
             if "error" in pred:
                 continue
 
-            cal  = pred.get("calibrated", {})
-            hw   = cal.get("home_win", 0.33)
-            dr   = cal.get("draw",     0.33)
-            aw   = cal.get("away_win", 0.34)
+            consensus = pred["consensus"]
+            engines   = pred["engines"]
+
+            hw   = consensus.get("home_win", 0.33)
+            dr   = consensus.get("draw",     0.33)
+            aw   = consensus.get("away_win", 0.34)
             lead = max(hw, dr, aw)
-            if lead == hw:
-                outcome = "Home Win"
-            elif lead == aw:
-                outcome = "Away Win"
-            else:
-                outcome = "Draw"
+            outcome = consensus.get("predicted_outcome", "Home Win")
+            confidence = consensus.get("confidence", "Medium")
 
-            conf_pct = pred.get("confidence", 50)
-            if conf_pct >= 55:
-                confidence = "High"
-            elif conf_pct >= 45:
-                confidence = "Medium"
-            else:
-                confidence = "Low"
-
-            xg_h = float(pred.get("exp_home_goals") or 0)
-            xg_a = float(pred.get("exp_away_goals") or 0)
-
-            # Predicted score from xG (rounded)
+            markets = pred.get("markets", {})
+            xg_h = float(markets.get("home_xg", 0))
+            xg_a = float(markets.get("away_xg", 0))
             pred_h = max(0, round(xg_h))
             pred_a = max(0, round(xg_a))
+
+            # Simulate DC calibration dict for bet recs
+            cal = {"home_win": hw, "draw": dr, "away_win": aw}
 
             result_entry = {
                 "predicted_outcome": outcome,
@@ -229,30 +222,45 @@ def upcoming_dc_predictions(
                     "gameweek":      fx["gameweek"],
                     "season":        fx["season"],
                 },
-                "model_breakdown": pred.get("models", {}),
+                # MAP consensus engines payload to the frontend's expected breakdown
+                "model_breakdown": engines,
+                "weights": pred.get("weights_used", {}),
                 "bet_recommendations": _dc_bet_recommendations(cal, xg_h, xg_a),
-                "engine": "dixon_coles",
+                "engine": "consensus",
             }
             results.append(result_entry)
 
-            # Auto-log to prediction_log in a background thread (non-blocking)
+            # Use the exact dictionary format and positional arguments expected by the logger
             import threading
+            from routes.predictions import _log_prediction_to_db as _log_db
+            
+            # Extract individual engine outcomes for the feedback loop
+            dc_out  = engines.get("dc", {}).get("predicted_outcome")
+            ml_out  = engines.get("ml", {}).get("predicted_outcome")
+            leg_out = engines.get("legacy", {}).get("predicted_outcome")
+            enr_out = engines.get("enrichment", {}).get("predicted_outcome")
+            
+            # Auto-log handled internally background thread
             threading.Thread(
-                target=_log_prediction_bg,
+                target=_log_db,
                 args=(
-                    int(fx["id"]), str(fx["home_team"]), str(fx["away_team"]),
-                    str(fx["league"]), fx["match_date"], str(outcome),
-                    str(confidence), float(lead), float(hw), float(dr), float(aw),
+                    result_entry,           # result dict
+                    int(fx["id"]),          # match_id
+                    dc_out,                 # dc_outcome
+                    ml_out,                 # ml_outcome
+                    enr_out,                # enrichment_outcome
+                    leg_out,                # legacy_outcome
+                    f"{pred_h}-{pred_a}"    # predicted_score
                 ),
                 daemon=True,
             ).start()
         except Exception as exc:
-            log.debug("DC skip fixture %s vs %s: %s", fx["home_team"], fx["away_team"], exc)
+            log.debug("Consensus skip fixture %s vs %s: %s", fx["home_team"], fx["away_team"], exc)
             continue
 
-    response = {"count": len(results), "predictions": results, "engine": "dixon_coles"}
+    response = {"count": len(results), "predictions": results, "engine": "consensus"}
     _upcoming_cache = {"data": response, "expires_at": time.time() + _UPCOMING_TTL, "key": cache_key}
-    log.info("Built /upcoming cache: %d predictions, TTL %ds", len(results), _UPCOMING_TTL)
+    log.info("Built /upcoming cache: %d consensus predictions, TTL %ds", len(results), _UPCOMING_TTL)
     return response
 
 
