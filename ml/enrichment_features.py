@@ -57,9 +57,8 @@ def build_enrichment_features(cur, home_team_id: int, away_team_id: int, match_d
         
     # ── 1. Match Odds ───────────────────────────────────────────────────────────
     # We find the most recent odds row where these two teams played.
-    # In a perfect world, we have a match_id, but here we query by team_id
     cur.execute(f"""
-        SELECT mo.b365_home_win, mo.b365_draw, mo.b365_away_win
+        SELECT mo.b365_home_win, mo.b365_draw, mo.b365_away_win, mo.raw_data
         FROM match_odds mo
         JOIN matches m ON m.id = mo.match_id
         WHERE m.home_team_id = %s AND m.away_team_id = %s
@@ -71,15 +70,43 @@ def build_enrichment_features(cur, home_team_id: int, away_team_id: int, match_d
         hw = _f(odds_row["b365_home_win"])
         dw = _f(odds_row["b365_draw"])
         aw = _f(odds_row["b365_away_win"])
-        # Convert odds to implied probabilities
-        margin = (1.0/hw + 1.0/dw + 1.0/aw) if (hw and dw and aw) else 1.0
-        feats["odds_home_prob"] = (1.0/hw) / margin if hw else 0.35
-        feats["odds_draw_prob"] = (1.0/dw) / margin if dw else 0.30
-        feats["odds_away_prob"] = (1.0/aw) / margin if aw else 0.35
+        
+        # Convert odds to implied probabilities (1x2)
+        margin_1x2 = (1.0/hw + 1.0/dw + 1.0/aw) if (hw and dw and aw) else 1.0
+        feats["odds_home_prob"] = (1.0/hw) / margin_1x2 if hw else 0.35
+        feats["odds_draw_prob"] = (1.0/dw) / margin_1x2 if dw else 0.30
+        feats["odds_away_prob"] = (1.0/aw) / margin_1x2 if aw else 0.35
+        
+        # Parse additional JSON raw_data features (Over/Under, Asian Handicap, etc.)
+        raw_odds = odds_row.get("raw_data") or {}
+        
+        # Over/Under 2.5
+        o25 = _f(raw_odds.get("B365>2.5", raw_odds.get("Max>2.5", 0)))
+        u25 = _f(raw_odds.get("B365<2.5", raw_odds.get("Max<2.5", 0)))
+        margin_ou = (1.0/o25 + 1.0/u25) if (o25 > 0 and u25 > 0) else 1.0
+        feats["odds_over_25_prob"]  = (1.0/o25) / margin_ou if o25 > 0 else 0.50
+        feats["odds_under_25_prob"] = (1.0/u25) / margin_ou if u25 > 0 else 0.50
+        
+        # Asian Handicap (e.g. -1.5, +0.5)
+        ah_size = _f(raw_odds.get("AHh", 0.0))
+        ahh     = _f(raw_odds.get("B365AHH", 0))
+        aha     = _f(raw_odds.get("B365AHA", 0))
+        margin_ah = (1.0/ahh + 1.0/aha) if (ahh > 0 and aha > 0) else 1.0
+        
+        feats["odds_asian_hdcp_size"] = ah_size
+        feats["odds_ah_home_prob"]    = (1.0/ahh) / margin_ah if ahh > 0 else 0.50
+        feats["odds_ah_away_prob"]    = (1.0/aha) / margin_ah if aha > 0 else 0.50
+        
     else:
+        # Defaults if no match odds row
         feats["odds_home_prob"] = 0.35
         feats["odds_draw_prob"] = 0.30
         feats["odds_away_prob"] = 0.35
+        feats["odds_over_25_prob"] = 0.50
+        feats["odds_under_25_prob"] = 0.50
+        feats["odds_asian_hdcp_size"] = 0.0
+        feats["odds_ah_home_prob"] = 0.50
+        feats["odds_ah_away_prob"] = 0.50
 
     # ── 2. Team ClubElo ─────────────────────────────────────────────────────────
     # We pull the most recent Elo values for both home and away
