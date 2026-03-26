@@ -145,6 +145,14 @@ def training_status():
     return state
 
 
+@router.get("/training-status/enrichment")
+def training_status_enrichment():
+    state = _enrichment_training_state
+    if not state:
+        return {"status": "idle", "message": "No enrichment training has been triggered yet."}
+    return state
+
+
 # ─── Feedback Calibration ─────────────────────────────────────────────────────
 
 @router.post("/recalibrate")
