@@ -28,13 +28,23 @@ def _get_league(cur, name: str):
     cur.execute("INSERT INTO leagues (name) VALUES (%s) RETURNING id", (name.title().strip(),))
     return cur.fetchone()["id"]
 
-def _get_team(cur, name: str, league_id: int):
+def _get_team(cur, name: str, league_id: int, team_cache: dict):
+    # In-memory deduplication during massive sync batches
+    cache_key = (name.lower().strip(), league_id)
+    if cache_key in team_cache:
+        return team_cache[cache_key]
+
     # Primitive mapping, assumes exact or subset matching will be handled by data normalizers later
     cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (name.strip(), league_id))
     res = cur.fetchone()
-    if res: return res["id"]
+    if res:
+        team_cache[cache_key] = res["id"]
+        return res["id"]
+        
     cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (name.strip(), league_id))
-    return cur.fetchone()["id"]
+    new_id = cur.fetchone()["id"]
+    team_cache[cache_key] = new_id
+    return new_id
 
 def _find_match(cur, home_team_id, away_team_id, match_date: str):
     if not match_date:
@@ -75,6 +85,7 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
     cur = conn.cursor()
     try:
         league_id = _get_league(cur, payload.league)
+        team_cache = {}
         
         odds_count = 0
         injuries_count = 0
@@ -87,8 +98,8 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                 away_name = row.get("AwayTeam") or row.get("Away")
                 if not home_name or not away_name: continue
                 
-                h_id = _get_team(cur, home_name, league_id)
-                a_id = _get_team(cur, away_name, league_id)
+                h_id = _get_team(cur, home_name, league_id, team_cache)
+                a_id = _get_team(cur, away_name, league_id, team_cache)
                 m_date = _parse_odds_date(row.get("Date"))
                 m_id = _find_match(cur, h_id, a_id, m_date)
                 
@@ -115,7 +126,7 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                 player = row.get("Player")
                 if not club or not player: continue
                 
-                t_id = _get_team(cur, club, league_id)
+                t_id = _get_team(cur, club, league_id, team_cache)
                 cur.execute("""
                     INSERT INTO player_injuries (team_id, player_name, injury_type, return_date, raw_data)
                     VALUES (%s, %s, %s, %s, %s)
@@ -130,14 +141,15 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
         # ── 3. Team ClubElo ─────────────────────────────────────────────────────────
         if payload.clubelo:
             for row in payload.clubelo:
-                home = row.get("Home")
-                away = row.get("Away")
-                target_date = row.get("Date")
+                raw_data = row.get("raw", row)
+                home = raw_data.get("Home") or raw_data.get("HomeTeam") or row.get("home")
+                away = raw_data.get("Away") or raw_data.get("AwayTeam") or row.get("away")
+                target_date = raw_data.get("Date") or row.get("date")
                 
-                # Split the fixture up into two separate clubelo entries
-                for tm, elo_val in [(home, row.get("Home_Elo")), (away, row.get("Away_Elo"))]:
-                    if not tm or not target_date or not elo_val: continue
-                    t_id = _get_team(cur, tm, league_id)
+                # We may not have exact Elo numbers from the Fixtures endpoint, but we save the predicted Probs!
+                for tm, elo_val in [(home, raw_data.get("Home_Elo")), (away, raw_data.get("Away_Elo"))]:
+                    if not tm or not target_date: continue
+                    t_id = _get_team(cur, tm, league_id, team_cache)
                     cur.execute("""
                         INSERT INTO team_clubelo (team_id, elo_date, elo, raw_data)
                         VALUES (%s, %s, %s, %s)

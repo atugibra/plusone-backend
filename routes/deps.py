@@ -15,6 +15,7 @@ Usage:
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import os
 
 from auth_utils import decode_access_token
 from database import get_connection
@@ -34,7 +35,18 @@ def get_current_user(
     Raises HTTP 401 if the token is missing, expired, or invalid.
     Raises HTTP 401 if the user no longer exists in the database.
     """
-    token   = credentials.credentials
+    # --- [NEW] ADMIN API KEY BYPASS -------------------------------------------
+    # We check if the request provides the permanent master key in the headers.
+    # If it matches our extremely secure environment variable, we grant it INSTANT
+    # admin privileges, entirely bypassing the 30-day JWT decoding.
+    # This guarantees that a 4-hour batch scrape running overnight will NEVER expire!
+    master_key = os.getenv("ADMIN_API_KEY")
+    token = credentials.credentials
+    
+    if master_key and token == master_key:
+        return {"id": 0, "email": "admin@api-key.system", "role": "admin"}
+    # -------------------------------------------------------------------------
+
     payload = decode_access_token(token)
     if payload is None:
         raise HTTPException(
