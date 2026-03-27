@@ -294,6 +294,22 @@ def predict_enrichment(home_team_id: int, away_team_id: int, match_date: str = N
     cur = conn.cursor()
     try:
         feats = build_enrichment_features(cur, home_team_id, away_team_id, match_date)
+        
+        # Default detection: If this match has literally zero enrichment data 
+        # (no odds, no clubelo, no injuries), the model's output would be arbitrary garbage.
+        # We explicitly abstain so the Consensus Engine zero-weights this engine.
+        if (feats.get("clubelo_home_rating") == 1500.0 and 
+            feats.get("odds_home_prob") == 0.35 and 
+            feats.get("home_injured_players") == 0.0 and 
+            feats.get("away_injured_players") == 0.0):
+            
+            return {
+                "error": "No enrichment data available (all defaults).",
+                "home_win": 0.35, "draw": 0.30, "away_win": 0.35,
+                "predicted_outcome": "—",
+                "_features": feats
+            }
+
         probs = eng.predict_proba(feats)
         
         idx = np.argmax([probs["home_win"], probs["draw"], probs["away_win"]])

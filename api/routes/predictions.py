@@ -34,10 +34,13 @@ router = APIRouter()
 _training_state: dict = {}
 _public_cache:   dict = {"data": None, "expires_at": 0.0}
 
-# ── Rate limiter (sliding window, in-memory, no extra deps) ───────────────────
-_RATE_WINDOW = 60        # seconds
-_RATE_MAX    = 60        # requests per window per IP
-_rate_store: dict = {}   # ip → [timestamp, ...]
+# ─── Rate limiter (sliding window, in-memory, no extra deps) ──────────────────
+# Allows MAX_REQUESTS calls per IP within WINDOW_SECONDS before returning 429.
+# The store is cleaned up lazily to avoid unbounded memory growth.
+
+_RATE_WINDOW  = 60       # seconds
+_RATE_MAX     = 60       # requests per window per IP
+_rate_store:  dict = {}  # ip → [timestamp, ...]
 
 
 def _check_rate_limit(ip: str) -> None:
@@ -45,6 +48,7 @@ def _check_rate_limit(ip: str) -> None:
     now    = time.time()
     cutoff = now - _RATE_WINDOW
     hits   = _rate_store.get(ip, [])
+    # Purge old entries
     hits   = [t for t in hits if t > cutoff]
     if len(hits) >= _RATE_MAX:
         retry_after = int(_RATE_WINDOW - (now - hits[0]))
@@ -55,6 +59,7 @@ def _check_rate_limit(ip: str) -> None:
         )
     hits.append(now)
     _rate_store[ip] = hits
+    # Lazy cleanup: evict stale IPs roughly every 500 calls
     if len(_rate_store) > 500:
         stale = [k for k, v in _rate_store.items() if not any(t > cutoff for t in v)]
         for k in stale:
@@ -86,7 +91,7 @@ class ConsensusRequest(BaseModel):
     away_team_id: int
     league_id:    int
     season_id:    int
-    match_id:     Optional[int] = None   # passed from frontend for gradeability
+    match_id:     Optional[int] = None   # allows prediction_log grading after match completes
 
 
 # ─── ML Routes ────────────────────────────────────────────────────────────────
@@ -190,7 +195,6 @@ def _log_prediction_to_db(
     match_id: Optional[int] = None,
     dc_outcome: Optional[str] = None,
     ml_outcome: Optional[str] = None,
-    enrichment_outcome: Optional[str] = None,
     legacy_outcome: Optional[str] = None,
     predicted_score: Optional[str] = None,
 ):
@@ -210,7 +214,7 @@ def _log_prediction_to_db(
         away_team_id = match_info.get("away_team_id") or result.get("away_team_id")
         league       = match_info.get("league")       or result.get("league")
 
-        # Resolve names/league from DB if still missing
+        # If names are missing but we have IDs, look them up from DB
         if (not home_team or not away_team or not league) and (home_team_id or away_team_id):
             try:
                 conn_inner = get_connection()
@@ -252,7 +256,7 @@ def _log_prediction_to_db(
                         predicted, home_team, away_team)
             return
 
-        # Markets — consensus uses result.markets; ML uses result.expected_goals
+        # Markets — present in consensus (result.markets) or ML (result.expected_goals)
         markets  = result.get("markets") or {}
         xg_src   = result.get("expected_goals") or markets
         btts_yes = markets.get("btts_yes")
@@ -260,19 +264,13 @@ def _log_prediction_to_db(
         home_xg  = xg_src.get("home_xg")
         away_xg  = xg_src.get("away_xg")
 
-        # Pull from kwargs or automatically extract from _engine_picks
-        engine_picks = result.get("_engine_picks", {})
-        dc_val  = dc_outcome or engine_picks.get("dc")
-        ml_val  = ml_outcome or engine_picks.get("ml")
-        enr_val = enrichment_outcome or engine_picks.get("enrichment")
-        leg_val = legacy_outcome or engine_picks.get("legacy")
-
         conn = get_connection()
         cur  = conn.cursor()
 
-        # ── Deduplication / Upsert ────────────────────────────────────────────
+        # ── Deduplication / Upsert ───────────────────────────────────────────
         existing = None
 
+        # 1. Prefer matching exactly by match_id if provided
         if match_id is not None:
             cur.execute(
                 "SELECT id, match_id, actual FROM prediction_log WHERE match_id = %s LIMIT 1",
@@ -280,6 +278,7 @@ def _log_prediction_to_db(
             )
             existing = cur.fetchone()
 
+        # 2. Fallback to team names + time window if no exact match_id found
         if not existing:
             cur.execute("""
                 SELECT id, match_id, actual FROM prediction_log
@@ -289,6 +288,7 @@ def _log_prediction_to_db(
                 ORDER BY created_at DESC LIMIT 1
             """, (home_team, away_team))
             row = cur.fetchone()
+            # Only use this fallback row if we aren't stealing it from a different known match
             if row and (row["match_id"] is None or row["match_id"] == match_id):
                 existing = row
 
@@ -315,8 +315,8 @@ def _log_prediction_to_db(
                     league                    = COALESCE(%s, league),
                     dc_predicted_outcome      = COALESCE(%s, dc_predicted_outcome),
                     ml_predicted_outcome      = COALESCE(%s, ml_predicted_outcome),
-                    enrichment_predicted_outcome = COALESCE(%s, enrichment_predicted_outcome),
                     legacy_predicted_outcome  = COALESCE(%s, legacy_predicted_outcome),
+                    enrichment_predicted_outcome = COALESCE(%s, enrichment_predicted_outcome),
                     predicted_score           = COALESCE(%s, predicted_score)
                 WHERE id = %s
             """, (
@@ -331,14 +331,18 @@ def _log_prediction_to_db(
                 float(home_xg)  if home_xg  is not None else None,
                 float(away_xg)  if away_xg  is not None else None,
                 match_date, league,
-                dc_val, ml_val, enr_val, leg_val, predicted_score,
+                result.get("engines", {}).get("dc", {}).get("predicted_outcome") or dc_outcome,
+                result.get("engines", {}).get("ml", {}).get("predicted_outcome") or ml_outcome,
+                result.get("engines", {}).get("legacy", {}).get("predicted_outcome") or legacy_outcome,
+                result.get("engines", {}).get("enrichment", {}).get("predicted_outcome"),
+                predicted_score,
                 existing["id"],
             ))
             conn.commit()
             log.info("Updated prediction for %s vs %s", home_team, away_team)
             return
 
-        # Guard against match_id collision on new inserts
+        # Guard against exact match_id collision for newly inserted rows
         if match_id is not None:
             cur.execute("SELECT id FROM prediction_log WHERE match_id = %s LIMIT 1", (match_id,))
             if cur.fetchone():
@@ -352,15 +356,14 @@ def _log_prediction_to_db(
                  home_win_prob, draw_prob, away_win_prob,
                  btts_yes, over_2_5, home_xg, away_xg,
                  dc_predicted_outcome, ml_predicted_outcome,
-                 enrichment_predicted_outcome,
-                 legacy_predicted_outcome, predicted_score)
+                 legacy_predicted_outcome, enrichment_predicted_outcome, predicted_score)
             VALUES
                 (%s, %s, %s, %s, %s,
                  %s, %s, %s,
                  %s, %s, %s,
                  %s, %s, %s, %s,
-                 %s, %s, %s,
-                 %s, %s)
+                 %s, %s,
+                 %s, %s, %s)
         """, (
             match_id, home_team, away_team, league, match_date,
             predicted, result.get("confidence") or result.get("consensus", {}).get("confidence"),
@@ -372,11 +375,14 @@ def _log_prediction_to_db(
             float(over_2_5) if over_2_5 is not None else None,
             float(home_xg)  if home_xg  is not None else None,
             float(away_xg)  if away_xg  is not None else None,
-            dc_val, ml_val, enr_val, leg_val, predicted_score,
+            result.get("engines", {}).get("dc", {}).get("predicted_outcome") or dc_outcome,
+            result.get("engines", {}).get("ml", {}).get("predicted_outcome") or ml_outcome,
+            result.get("engines", {}).get("legacy", {}).get("predicted_outcome") or legacy_outcome,
+            result.get("engines", {}).get("enrichment", {}).get("predicted_outcome"),
+            predicted_score,
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
-
     except Exception as exc:
         log.error("Could not log prediction: %s", exc, exc_info=True)
         if conn:
@@ -458,9 +464,14 @@ def _derive_best_bets(predictions: list) -> list:
 
 @router.get("/public")
 def public_predictions(
+    request:   Request,
     league_id: Optional[int] = Query(None),
     limit:     int           = Query(30),
 ):
+    # Per-IP rate limit: 60 requests per 60-second window
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
     global _public_cache
     now = time.time()
     if _public_cache["data"] is not None and now < _public_cache["expires_at"]:
@@ -480,6 +491,8 @@ def public_predictions(
             "cached":       False,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -624,6 +637,13 @@ def prediction_accuracy_trend(
         conn.close()
 
 
+# ─── Dynamic Consensus Engine (self-contained) ───────────────────────────────
+
+_OUTCOME_LABELS  = ["Home Win", "Draw", "Away Win"]
+_DEFAULT_WEIGHTS = {"dc": 0.45, "ml": 0.35, "legacy": 0.20}
+_MIN_GRADED_ROWS = 10
+
+
 # ─── Dynamic Consensus Engine ───────────────────────────────────────────────
 
 
@@ -654,27 +674,29 @@ def consensus_predict(req: ConsensusRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ─── Auto-consensus background job ──────────────────────────────────────────
+# ─── Auto-consensus background job ────────────────────────────────────────────
 
-_AUTO_CONSENSUS_INTERVAL_HOURS = 6   # fallback default (hours)
-_auto_consensus_state: dict = {"last_run": None, "last_count": 0, "last_error": None, "interval_hours": _AUTO_CONSENSUS_INTERVAL_HOURS}
+_AUTO_CONSENSUS_INTERVAL_HOURS = 6
+_auto_consensus_state: dict = {
+    "last_run":       None,
+    "last_count":     0,
+    "last_error":     None,
+    "interval_hours": _AUTO_CONSENSUS_INTERVAL_HOURS,
+}
 
 
 def _get_consensus_interval_hours() -> int:
-    """Read consensus_interval_hours from app_settings table, fallback to default."""
+    """Read consensus_interval_hours from app_settings, fallback to default."""
     try:
         conn = get_connection()
         cur  = conn.cursor()
-        cur.execute("""
-            SELECT value FROM app_settings WHERE key = 'consensus_interval_hours' LIMIT 1
-        """)
+        cur.execute("SELECT value FROM app_settings WHERE key = 'consensus_interval_hours' LIMIT 1")
         row = cur.fetchone()
         conn.close()
         if row and row["value"]:
-            hours = int(row["value"])
-            return max(1, min(hours, 168))   # clamp between 1h and 7 days
+            return max(1, min(int(row["value"]), 168))
     except Exception:
-        pass   # table may not exist yet, use default
+        pass
     return _AUTO_CONSENSUS_INTERVAL_HOURS
 
 
@@ -694,36 +716,37 @@ def _get_consensus_lookback_days() -> int:
 
 
 def _run_consensus_for_fixture(fx: dict, conn) -> bool:
-    """
-    Run the full Dynamic Consensus Engine for a single upcoming fixture dict
-    and log the result to prediction_log via _log_prediction_to_db.
-    """
-    home_team_id = fx["home_team_id"]
-    away_team_id = fx["away_team_id"]
-    league_id    = fx["league_id"]
-    season_id    = fx["season_id"]
-    fixture_id   = fx["id"]
+    from ml.consensus_engine import run_consensus
+    
+    # 1. Provide a default fallback logger
+    fallback_match_id = fx.get("id")
+    home_name = fx.get("home_name", f"Team {fx.get('home_team_id')}")
+    away_name = fx.get("away_name", f"Team {fx.get('away_team_id')}")
 
     try:
-        from ml.consensus_engine import run_consensus
-        result = run_consensus(home_team_id, away_team_id, league_id, season_id)
-        if "error" in result:
+        # Run unified engine
+        res = run_consensus(
+            home_team_id=fx["home_team_id"],
+            away_team_id=fx["away_team_id"],
+            league_id=fx.get("league_id"),
+            season_id=fx.get("season_id")
+        )
+
+        if "error" in res:
+            log.warning("Auto-consensus skipped %s vs %s: %s", home_name, away_name, res["error"])
             return False
 
-        # Ensure match_date passes through to the log
-        _match = result.get("match", {})
-        _match["match_date"] = str(fx.get("match_date")) if fx.get("match_date") else None
-        
-        # Merge fx names as fallback
-        if not _match.get("home_team"): _match["home_team"] = fx.get("home_name")
-        if not _match.get("away_team"): _match["away_team"] = fx.get("away_name")
-        result["match"] = _match
+        # If a match dict was populated but missing `match_date`, inject it
+        if res.get("match") is not None:
+            if fx.get("match_date") and not res["match"].get("match_date"):
+                res["match"]["match_date"] = str(fx["match_date"])
 
-        _log_prediction_to_db(result, match_id=fixture_id)
+        # Use the exact logging pattern created for /consensus
+        _log_prediction_to_db(res, fallback_match_id)
         return True
-        
+
     except Exception as exc:
-        log.warning("Auto-consensus: Error for %s: %s", fixture_id, exc)
+        log.error("Auto-consensus fatal error for %s vs %s: %s", home_name, away_name, exc, exc_info=True)
         return False
 
 
@@ -732,7 +755,7 @@ def auto_consensus_job():
     Fetch all upcoming fixtures (next 7 days, unplayed) and run the
     Dynamic Consensus Engine on each. Results are automatically written
     to prediction_log (with dedup — existing rows are updated, not duplicated).
-    This function is safe to call from a background thread.
+    Safe to call from a background thread.
     """
     global _auto_consensus_state
     _auto_consensus_state["last_error"] = None
@@ -777,27 +800,20 @@ def auto_consensus_job():
 
 
 def _schedule_auto_consensus(interval_hours: int = None):
-    """Recurring threading.Timer. Re-reads interval from app_settings each cycle
-    so admin changes take effect on the next run without a server restart."""
     def _run_and_reschedule():
-        try:
-            auto_consensus_job()
-        finally:
-            # always re-read from DB so live setting changes are picked up
-            _schedule_auto_consensus()
-    # Read fresh interval from DB every cycle
+        try: auto_consensus_job()
+        finally: _schedule_auto_consensus()
     effective_hours = interval_hours or _get_consensus_interval_hours()
     _auto_consensus_state["interval_hours"] = effective_hours
     t = threading.Timer(effective_hours * 3600, _run_and_reschedule)
-    t.daemon = True
-    t.name   = "auto-consensus-scheduler"
+    t.daemon = True; t.name = "auto-consensus-scheduler"
     t.start()
-    log.info("Auto-consensus next run in %dh (reads DB setting each cycle)", effective_hours)
+    log.info("Auto-consensus next run in %dh", effective_hours)
 
 
 @router.post("/auto-consensus")
 def trigger_auto_consensus():
-    """Manually trigger the automatic consensus prediction job."""
+    """Manually trigger the automatic consensus prediction job for upcoming fixtures."""
     t = threading.Thread(target=auto_consensus_job, daemon=True, name="auto-consensus-manual")
     t.start()
     return {"started": True, "message": "Auto-consensus job started. Upcoming fixtures will be predicted and logged."}
@@ -805,26 +821,21 @@ def trigger_auto_consensus():
 
 @router.get("/auto-consensus/status")
 def auto_consensus_status():
-    """Return status of the last auto-consensus run, including live DB interval setting."""
+    """Return status of the last auto-consensus run."""
     return {
-        "interval_hours":      _get_consensus_interval_hours(),   # live DB value
+        "interval_hours":      _get_consensus_interval_hours(),
         "interval_hours_live": _auto_consensus_state.get("interval_hours", _AUTO_CONSENSUS_INTERVAL_HOURS),
         **{k: v for k, v in _auto_consensus_state.items() if k != "interval_hours"},
     }
 
 
-# ── Start the scheduler when this module is imported ─────────────────────────
-# Runs once 2 minutes after startup so the server finishes initialising first,
-# then every 6 hours thereafter.
+# Start the scheduler 2 mins after import so the server finishes initialising first.
 _initial_timer = threading.Timer(120, lambda: (_schedule_auto_consensus(), auto_consensus_job()))
 _initial_timer.daemon = True
 _initial_timer.name   = "auto-consensus-init"
 _initial_timer.start()
 log.info("Auto-consensus scheduler registered: first run in 2 min, then every %dh",
          _AUTO_CONSENSUS_INTERVAL_HOURS)
-
-
-# ─── Legacy Rule-based Route ──────────────────────────────────────────────────
 
 def _safe_div(a, b, default=0.0):
     try: return float(a) / float(b) if b else default

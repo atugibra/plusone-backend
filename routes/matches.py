@@ -21,6 +21,7 @@ def list_matches(
         SELECT m.id, m.match_date, m.gameweek, m.start_time, m.score_raw,
                m.home_score, m.away_score, m.attendance, m.venue, m.referee, m.round,
                ht.name AS home_team, at.name AS away_team,
+               ht.logo_url AS home_logo, at.logo_url AS away_logo,
                l.name AS league, s.name AS season
         FROM matches m
         JOIN teams ht ON ht.id = m.home_team_id
@@ -63,7 +64,8 @@ def get_match(match_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT m.*, ht.name AS home_team, at.name AS away_team,
+        SELECT m.*, ht.name AS home_team, ht.logo_url AS home_logo,
+               at.name AS away_team, at.logo_url AS away_logo,
                l.name AS league, s.name AS season
         FROM matches m
         JOIN teams ht ON ht.id = m.home_team_id
