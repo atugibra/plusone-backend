@@ -84,9 +84,17 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
     conn = get_connection()
     cur = conn.cursor()
     try:
-        league_id = _get_league(cur, payload.league)
+        default_league_id = _get_league(cur, payload.league)
         team_cache = {}
         
+        # Helper to determine the correct league dynamically per row.
+        # This prevents team-corruption when batch syncing multi-league CSV files (like fixtures.csv)
+        def _resolve_league(row_obj):
+            row_league = row_obj.get("League") or row_obj.get("league")
+            if row_league and row_league != "Unknown League" and row_league != "Global Enrichment Sync":
+                return _get_league(cur, row_league)
+            return default_league_id
+            
         odds_count = 0
         injuries_count = 0
         clubelo_count = 0
@@ -98,8 +106,9 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                 away_name = row.get("AwayTeam") or row.get("Away")
                 if not home_name or not away_name: continue
                 
-                h_id = _get_team(cur, home_name, league_id, team_cache)
-                a_id = _get_team(cur, away_name, league_id, team_cache)
+                l_id = _resolve_league(row)
+                h_id = _get_team(cur, home_name, l_id, team_cache)
+                a_id = _get_team(cur, away_name, l_id, team_cache)
                 m_date = _parse_odds_date(row.get("Date"))
                 m_id = _find_match(cur, h_id, a_id, m_date)
                 
@@ -126,7 +135,8 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                 player = row.get("Player")
                 if not club or not player: continue
                 
-                t_id = _get_team(cur, club, league_id, team_cache)
+                l_id = _resolve_league(row)
+                t_id = _get_team(cur, club, l_id, team_cache)
                 cur.execute("""
                     INSERT INTO player_injuries (team_id, player_name, injury_type, return_date, raw_data)
                     VALUES (%s, %s, %s, %s, %s)
@@ -146,10 +156,12 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                 away = raw_data.get("Away") or raw_data.get("AwayTeam") or row.get("away")
                 target_date = raw_data.get("Date") or row.get("date")
                 
+                l_id = _resolve_league(row)
+                
                 # We may not have exact Elo numbers from the Fixtures endpoint, but we save the predicted Probs!
                 for tm, elo_val in [(home, raw_data.get("Home_Elo")), (away, raw_data.get("Away_Elo"))]:
                     if not tm or not target_date: continue
-                    t_id = _get_team(cur, tm, league_id, team_cache)
+                    t_id = _get_team(cur, tm, l_id, team_cache)
                     cur.execute("""
                         INSERT INTO team_clubelo (team_id, elo_date, elo, raw_data)
                         VALUES (%s, %s, %s, %s)
