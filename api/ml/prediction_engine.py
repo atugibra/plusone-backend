@@ -201,6 +201,25 @@ def recalibrate_from_log() -> dict:
 
 # ─── Prediction ───────────────────────────────────────────────────────────────
 
+import math
+
+def _poisson_prob(lam: float, k: int) -> float:
+    return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
+
+def _derive_markets(h_xg: float, a_xg: float) -> tuple:
+    p_h0 = _poisson_prob(h_xg, 0)
+    p_a0 = _poisson_prob(a_xg, 0)
+    btts_no = p_h0 + p_a0 - (p_h0 * p_a0)
+    btts_yes = 1.0 - btts_no
+    
+    u25 = 0.0
+    for i in range(3):
+        for j in range(3 - i):
+            u25 += _poisson_prob(h_xg, i) * _poisson_prob(a_xg, j)
+            
+    return round(btts_yes, 4), round(1.0 - u25, 4)
+
+
 def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) -> float:
     if venue == "home":
         attack_rate  = attacker_feats.get("home_gf_pg", 0.0)
@@ -308,12 +327,8 @@ def _outcome_from_probs(probs: dict) -> tuple:
     idx = int(max(range(3), key=lambda i: vals[i]))
     predicted = labels[idx]
 
-    import math
-    p = [max(v, 1e-10) for v in vals]
-    entropy     = -sum(x * math.log(x) for x in p)
-    max_entropy = -math.log(1.0 / 3.0)
-    score = round((1.0 - entropy / max_entropy) * 100, 1)
-    label = "High" if score >= 30 else ("Medium" if score >= 15 else "Low")
+    score = max(vals)
+    label = "High" if score >= 0.55 else ("Medium" if score >= 0.42 else "Low")
     return predicted, label, score
 
 
@@ -402,6 +417,8 @@ def predict_match(home_team_id: int, away_team_id: int,
                 "clean_sheet_rate": round(feats.get("clean_sheet_rate", 0.0), 3),
             }
 
+        btts_prob, o25_prob = _derive_markets(home_xg, away_xg)
+
         cal = get_calibrator()
         return {
             "match": {
@@ -431,6 +448,10 @@ def predict_match(home_team_id: int, away_team_id: int,
             "team_comparison": {
                 "home": cmp(home_feats, "home"),
                 "away": cmp(away_feats, "away"),
+            },
+            "markets": {
+                "btts_yes": btts_prob,
+                "over_2_5": o25_prob,
             },
             "h2h": {
                 "home_wins":  h2h["h2h_home_wins"],
@@ -565,6 +586,7 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
 
                 home_xg = _compute_venue_xg(home_feats, away_feats, "home")
                 away_xg = _compute_venue_xg(away_feats, home_feats, "away")
+                btts_prob, o25_prob = _derive_markets(home_xg, away_xg)
                 factors = _key_factors(home_feats, away_feats,
                                        fx["home_name"], fx["away_name"])
 
@@ -596,6 +618,10 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                         "home_xg":         home_xg,
                         "away_xg":         away_xg,
                         "predicted_score": f"{round(home_xg)}-{round(away_xg)}",
+                    },
+                    "markets": {
+                        "btts_yes": btts_prob,
+                        "over_2_5": o25_prob,
                     },
                     "key_factors": factors,
                     "model_info": {
