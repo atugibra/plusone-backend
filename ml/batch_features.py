@@ -630,21 +630,30 @@ def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_
         
         raw_json = row.get("raw_data") or {}
         raw_inner = raw_json.get("raw", {})
-        h_prob = d_prob = 0.0
+        h_prob = d_prob = a_prob = 0.0
         if raw_inner and "GD=0" in raw_inner:
             d_prob = _f(raw_inner.get("GD=0", 0.0))
-            hw_sum = sum(_f(raw_inner.get(f"GD={i}", 0.0)) for i in range(1, 10))
-            h_prob = hw_sum
-        return e, h_prob, d_prob
+            hw_sum_el = sum(_f(raw_inner.get(f"GD={i}", 0.0)) for i in range(1, 10))
+            h_prob = hw_sum_el
+            aw_sum_el = sum(_f(raw_inner.get(f"GD={i}", 0.0)) for i in range(-9, 0))
+            a_prob = aw_sum_el
+            
+            # Normalize just like standalone enrichment script
+            tot = h_prob + d_prob + a_prob
+            if tot > 0:
+                h_prob, d_prob, a_prob = h_prob/tot, d_prob/tot, a_prob/tot
 
-    h_elo, he_hw, he_dr = _get_elo(home_team_id)
-    a_elo, _, _         = _get_elo(away_team_id)
+        return e, h_prob, d_prob, a_prob
+
+    h_elo, he_hw, he_dr, _ = _get_elo(home_team_id)
+    a_elo, _, _, ae_aw     = _get_elo(away_team_id)
     
     feats["clubelo_home_rating"] = h_elo
     feats["clubelo_away_rating"] = a_elo
     feats["clubelo_gap"]         = h_elo - a_elo
     feats["clubelo_home_prob"]   = he_hw if he_hw > 0 else (hw_rate/hw_sum)
     feats["clubelo_draw_prob"]   = he_dr if he_dr > 0 else (style.get("league_draw_rate",0.25)/hw_sum)
+    feats["clubelo_away_prob"]   = ae_aw if ae_aw > 0 else (aw_rate/hw_sum)
     
     return feats
 
