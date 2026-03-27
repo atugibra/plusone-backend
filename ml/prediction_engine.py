@@ -346,12 +346,13 @@ def predict_match(home_team_id: int, away_team_id: int,
         season_name = ss_row["name"] if ss_row else ""
 
         cur.execute(
-            "SELECT id FROM matches WHERE home_team_id = %s AND away_team_id = %s"
+            "SELECT id, match_date FROM matches WHERE home_team_id = %s AND away_team_id = %s"
             " AND season_id = %s LIMIT 1",
             (home_team_id, away_team_id, season_id),
         )
         match_row = cur.fetchone()
         match_id_or_none = match_row["id"] if match_row else None
+        match_date_val   = match_row["match_date"] if match_row else None
 
         # ── 2. Build features via BATCH path (identical to training) ────────────
         # This guarantees the feature vector has the exact same shape / ordering
@@ -362,7 +363,8 @@ def predict_match(home_team_id: int, away_team_id: int,
         conn = None
 
         fv, feat_names, home_feats, away_feats, h2h = _batch_build(
-            cache, home_team_id, away_team_id, league_id, season_id
+            cache, home_team_id, away_team_id, league_id, season_id,
+            match_id=match_id_or_none, match_date=match_date_val
         )
 
         raw_proba = engine.predict_proba(fv)
@@ -547,7 +549,8 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                 sid  = fx["season_id"]
 
                 fv, feat_names, home_feats, away_feats, h2h = _build_match_features(
-                    cache, htid, atid, lid, sid
+                    cache, htid, atid, lid, sid,
+                    match_id=fx["id"], match_date=fx["match_date"]
                 )
                 raw_proba = eng.predict_proba(fv)
 
