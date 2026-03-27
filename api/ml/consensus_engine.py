@@ -31,9 +31,10 @@ log = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 DEFAULT_WEIGHTS = {
-    "dc":     0.45,
-    "ml":     0.35,
-    "legacy": 0.20,
+    "dc":         0.35,
+    "ml":         0.30,
+    "enrichment": 0.20,
+    "legacy":     0.15,
 }
 
 # Minimum graded rows required before we trust historical weights
@@ -143,16 +144,18 @@ def _fetch_dynamic_weights(cur) -> dict:
     try:
         cur.execute(f"""
             SELECT
-                COUNT(*)                                              AS total,
-                SUM(CASE WHEN dc_correct     THEN 1 ELSE 0 END)::float AS dc_correct,
-                SUM(CASE WHEN ml_correct     THEN 1 ELSE 0 END)::float AS ml_correct,
-                SUM(CASE WHEN legacy_correct THEN 1 ELSE 0 END)::float AS legacy_correct
+                COUNT(*)                                                 AS total,
+                SUM(CASE WHEN dc_correct         THEN 1 ELSE 0 END)::float AS dc_correct,
+                SUM(CASE WHEN ml_correct         THEN 1 ELSE 0 END)::float AS ml_correct,
+                SUM(CASE WHEN enrichment_correct THEN 1 ELSE 0 END)::float AS enrichment_correct,
+                SUM(CASE WHEN legacy_correct     THEN 1 ELSE 0 END)::float AS legacy_correct
             FROM prediction_log
             WHERE correct IS NOT NULL
               AND evaluated_at >= NOW() - INTERVAL '{ACCURACY_WINDOW_DAYS} days'
-              AND dc_predicted_outcome     IS NOT NULL
-              AND ml_predicted_outcome     IS NOT NULL
-              AND legacy_predicted_outcome IS NOT NULL
+              AND dc_predicted_outcome         IS NOT NULL
+              AND ml_predicted_outcome         IS NOT NULL
+              AND enrichment_predicted_outcome IS NOT NULL
+              AND legacy_predicted_outcome     IS NOT NULL
         """)
         row = cur.fetchone()
         if not row:
@@ -163,23 +166,25 @@ def _fetch_dynamic_weights(cur) -> dict:
             log.info("Consensus: only %d graded rows → using default weights", total)
             return DEFAULT_WEIGHTS.copy()
 
-        dc_acc     = float(row["dc_correct"]     or 0) / total
-        ml_acc     = float(row["ml_correct"]     or 0) / total
-        legacy_acc = float(row["legacy_correct"] or 0) / total
+        dc_acc     = float(row["dc_correct"]         or 0) / total
+        ml_acc     = float(row["ml_correct"]         or 0) / total
+        enr_acc    = float(row["enrichment_correct"] or 0) / total
+        legacy_acc = float(row["legacy_correct"]     or 0) / total
 
         # Accuracy directly becomes the unnormalised weight
-        weight_sum = dc_acc + ml_acc + legacy_acc
+        weight_sum = dc_acc + ml_acc + enr_acc + legacy_acc
         if weight_sum < 0.01:
             return DEFAULT_WEIGHTS.copy()
 
         weights = {
-            "dc":     round(dc_acc     / weight_sum, 4),
-            "ml":     round(ml_acc     / weight_sum, 4),
-            "legacy": round(legacy_acc / weight_sum, 4),
+            "dc":         round(dc_acc     / weight_sum, 4),
+            "ml":         round(ml_acc     / weight_sum, 4),
+            "enrichment": round(enr_acc    / weight_sum, 4),
+            "legacy":     round(legacy_acc / weight_sum, 4),
         }
         log.info(
-            "Consensus: dynamic weights from %d rows — DC=%.1f%% ML=%.1f%% Legacy=%.1f%%",
-            total, weights["dc"]*100, weights["ml"]*100, weights["legacy"]*100,
+            "Consensus: dynamic weights from %d rows — DC=%.1f%% ML=%.1f%% ENR=%.1f%% Legacy=%.1f%%",
+            total, weights["dc"]*100, weights["ml"]*100, weights["enrichment"]*100, weights["legacy"]*100,
         )
         return weights
 
@@ -190,15 +195,16 @@ def _fetch_dynamic_weights(cur) -> dict:
 
 # ─── Probability blending ─────────────────────────────────────────────────────
 
-def _blend(dc: dict, ml: dict, legacy: dict, weights: dict) -> dict:
-    """Weighted linear blend of three probability distributions."""
-    w_dc     = weights["dc"]
-    w_ml     = weights["ml"]
-    w_legacy = weights["legacy"]
+def _blend(dc: dict, ml: dict, enrichment: dict, legacy: dict, weights: dict) -> dict:
+    """Weighted linear blend of four probability distributions."""
+    w_dc     = weights.get("dc", 0.0)
+    w_ml     = weights.get("ml", 0.0)
+    w_enr    = weights.get("enrichment", 0.0)
+    w_legacy = weights.get("legacy", 0.0)
 
-    hw = (w_dc * dc["home_win"]  + w_ml * ml["home_win"]  + w_legacy * legacy["home_win"])
-    dr = (w_dc * dc["draw"]      + w_ml * ml["draw"]      + w_legacy * legacy["draw"])
-    aw = (w_dc * dc["away_win"]  + w_ml * ml["away_win"]  + w_legacy * legacy["away_win"])
+    hw = (w_dc * dc["home_win"] + w_ml * ml["home_win"] + w_enr * enrichment["home_win"] + w_legacy * legacy["home_win"])
+    dr = (w_dc * dc["draw"]     + w_ml * ml["draw"]     + w_enr * enrichment["draw"]     + w_legacy * legacy["draw"])
+    aw = (w_dc * dc["away_win"] + w_ml * ml["away_win"] + w_enr * enrichment["away_win"] + w_legacy * legacy["away_win"])
 
     total = hw + dr + aw or 1.0
     hw, dr, aw = hw / total, dr / total, aw / total
@@ -227,12 +233,17 @@ def _confidence_from_entropy(probs: dict) -> tuple:
     return score, label
 
 
-def _agreement_level(dc_out: str, ml_out: str, legacy_out: str) -> str:
-    outcomes = [dc_out, ml_out, legacy_out]
-    if len(set(outcomes)) == 1:
+def _agreement_level(dc_out: str, ml_out: str, enr_out: str, legacy_out: str) -> str:
+    outcomes = [dc_out, ml_out, enr_out, legacy_out]
+    unique = len(set(outcomes))
+    if unique == 1:
         return "full"
-    if len(set(outcomes)) == 2:
-        return "majority"
+    if unique == 2:
+        # Check if 3 engines agree (majority) vs 2-2 tie
+        from collections import Counter
+        counts = Counter(outcomes).values()
+        if max(counts) >= 3:
+            return "majority"
     return "split"
 
 
@@ -329,7 +340,40 @@ def run_consensus(
             expected_goals = {}
             weights["ml"] = 0.0
 
-        # ── 4. Run Legacy engine ──────────────────────────────────────────────
+        # ── 4. Run Enrichment engine ──────────────────────────────────────────
+        try:
+            from ml.enrichment_engine import predict_enrichment  # lazy import
+            
+            # Find exact match date if it exists
+            cur.execute("""
+                SELECT match_date FROM matches 
+                WHERE home_team_id = %s AND away_team_id = %s AND season_id = %s LIMIT 1
+            """, (home_team_id, away_team_id, season_id))
+            mr = cur.fetchone()
+            m_date = str(mr["match_date"]) if mr and mr["match_date"] else None
+            
+            enr_raw = predict_enrichment(home_team_id, away_team_id, m_date)
+            if "error" in enr_raw:
+                raise RuntimeError(enr_raw["error"])
+                
+            enr_probs = {
+                "home_win": float(enr_raw.get("home_win", 0.35)),
+                "draw":     float(enr_raw.get("draw",     0.30)),
+                "away_win": float(enr_raw.get("away_win", 0.35)),
+            }
+            s = sum(enr_probs.values()) or 1
+            enr_probs = {k: round(v / s, 4) for k, v in enr_probs.items()}
+            enr_outcome = enr_raw.get("predicted_outcome", "Home Win")
+            enr_features = enr_raw.get("_features", {})
+        except Exception as exc:
+            log.warning("Consensus: Enrichment engine error: %s", exc)
+            errors.append(f"enrichment: {exc}")
+            enr_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+            enr_outcome = "Home Win"
+            enr_features = {}
+            weights["enrichment"] = 0.0
+
+        # ── 5. Run Legacy engine ──────────────────────────────────────────────
         try:
             legacy_raw     = _run_legacy_engine(cur, home_team_id, away_team_id)
             legacy_probs   = {k: v for k, v in legacy_raw.items()
@@ -342,22 +386,22 @@ def run_consensus(
             legacy_outcome = "Home Win"
             weights["legacy"] = 0.0
 
-        # ── 5. Re-normalise weights if any engine failed ─────────────────────
+        # ── 6. Re-normalise weights if any engine failed ─────────────────────
         w_sum = sum(weights.values())
         if w_sum < 0.01:
             weights = DEFAULT_WEIGHTS.copy()
             w_sum = 1.0
         weights = {k: round(v / w_sum, 4) for k, v in weights.items()}
 
-        # ── 6. Blend ──────────────────────────────────────────────────────────
-        blended = _blend(dc_probs, ml_probs, legacy_probs, weights)
+        # ── 7. Blend ──────────────────────────────────────────────────────────
+        blended = _blend(dc_probs, ml_probs, enr_probs, legacy_probs, weights)
 
-        # ── 7. Consensus outcome + confidence ─────────────────────────────────
+        # ── 8. Consensus outcome + confidence ─────────────────────────────────
         import numpy as np  # lazy import (already imported above in DC block)
         idx = int(np.argmax([blended["home_win"], blended["draw"], blended["away_win"]]))
         consensus_outcome   = OUTCOME_LABELS[idx]
         confidence_score, confidence_label = _confidence_from_entropy(blended)
-        agreement = _agreement_level(dc_outcome, ml_outcome, legacy_outcome)
+        agreement = _agreement_level(dc_outcome, ml_outcome, enr_outcome, legacy_outcome)
 
         # ── 8. Simple market proxies from blended probs + xG ─────────────────
         home_xg = float(expected_goals.get("home_xg", 1.35))
@@ -401,6 +445,13 @@ def run_consensus(
                     "away_win":          ml_probs["away_win"],
                     "predicted_outcome": ml_outcome,
                 },
+                "enrichment": {
+                    "home_win":          enr_probs["home_win"],
+                    "draw":              enr_probs["draw"],
+                    "away_win":          enr_probs["away_win"],
+                    "predicted_outcome": enr_outcome,
+                    "diagnostics":       enr_features,
+                },
                 "legacy": {
                     "home_win":          legacy_probs["home_win"],
                     "draw":              legacy_probs["draw"],
@@ -420,9 +471,10 @@ def run_consensus(
             },
             # Individual engine picks — stored in prediction_log for grading
             "_engine_picks": {
-                "dc":     dc_outcome,
-                "ml":     ml_outcome,
-                "legacy": legacy_outcome,
+                "dc":         dc_outcome,
+                "ml":         ml_outcome,
+                "enrichment": enr_outcome,
+                "legacy":     legacy_outcome,
             },
             **({"_errors": errors} if errors else {}),
         }
