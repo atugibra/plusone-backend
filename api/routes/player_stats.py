@@ -22,7 +22,7 @@ def get_players(
         SELECT ps.id, ps.player_name, ps.nationality, ps.position,
                ps.age, ps.games, ps.games_starts, ps.minutes, ps.minutes_90s,
                ps.goals, ps.assists, ps.standard_stats,
-               t.name AS team, l.name AS league, s.name AS season
+               t.name AS team, t.logo_url AS logo_url, l.name AS league, s.name AS season
         FROM player_stats ps
         LEFT JOIN teams t ON t.id = ps.team_id
         LEFT JOIN leagues l ON l.id = t.league_id
@@ -59,7 +59,7 @@ def top_scorers(season_id: Optional[int] = None, league_id: Optional[int] = None
     cur = conn.cursor()
     query = """
         SELECT ps.player_name, ps.nationality, ps.position, ps.goals, ps.assists,
-               ps.games, ps.minutes_90s, t.name AS team, l.name AS league, s.name AS season
+               ps.games, ps.minutes_90s, t.name AS team, t.logo_url AS logo_url, l.name AS league, s.name AS season
         FROM player_stats ps
         LEFT JOIN teams t ON t.id = ps.team_id
         LEFT JOIN leagues l ON l.id = t.league_id

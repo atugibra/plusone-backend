@@ -62,6 +62,7 @@ def get_standings(league_id: Optional[int] = None, season_id: Optional[int] = No
     query = """
         SELECT ls.rank,
                t.name  AS team,
+               t.logo_url AS logo_url,
                l.name  AS league,
                l.id    AS league_id,
                s.name  AS season,

@@ -47,6 +47,10 @@ CFG = {
     "mc_simulations":       50_000,
     "ensemble_weights":     [0.45, 0.30, 0.25],
     "min_kelly_edge":       0.03,
+    # How many months of match history to use for DC training.
+    # 9 months ≈ 1 full football season.  Override via app_settings key
+    # 'dc_lookback_months' (integer, 1–120).  Increasing this gives more
+    # data but may dilute the time-decay weighting.
     "dc_lookback_months":   9,
 }
 
@@ -60,6 +64,10 @@ _dc_meta: dict = {}
 
 
 def _get_lookback_months() -> int:
+    """
+    Read dc_lookback_months from app_settings (allows live changes without
+    restarting the server). Falls back to CFG default (9 months).
+    """
     try:
         conn = get_connection()
         cur  = conn.cursor()
@@ -69,7 +77,8 @@ def _get_lookback_months() -> int:
         row = cur.fetchone()
         conn.close()
         if row and row["value"]:
-            return max(1, min(int(row["value"]), 120))
+            val = int(row["value"])
+            return max(1, min(val, 120))   # clamp to 1–120 months
     except Exception:
         pass
     return CFG["dc_lookback_months"]
@@ -490,8 +499,56 @@ class DCPredictor:
         home = self.team_names.get(home_team_id)
         away = self.team_names.get(away_team_id)
 
-        if not home or not away:
-            return {"error": f"Team ID {home_team_id} or {away_team_id} not found in DC model. Retrain required."}
+        # ── Graceful fallback for unknown team IDs ──────────────────────────────
+        # Teams that play in multiple leagues (e.g. "Chelsea eng" in UCL) may
+        # have a different ID than their domestic entry. We use their name if we
+        # can look it up from the DB, otherwise fall back to league-average params.
+        missing = []
+        if not home: missing.append(("home", home_team_id))
+        if not away: missing.append(("away", away_team_id))
+
+        if missing:
+            try:
+                conn = get_connection()
+                cur  = conn.cursor()
+                ids = [tid for _, tid in missing]
+                placeholders = ", ".join(["%s"] * len(ids))
+                cur.execute(f"SELECT id, name FROM teams WHERE id IN ({placeholders})", ids)
+                rows = {r["id"]: r["name"] for r in cur.fetchall()}
+                conn.close()
+                for side, tid in missing:
+                    resolved = rows.get(tid)
+                    if side == "home":
+                        home = resolved
+                    else:
+                        away = resolved
+            except Exception:
+                pass
+
+        # If we still don't have names, inject league-average model params
+        if not home:
+            home = f"__avg_{home_team_id}__"
+            if home not in self.dc.params and self.dc.fitted:
+                avg_atk = float(np.mean([v["attack"]  for v in self.dc.params.values() if isinstance(v, dict) and "attack" in v] or [0.0]))
+                avg_def = float(np.mean([v["defence"] for v in self.dc.params.values() if isinstance(v, dict) and "defence" in v] or [0.0]))
+                self.dc.params[home] = {"attack": avg_atk, "defence": avg_def}
+            self.elo.ratings.setdefault(home, CFG["elo_start"])
+            self.xg.team_xg_att.setdefault(home, self.xg.league_xg_avg)
+            self.xg.team_xg_def.setdefault(home, self.xg.league_xg_avg)
+        if not away:
+            away = f"__avg_{away_team_id}__"
+            if away not in self.dc.params and self.dc.fitted:
+                avg_atk = float(np.mean([v["attack"]  for v in self.dc.params.values() if isinstance(v, dict) and "attack" in v] or [0.0]))
+                avg_def = float(np.mean([v["defence"] for v in self.dc.params.values() if isinstance(v, dict) and "defence" in v] or [0.0]))
+                self.dc.params[away] = {"attack": avg_atk, "defence": avg_def}
+            self.elo.ratings.setdefault(away, CFG["elo_start"])
+            self.xg.team_xg_att.setdefault(away, self.xg.league_xg_avg)
+            self.xg.team_xg_def.setdefault(away, self.xg.league_xg_avg)
+
+        # Store resolved names for future calls
+        self.team_names[home_team_id] = home
+        self.team_names[away_team_id] = away
+        # ────────────────────────────────────────────────────────────────────────
 
         dc_pred  = self.dc.predict(home, away)
         elo_pred = self.elo.predict(home, away)

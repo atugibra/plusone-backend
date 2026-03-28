@@ -33,7 +33,8 @@ def head_to_head(team_id: int, opponent_id: int):
     cur = conn.cursor()
     cur.execute("""
         SELECT m.match_date, m.gameweek, s.name AS season, l.name AS league,
-               ht.name AS home_team, m.home_score, m.away_score, at.name AS away_team,
+               ht.name AS home_team, ht.logo_url AS home_logo, m.home_score, 
+               m.away_score, at.name AS away_team, at.logo_url AS away_logo,
                m.venue, m.score_raw
         FROM matches m
         JOIN teams ht ON ht.id = m.home_team_id

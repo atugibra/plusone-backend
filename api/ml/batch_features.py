@@ -700,7 +700,7 @@ def _build_team_features(cache: DataCache, team_id: int,
 # ─── Match feature vector (in-memory) ─────────────────────────────────────────
 
 def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int,
-                           league_id: int, season_id: int):
+                           league_id: int, season_id: int, match_id=None, match_date=None):
     """Same output format as feature_engineering.build_match_features()."""
     home_feats = _build_team_features(cache, home_team_id, league_id, season_id)
     away_feats = _build_team_features(cache, away_team_id, league_id, season_id)

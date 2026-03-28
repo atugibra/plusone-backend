@@ -31,10 +31,10 @@ log = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 DEFAULT_WEIGHTS = {
-    "dc":         0.35,
+    "dc":         0.45,
     "ml":         0.30,
-    "enrichment": 0.20,
-    "legacy":     0.15,
+    "enrichment": 0.00,
+    "legacy":     0.25,
 }
 
 # Minimum graded rows required before we trust historical weights
@@ -168,7 +168,7 @@ def _fetch_dynamic_weights(cur) -> dict:
 
         dc_acc     = float(row["dc_correct"]         or 0) / total
         ml_acc     = float(row["ml_correct"]         or 0) / total
-        enr_acc    = float(row["enrichment_correct"] or 0) / total
+        enr_acc    = 0.0
         legacy_acc = float(row["legacy_correct"]     or 0) / total
 
         # Accuracy directly becomes the unnormalised weight
@@ -342,7 +342,7 @@ def run_consensus(
 
         # ── 4. Run Enrichment engine ──────────────────────────────────────────
         try:
-            from ml.enrichment_engine import predict_enrichment  # lazy import
+            predict_enrichment = lambda *args: {"error": "Enrichment disabled by user"}  # lazy import
             
             # Find exact match date if it exists
             cur.execute("""
@@ -531,7 +531,7 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
         from ml.dc_engine import predict_dc_match
         
         # We need Enrichment features lazily
-        from ml.enrichment_engine import predict_enrichment
+        predict_enrichment = lambda *args: {"error": "Enrichment disabled by user"}
         
         results = []
         import numpy as np
