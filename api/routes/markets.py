@@ -141,8 +141,7 @@ def upcoming_dc_predictions(
     raw_results = upcoming_consensus_fast(league_id, limit)
     
     results = []
-    import threading
-    from api.routes.predictions import _log_prediction_to_db as _log_db
+    from .predictions import _log_prediction_to_db as _log_db
 
     for pred in raw_results:
         try:
