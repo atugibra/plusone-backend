@@ -193,18 +193,122 @@ def _fetch_dynamic_weights(cur) -> dict:
         return DEFAULT_WEIGHTS.copy()
 
 
+def _fetch_per_outcome_weights(cur) -> dict:
+    """
+    Query prediction_log for each engine's accuracy broken down by actual outcome
+    (Home Win / Draw / Away Win). Returns per-outcome weight dicts so the
+    consensus can trust whichever engine is historically best for each outcome.
+
+    Returns:
+        {
+          "Home Win": {"dc": w, "ml": w, "enrichment": w, "legacy": w},
+          "Draw":     {"dc": w, "ml": w, "enrichment": w, "legacy": w},
+          "Away Win": {"dc": w, "ml": w, "enrichment": w, "legacy": w},
+        }
+    Falls back to None if not enough data (caller uses global weights instead).
+    """
+    try:
+        cur.execute("""
+            SELECT
+                actual,
+                COUNT(*) FILTER (WHERE dc_correct     IS NOT NULL) AS dc_n,
+                SUM(CASE WHEN dc_correct     THEN 1 ELSE 0 END)::float AS dc_correct,
+                COUNT(*) FILTER (WHERE ml_correct     IS NOT NULL) AS ml_n,
+                SUM(CASE WHEN ml_correct     THEN 1 ELSE 0 END)::float AS ml_correct,
+                COUNT(*) FILTER (WHERE legacy_correct IS NOT NULL) AS leg_n,
+                SUM(CASE WHEN legacy_correct THEN 1 ELSE 0 END)::float AS leg_correct
+            FROM prediction_log
+            WHERE actual IS NOT NULL
+              AND evaluated_at >= NOW() - INTERVAL '90 days'
+            GROUP BY actual
+            HAVING COUNT(*) >= 10
+        """)
+        rows = cur.fetchall()
+        if not rows:
+            return None
+
+        result = {}
+        for row in rows:
+            outcome = str(row["actual"]).strip()  # "Home Win", "Draw", "Away Win"
+            dc_n,  ml_n,  leg_n  = int(row["dc_n"] or 0), int(row["ml_n"] or 0), int(row["leg_n"] or 0)
+            dc_acc  = float(row["dc_correct"]  or 0) / dc_n  if dc_n  > 0 else 0.0
+            ml_acc  = float(row["ml_correct"]  or 0) / ml_n  if ml_n  > 0 else 0.0
+            leg_acc = float(row["leg_correct"] or 0) / leg_n if leg_n > 0 else 0.0
+            enr_acc = 0.0   # enrichment engine not yet per-outcome tracked
+
+            # Apply a small floor (0.05) so no engine gets weight=0 and becomes
+            # completely silenced — we still want some diversity in the blend.
+            MIN_W = 0.05
+            dc_acc  = max(dc_acc,  MIN_W)
+            ml_acc  = max(ml_acc,  MIN_W)
+            leg_acc = max(leg_acc, MIN_W)
+            enr_acc = max(enr_acc, MIN_W)
+
+            wsum = dc_acc + ml_acc + leg_acc + enr_acc
+            result[outcome] = {
+                "dc":         round(dc_acc  / wsum, 4),
+                "ml":         round(ml_acc  / wsum, 4),
+                "enrichment": round(enr_acc / wsum, 4),
+                "legacy":     round(leg_acc / wsum, 4),
+            }
+
+        # Only return if we got all three outcome types
+        if len(result) == 3:
+            log.info(
+                "Consensus per-outcome weights — HW: DC=%.0f%% ML=%.0f%% Leg=%.0f%% | "
+                "D: DC=%.0f%% ML=%.0f%% Leg=%.0f%% | "
+                "AW: DC=%.0f%% ML=%.0f%% Leg=%.0f%%",
+                result.get("Home Win", {}).get("dc", 0)*100,
+                result.get("Home Win", {}).get("ml", 0)*100,
+                result.get("Home Win", {}).get("legacy", 0)*100,
+                result.get("Draw", {}).get("dc", 0)*100,
+                result.get("Draw", {}).get("ml", 0)*100,
+                result.get("Draw", {}).get("legacy", 0)*100,
+                result.get("Away Win", {}).get("dc", 0)*100,
+                result.get("Away Win", {}).get("ml", 0)*100,
+                result.get("Away Win", {}).get("legacy", 0)*100,
+            )
+            return result
+        return None
+    except Exception as exc:
+        log.warning("Consensus: per-outcome weight query failed (%s)", exc)
+        return None
+
+
 # ─── Probability blending ─────────────────────────────────────────────────────
 
-def _blend(dc: dict, ml: dict, enrichment: dict, legacy: dict, weights: dict) -> dict:
-    """Weighted linear blend of four probability distributions."""
-    w_dc     = weights.get("dc", 0.0)
-    w_ml     = weights.get("ml", 0.0)
-    w_enr    = weights.get("enrichment", 0.0)
-    w_legacy = weights.get("legacy", 0.0)
+def _blend(dc: dict, ml: dict, enrichment: dict, legacy: dict,
+           weights: dict, per_outcome_weights: dict = None) -> dict:
+    """
+    Weighted linear blend of four probability distributions.
+    If per_outcome_weights is provided, uses separate engine weights for each
+    outcome slot (Home Win / Draw / Away Win) so the best engine for each
+    outcome type is trusted most. Falls back to global weights otherwise.
+    """
+    def _slot(outcome_key: str, engine_key: str) -> float:
+        """Pick weight: per-outcome if available, else global."""
+        if per_outcome_weights and outcome_key in per_outcome_weights:
+            return per_outcome_weights[outcome_key].get(engine_key, 0.0)
+        return weights.get(engine_key, 0.0)
 
-    hw = (w_dc * dc["home_win"] + w_ml * ml["home_win"] + w_enr * enrichment["home_win"] + w_legacy * legacy["home_win"])
-    dr = (w_dc * dc["draw"]     + w_ml * ml["draw"]     + w_enr * enrichment["draw"]     + w_legacy * legacy["draw"])
-    aw = (w_dc * dc["away_win"] + w_ml * ml["away_win"] + w_enr * enrichment["away_win"] + w_legacy * legacy["away_win"])
+    hw = (
+        _slot("Home Win", "dc")         * dc["home_win"] +
+        _slot("Home Win", "ml")         * ml["home_win"] +
+        _slot("Home Win", "enrichment") * enrichment["home_win"] +
+        _slot("Home Win", "legacy")     * legacy["home_win"]
+    )
+    dr = (
+        _slot("Draw", "dc")         * dc["draw"] +
+        _slot("Draw", "ml")         * ml["draw"] +
+        _slot("Draw", "enrichment") * enrichment["draw"] +
+        _slot("Draw", "legacy")     * legacy["draw"]
+    )
+    aw = (
+        _slot("Away Win", "dc")         * dc["away_win"] +
+        _slot("Away Win", "ml")         * ml["away_win"] +
+        _slot("Away Win", "enrichment") * enrichment["away_win"] +
+        _slot("Away Win", "legacy")     * legacy["away_win"]
+    )
 
     total = hw + dr + aw or 1.0
     hw, dr, aw = hw / total, dr / total, aw / total
@@ -393,8 +497,12 @@ def run_consensus(
             w_sum = 1.0
         weights = {k: round(v / w_sum, 4) for k, v in weights.items()}
 
-        # ── 7. Blend ──────────────────────────────────────────────────────────
-        blended = _blend(dc_probs, ml_probs, enr_probs, legacy_probs, weights)
+        # ── 7. Per-outcome weights (trust best engine per outcome type) ────────
+        per_outcome_w = _fetch_per_outcome_weights(cur)
+
+        # ── 8. Blend ──────────────────────────────────────────────────────────
+        blended = _blend(dc_probs, ml_probs, enr_probs, legacy_probs, weights,
+                         per_outcome_weights=per_outcome_w)
 
         # ── 8. Consensus outcome + confidence ─────────────────────────────────
         import numpy as np  # lazy import (already imported above in DC block)

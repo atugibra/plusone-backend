@@ -196,6 +196,26 @@ def get_calibration():
 
 # ─── GET /api/performance/per-league ─────────────────────────────────────────
 
+def _league_tier(accuracy, evaluated) -> dict:
+    """
+    Return a confidence tier for a league based on accuracy + sample size.
+    Predictions are NEVER disabled — the tier is a UI signal only, letting
+    the models keep accumulating feedback data to graduate to higher tiers.
+
+    reliable   (green)  — accuracy >= 45% AND >= 15 evaluated
+    learning   (yellow) — accuracy 30-44% OR < 15 evaluated
+    unreliable (red)    — accuracy < 30% AND >= 10 evaluated
+    new        (grey)   — fewer than 10 evaluated (insufficient data)
+    """
+    if accuracy is None or evaluated is None or evaluated < 10:
+        return {"tier": "new",        "label": "Insufficient Data",    "color": "grey"}
+    if accuracy < 30:
+        return {"tier": "unreliable", "label": "Low Confidence",       "color": "red"}
+    if accuracy < 45 or evaluated < 15:
+        return {"tier": "learning",   "label": "Model Still Learning", "color": "yellow"}
+    return     {"tier": "reliable",   "label": "Reliable",             "color": "green"}
+
+
 @router.get("/per-league")
 def get_per_league():
     conn = get_connection()
@@ -228,14 +248,19 @@ def get_per_league():
         total     = int(row["total_predictions"])
         evaluated = int(row["evaluated"])
         metrics   = evaluated_metrics.get(league, {})
+        accuracy  = metrics.get("accuracy")
+        tier      = _league_tier(accuracy, evaluated)
         rows.append({
-            "league":      league,
-            "matches":     total,
-            "evaluated":   evaluated,
-            "accuracy":    metrics.get("accuracy"),
-            "brier":       metrics.get("brier"),
-            "rps":         metrics.get("rps"),
-            "has_results": evaluated > 0,
+            "league":          league,
+            "matches":         total,
+            "evaluated":       evaluated,
+            "accuracy":        accuracy,
+            "brier":           metrics.get("brier"),
+            "rps":             metrics.get("rps"),
+            "has_results":     evaluated > 0,
+            "confidence_tier": tier["tier"],
+            "tier_label":      tier["label"],
+            "tier_color":      tier["color"],
         })
 
     rows.sort(key=lambda x: (not x["has_results"], x.get("brier") or 999))
