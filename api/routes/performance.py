@@ -258,7 +258,9 @@ def get_confusion_matrix():
 
     probs, outcomes = _build_matrices(df)
     cm = MetricsEngine.confusion_matrix(probs, outcomes)
-    return {"n_predictions": len(df), "matrix": cm.to_dict(), "labels": ["Away Win", "Draw", "Home Win"]}
+    # orient='index' gives {row → {col: value}} which matches the frontend's
+    # matrix["Actual Away Win"]["Pred Home Win"] access pattern.
+    return {"n_predictions": len(df), "matrix": cm.to_dict(orient='index'), "labels": ["Away Win", "Draw", "Home Win"]}
 
 
 # ─── GET /api/performance/markets ────────────────────────────────────────────
