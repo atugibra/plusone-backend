@@ -601,6 +601,60 @@ class DCPredictor:
             key=lambda x: -x["elo"],
         )
 
+    # ── Live feedback calibration from prediction_log ──────────────────────────
+    def fit_calibrator_from_log(self) -> int:
+        """
+        Refit the DC ProbabilityCalibrator using real graded outcomes from
+        prediction_log (dc_correct column). This is how DC learns from mistakes.
+        Returns the number of samples used, or 0 if skipped.
+        """
+        try:
+            conn = get_connection()
+            cur  = conn.cursor()
+            cur.execute("""
+                SELECT home_win_prob, draw_prob, away_win_prob, actual
+                FROM prediction_log
+                WHERE dc_correct IS NOT NULL
+                  AND home_win_prob IS NOT NULL
+                  AND draw_prob     IS NOT NULL
+                  AND away_win_prob IS NOT NULL
+                  AND actual IS NOT NULL
+                ORDER BY evaluated_at DESC
+                LIMIT 500
+            """)
+            rows = cur.fetchall()
+            conn.close()
+        except Exception as exc:
+            log.warning("DC fit_calibrator_from_log: DB query failed: %s", exc)
+            return 0
+
+        OUTCOME_MAP = {"Home Win": 2, "Draw": 1, "Away Win": 0}
+        probs_list, labels_list = [], []
+        for r in rows:
+            outcome = OUTCOME_MAP.get(str(r["actual"]).strip())
+            if outcome is None:
+                continue
+            hw = float(r["home_win_prob"] or 0)
+            dr = float(r["draw_prob"]     or 0)
+            aw = float(r["away_win_prob"] or 0)
+            total = hw + dr + aw
+            if total < 0.01:
+                continue
+            # calibrator expects [p_aw, p_d, p_hw] order
+            probs_list.append([aw / total, dr / total, hw / total])
+            labels_list.append(outcome)
+
+        if len(probs_list) < 15:
+            log.debug("DC fit_calibrator_from_log: only %d samples (need 15), skipping.",
+                      len(probs_list))
+            return 0
+
+        probs = np.array(probs_list)
+        labels = np.array(labels_list)
+        self.calibrator.fit(probs, labels)
+        log.info("DC calibrator refitted from %d live prediction outcomes.", len(probs_list))
+        return len(probs_list)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SINGLETON API
@@ -635,6 +689,15 @@ def train_dc_model() -> dict:
             "elapsed_s":  elapsed,
         }
         log.info("DC model trained: %d matches, %.1fs", predictor.n_matches, elapsed)
+        # Apply live feedback calibration from prediction_log (dc_correct data)
+        # This overwrites the in-sample calibrator with real prediction outcomes.
+        try:
+            n_cal = predictor.fit_calibrator_from_log()
+            if n_cal:
+                _dc_meta["calibrator_samples"] = n_cal
+                log.info("DC live calibration applied on %d real outcomes.", n_cal)
+        except Exception as exc:
+            log.warning("DC live calibration after train failed: %s", exc)
         # — Persist to Supabase so the model survives redeploys —
         saved = save_to_db(predictor, name="dc_model")
         if saved:

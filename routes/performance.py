@@ -347,3 +347,104 @@ def get_market_accuracy():
         })
 
     return {"overall": overall, "by_league": by_league}
+
+
+# ─── GET /api/performance/engines ────────────────────────────────────────────
+
+@router.get("/engines")
+def get_engine_performance():
+    """
+    Per-engine accuracy breakdown from prediction_log.
+    Uses dc_correct, ml_correct, legacy_correct, and correct (consensus)
+    columns that are populated by do_evaluate_predictions().
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+    try:
+        # Overall per-engine counts
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE dc_correct     IS NOT NULL) AS dc_evaluated,
+                SUM(CASE WHEN dc_correct     THEN 1 ELSE 0 END)    AS dc_correct,
+                COUNT(*) FILTER (WHERE ml_correct     IS NOT NULL) AS ml_evaluated,
+                SUM(CASE WHEN ml_correct     THEN 1 ELSE 0 END)    AS ml_correct,
+                COUNT(*) FILTER (WHERE legacy_correct IS NOT NULL) AS leg_evaluated,
+                SUM(CASE WHEN legacy_correct THEN 1 ELSE 0 END)    AS leg_correct,
+                COUNT(*) FILTER (WHERE correct        IS NOT NULL) AS con_evaluated,
+                SUM(CASE WHEN correct        THEN 1 ELSE 0 END)    AS con_correct
+            FROM prediction_log
+        """)
+        r = cur.fetchone()
+
+        def _acc(correct, total):
+            c, t = int(correct or 0), int(total or 0)
+            return round(c / t * 100, 1) if t > 0 else None
+
+        overall = {
+            "dc":        {"evaluated": int(r["dc_evaluated"]  or 0), "correct": int(r["dc_correct"]  or 0), "accuracy_pct": _acc(r["dc_correct"],  r["dc_evaluated"])},
+            "ml":        {"evaluated": int(r["ml_evaluated"]  or 0), "correct": int(r["ml_correct"]  or 0), "accuracy_pct": _acc(r["ml_correct"],  r["ml_evaluated"])},
+            "legacy":    {"evaluated": int(r["leg_evaluated"] or 0), "correct": int(r["leg_correct"] or 0), "accuracy_pct": _acc(r["leg_correct"], r["leg_evaluated"])},
+            "consensus": {"evaluated": int(r["con_evaluated"] or 0), "correct": int(r["con_correct"] or 0), "accuracy_pct": _acc(r["con_correct"], r["con_evaluated"])},
+        }
+
+        # Per-outcome breakdown (Home Win / Draw / Away Win) for each engine
+        cur.execute("""
+            SELECT
+                actual,
+                SUM(CASE WHEN dc_correct     THEN 1 ELSE 0 END) AS dc_correct,
+                COUNT(*) FILTER (WHERE dc_correct IS NOT NULL)   AS dc_total,
+                SUM(CASE WHEN ml_correct     THEN 1 ELSE 0 END) AS ml_correct,
+                COUNT(*) FILTER (WHERE ml_correct IS NOT NULL)   AS ml_total,
+                SUM(CASE WHEN legacy_correct THEN 1 ELSE 0 END) AS leg_correct,
+                COUNT(*) FILTER (WHERE legacy_correct IS NOT NULL) AS leg_total,
+                SUM(CASE WHEN correct        THEN 1 ELSE 0 END) AS con_correct,
+                COUNT(*) FILTER (WHERE correct IS NOT NULL)      AS con_total
+            FROM prediction_log
+            WHERE actual IS NOT NULL
+            GROUP BY actual
+            ORDER BY actual
+        """)
+        by_outcome = []
+        for row in cur.fetchall():
+            act = row["actual"]
+            by_outcome.append({
+                "outcome":   act,
+                "dc":     {"correct": int(row["dc_correct"]  or 0), "total": int(row["dc_total"]  or 0), "accuracy_pct": _acc(row["dc_correct"],  row["dc_total"])},
+                "ml":     {"correct": int(row["ml_correct"]  or 0), "total": int(row["ml_total"]  or 0), "accuracy_pct": _acc(row["ml_correct"],  row["ml_total"])},
+                "legacy": {"correct": int(row["leg_correct"] or 0), "total": int(row["leg_total"] or 0), "accuracy_pct": _acc(row["leg_correct"], row["leg_total"])},
+                "consensus": {"correct": int(row["con_correct"] or 0), "total": int(row["con_total"] or 0), "accuracy_pct": _acc(row["con_correct"], row["con_total"])},
+            })
+
+        # Recent 30-day trend per engine
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE dc_correct IS NOT NULL)     AS dc_evaluated,
+                SUM(CASE WHEN dc_correct     THEN 1 ELSE 0 END)    AS dc_correct,
+                COUNT(*) FILTER (WHERE ml_correct IS NOT NULL)     AS ml_evaluated,
+                SUM(CASE WHEN ml_correct     THEN 1 ELSE 0 END)    AS ml_correct,
+                COUNT(*) FILTER (WHERE legacy_correct IS NOT NULL) AS leg_evaluated,
+                SUM(CASE WHEN legacy_correct THEN 1 ELSE 0 END)    AS leg_correct,
+                COUNT(*) FILTER (WHERE correct IS NOT NULL)        AS con_evaluated,
+                SUM(CASE WHEN correct        THEN 1 ELSE 0 END)    AS con_correct
+            FROM prediction_log
+            WHERE evaluated_at >= NOW() - INTERVAL '30 days'
+        """)
+        t = cur.fetchone()
+        last_30 = {
+            "dc":        {"evaluated": int(t["dc_evaluated"]  or 0), "correct": int(t["dc_correct"]  or 0), "accuracy_pct": _acc(t["dc_correct"],  t["dc_evaluated"])},
+            "ml":        {"evaluated": int(t["ml_evaluated"]  or 0), "correct": int(t["ml_correct"]  or 0), "accuracy_pct": _acc(t["ml_correct"],  t["ml_evaluated"])},
+            "legacy":    {"evaluated": int(t["leg_evaluated"] or 0), "correct": int(t["leg_correct"] or 0), "accuracy_pct": _acc(t["leg_correct"], t["leg_evaluated"])},
+            "consensus": {"evaluated": int(t["con_evaluated"] or 0), "correct": int(t["con_correct"] or 0), "accuracy_pct": _acc(t["con_correct"], t["con_evaluated"])},
+        }
+
+        return {
+            "overall":    overall,
+            "last_30":    last_30,
+            "by_outcome": by_outcome,
+        }
+    except Exception as e:
+        log.warning("get_engine_performance failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+

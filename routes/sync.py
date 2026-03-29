@@ -1,10 +1,14 @@
 import json
 import re
+import threading
+import logging
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from database import get_connection
 from routes.deps import require_admin
+
+_sync_log = logging.getLogger(__name__)
 
 def safe_num(val):
     """Safely convert FBref values to a number, returning None for non-numeric."""
@@ -80,6 +84,29 @@ def _auto_evaluate_predictions(conn) -> int:
         try: conn.rollback()
         except Exception: pass
         return 0
+
+
+def _auto_recalibrate_bg():
+    """
+    Fire-and-forget: refit the ML feedback calibrator from prediction_log.
+    Runs in a background daemon thread so the sync response is not delayed.
+    After calibration, also trigger DC live-calibration from dc_correct data.
+    """
+    try:
+        from ml.feedback_calibrator import recalibrate_with_feedback
+        recalibrate_with_feedback()
+        _sync_log.info("Auto-recalibrate (ML) completed after sync.")
+    except Exception as exc:
+        _sync_log.warning("Auto-recalibrate (ML) failed: %s", exc)
+    try:
+        from ml.dc_engine import get_dc_predictor
+        dc = get_dc_predictor()
+        if dc is not None and dc.fitted:
+            n = dc.fit_calibrator_from_log()
+            if n:
+                _sync_log.info("Auto-recalibrate (DC) completed on %d samples.", n)
+    except Exception as exc:
+        _sync_log.warning("Auto-recalibrate (DC) failed: %s", exc)
 
 class TableData(BaseModel):
     headers: List[str] = []
@@ -432,7 +459,11 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         conn.commit()
         # Auto-evaluate predictions whose matches just received scores
         evaluated = _auto_evaluate_predictions(conn)
-        return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "logos_updated": logos, "predictions_evaluated": evaluated}
+        # Auto-recalibrate both ML and DC engines if new grades came in
+        if evaluated > 0:
+            threading.Thread(target=_auto_recalibrate_bg, daemon=True,
+                             name="auto-recalibrate").start()
+        return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "logos_updated": logos, "predictions_evaluated": evaluated, "recalibration_triggered": evaluated > 0}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -454,7 +485,10 @@ def sync_fixtures(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         conn.commit()
         # Auto-evaluate predictions whose matches just received scores
         evaluated = _auto_evaluate_predictions(conn)
-        return {"success": True, "matches_inserted": inserted, "predictions_evaluated": evaluated}
+        if evaluated > 0:
+            threading.Thread(target=_auto_recalibrate_bg, daemon=True,
+                             name="auto-recalibrate").start()
+        return {"success": True, "matches_inserted": inserted, "predictions_evaluated": evaluated, "recalibration_triggered": evaluated > 0}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
