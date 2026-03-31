@@ -133,7 +133,7 @@ class EnsemblePredictor:
                 self.model, X_scaled, y, cv=skf,
                 scoring="accuracy",
                 params={"sample_weight": sample_weights},
-                n_jobs=-1,
+                n_jobs=1,  # n_jobs=-1 triggers sklearn parallel config warning
             )
         except (TypeError, ValueError):
             # sklearn < 1.4 uses fit_params= and raises ValueError/TypeError if params is passed
@@ -141,7 +141,7 @@ class EnsemblePredictor:
                 self.model, X_scaled, y, cv=skf,
                 scoring="accuracy",
                 fit_params={"sample_weight": sample_weights},
-                n_jobs=-1,
+                n_jobs=1,  # n_jobs=-1 triggers sklearn parallel config warning
             )
         self.cv_accuracy = float(np.mean(cv_scores))
 
