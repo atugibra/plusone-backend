@@ -410,7 +410,8 @@ class DCPredictor:
         self.mc          = MonteCarloEngine()
         self.blender     = EnsembleBlender()
         self.calibrator  = ProbabilityCalibrator()
-        self.team_names: dict = {}   # id → name
+        self.team_names:        dict = {}   # team_id → name
+        self.team_match_counts: dict = {}   # team_id → n completed matches seen in DC training
         self.fitted: bool = False
         self.n_matches: int = 0
 
@@ -461,10 +462,15 @@ class DCPredictor:
             log.warning("DCPredictor: not enough fixtures (%d). Skipping.", len(fixtures))
             return self
 
-        # Build team_id → name map
+        # Build team_id → name map AND per-team match counts
+        from collections import Counter
+        _counts: Counter = Counter()
         for _, r in fixtures.iterrows():
             self.team_names[r["home_team_id"]] = r["home_team"]
             self.team_names[r["away_team_id"]] = r["away_team"]
+            _counts[r["home_team_id"]] += 1
+            _counts[r["away_team_id"]] += 1
+        self.team_match_counts = dict(_counts)
 
         self.n_matches = len(fixtures)
         log.info("DCPredictor: fitting on %d matches…", self.n_matches)
@@ -555,12 +561,45 @@ class DCPredictor:
         xg_pred  = self.xg.predict(home, away)
         blended  = self.blender.blend(dc_pred, elo_pred, xg_pred)
 
+        exp_h = (dc_pred["exp_home_goals"] * 0.5 + xg_pred["exp_home_xg"] * 0.5)
+        exp_a = (dc_pred["exp_away_goals"] * 0.5 + xg_pred["exp_away_xg"] * 0.5)
+
+        # ── ClubElo confidence-weighted blend ────────────────────────────────────────
+        clubelo_probs = _fetch_clubelo_probs(home_team_id, away_team_id)
+        clubelo_w_dc  = 1.0
+        if clubelo_probs:
+            # Use the MINIMUM of each team's actual DC training match count.
+            # The team with less data is the bottleneck — if either team is unknown
+            # to DC (0 matches), DC gets no weight and ClubElo dominates fully.
+            # Threshold: 30 matches → DC fully trusted (w_dc = 1.0)
+            n_home = self.team_match_counts.get(home_team_id, 0)
+            n_away = self.team_match_counts.get(away_team_id, 0)
+            n_pair = min(n_home, n_away)   # bottleneck team drives the weight
+            clubelo_w_dc = float(min(1.0, n_pair / 30.0))
+            w_elo = 1.0 - clubelo_w_dc
+            log.debug(
+                "DC+ClubElo weights: home_n=%d away_n=%d n_pair=%d w_dc=%.2f",
+                n_home, n_away, n_pair, clubelo_w_dc
+            )
+
+            blended["home_win"] = clubelo_w_dc * blended["home_win"] + w_elo * clubelo_probs["home_win"]
+            blended["draw"]     = clubelo_w_dc * blended["draw"]     + w_elo * clubelo_probs["draw"]
+            blended["away_win"] = clubelo_w_dc * blended["away_win"] + w_elo * clubelo_probs["away_win"]
+            _s = blended["home_win"] + blended["draw"] + blended["away_win"] or 1.0
+            blended = {k: v / _s for k, v in blended.items()}
+
+            exp_h = clubelo_w_dc * exp_h + w_elo * clubelo_probs["lambda_home"]
+            exp_a = clubelo_w_dc * exp_a + w_elo * clubelo_probs["lambda_away"]
+
+            log.debug(
+                "DC+ClubElo blend: w_dc=%.2f home_win=%.3f draw=%.3f away_win=%.3f",
+                clubelo_w_dc, blended["home_win"], blended["draw"], blended["away_win"]
+            )
+
         raw_arr = np.array([[blended["away_win"], blended["draw"], blended["home_win"]]])
         cal_arr = self.calibrator.calibrate(raw_arr)[0]
         calibrated = {"away_win": float(cal_arr[0]), "draw": float(cal_arr[1]), "home_win": float(cal_arr[2])}
 
-        exp_h = (dc_pred["exp_home_goals"] * 0.5 + xg_pred["exp_home_xg"] * 0.5)
-        exp_a = (dc_pred["exp_away_goals"] * 0.5 + xg_pred["exp_away_xg"] * 0.5)
         mc_results = self.mc.simulate(exp_h, exp_a)
 
         probs = np.array([calibrated["home_win"], calibrated["draw"], calibrated["away_win"]])
@@ -579,6 +618,7 @@ class DCPredictor:
                 "dixon_coles": {k: round(v, 4) for k, v in dc_pred.items() if isinstance(v, float)},
                 "elo":         {k: round(v, 4) if isinstance(v, float) else v for k, v in elo_pred.items()},
                 "xg":          {k: round(v, 4) for k, v in xg_pred.items() if isinstance(v, float)},
+                "clubelo":     clubelo_probs or {},
             },
             "blended":    {k: round(v, 4) for k, v in blended.items()},
             "calibrated": {k: round(v, 4) for k, v in calibrated.items()},
@@ -588,8 +628,10 @@ class DCPredictor:
             "exp_home_goals": round(exp_h, 2),
             "exp_away_goals": round(exp_a, 2),
             "model_info": {
-                "n_trained_on": _dc_meta.get("n_matches", 0),
-                "trained_at":   _dc_meta.get("trained_at"),
+                "n_trained_on":  _dc_meta.get("n_matches", 0),
+                "trained_at":    _dc_meta.get("trained_at"),
+                "clubelo_w_dc":  round(clubelo_w_dc, 3),
+                "clubelo_found": clubelo_probs is not None,
             }
         }
 
@@ -654,6 +696,88 @@ class DCPredictor:
         self.calibrator.fit(probs, labels)
         log.info("DC calibrator refitted from %d live prediction outcomes.", len(probs_list))
         return len(probs_list)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLUBELO INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_clubelo_probs(home_team_id: int, away_team_id: int) -> dict | None:
+    """
+    Fetch ClubElo score-probability distribution for a specific fixture.
+    Queries team_clubelo table (two rows per match, one per team).
+    raw_data structure: {"raw": {"Home":"...","Away":"...","GD=0":"0.29",...,"R:0-0":"0.09",...}}
+    Returns 1X2 probs + implied lambda, or None if not found.
+    """
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+
+        ids = [home_team_id, away_team_id]
+        cur.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)", ids)
+        name_map = {r["id"]: r["name"] for r in cur.fetchall()}
+        home_name = name_map.get(home_team_id, "")
+        away_name = name_map.get(away_team_id, "")
+
+        raw_row = None
+
+        if home_name:
+            cur.execute("""
+                SELECT raw_data FROM team_clubelo
+                WHERE team_id = %s
+                  AND elo_date >= CURRENT_DATE - INTERVAL '7 days'
+                  AND (raw_data->'raw'->>'Away' ILIKE %s OR raw_data->>'Away' ILIKE %s)
+                ORDER BY elo_date DESC LIMIT 1
+            """, (home_team_id, f"%{away_name}%", f"%{away_name}%"))
+            raw_row = cur.fetchone()
+
+        if not raw_row and away_name:
+            cur.execute("""
+                SELECT raw_data FROM team_clubelo
+                WHERE team_id = %s
+                  AND elo_date >= CURRENT_DATE - INTERVAL '7 days'
+                  AND (raw_data->'raw'->>'Home' ILIKE %s OR raw_data->>'Home' ILIKE %s)
+                ORDER BY elo_date DESC LIMIT 1
+            """, (away_team_id, f"%{home_name}%", f"%{home_name}%"))
+            raw_row = cur.fetchone()
+
+        conn.close()
+        if not raw_row:
+            return None
+
+        rd = raw_row["raw_data"]
+        if isinstance(rd, str):
+            import json as _json
+            rd = _json.loads(rd)
+        inner = rd.get("raw", rd)
+
+        def _f(key):
+            v = inner.get(key)
+            try: return float(v) if v is not None else 0.0
+            except (TypeError, ValueError): return 0.0
+
+        p_hw = _f("GD=1") + _f("GD=2") + _f("GD=3") + _f("GD=4") + _f("GD=5") + _f("GD>5")
+        p_d  = _f("GD=0")
+        p_aw = _f("GD=-1") + _f("GD=-2") + _f("GD=-3") + _f("GD=-4") + _f("GD=-5") + _f("GD<-5")
+        total = p_hw + p_d + p_aw or 1.0
+        p_hw /= total; p_d /= total; p_aw /= total
+
+        lambda_h = sum(i * _f(f"R:{i}-{j}") for i in range(7) for j in range(7))
+        lambda_a = sum(j * _f(f"R:{i}-{j}") for i in range(7) for j in range(7))
+        lambda_h = max(lambda_h, 0.5)
+        lambda_a = max(lambda_a, 0.5)
+
+        if p_hw + p_d + p_aw < 0.5:
+            return None
+
+        return {
+            "home_win": round(p_hw, 4), "draw": round(p_d, 4), "away_win": round(p_aw, 4),
+            "lambda_home": round(lambda_h, 3), "lambda_away": round(lambda_a, 3),
+            "source": "clubelo"
+        }
+    except Exception as exc:
+        log.debug("_fetch_clubelo_probs: %s", exc)
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
