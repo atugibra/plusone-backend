@@ -206,7 +206,15 @@ def _log_prediction_to_db(
     conn = None
     try:
         match_info = result.get("match", {})
-        probs      = result.get("probabilities", {})
+
+        # Probabilities: ML engine → result["probabilities"]
+        #                Consensus  → result["consensus"] (home_win/draw/away_win)
+        _cons = result.get("consensus") or {}
+        probs = result.get("probabilities") or {
+            "home_win": _cons.get("home_win"),
+            "draw":     _cons.get("draw"),
+            "away_win": _cons.get("away_win"),
+        }
 
         home_team    = match_info.get("home_team")    or result.get("home_team")
         away_team    = match_info.get("away_team")    or result.get("away_team")

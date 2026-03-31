@@ -162,18 +162,24 @@ def do_evaluate_predictions(conn) -> int:
               )
         """)
 
-        # 1b. Fallback: ILIKE fuzzy match for rows still without a match_id
-        #     (handles "Manchester City" vs "Manchester City FC" etc.)
+        # 1b. Fallback: bidirectional ILIKE fuzzy match for rows still without a match_id
+        #     Handles both "Man City" → "Manchester City" AND "Manchester City" → "Man City FC"
         cur.execute("""
             UPDATE prediction_log pl
             SET match_id = (
                 SELECT m.id FROM matches m
                 JOIN teams ht ON ht.id = m.home_team_id
                 JOIN teams at ON at.id = m.away_team_id
-                WHERE ht.name ILIKE '%' || pl.home_team || '%'
-                  AND at.name ILIKE '%' || pl.away_team || '%'
-                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
-                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+                WHERE (
+                    ht.name ILIKE '%' || pl.home_team || '%'
+                    OR pl.home_team ILIKE '%' || ht.name || '%'
+                )
+                  AND (
+                    at.name ILIKE '%' || pl.away_team || '%'
+                    OR pl.away_team ILIKE '%' || at.name || '%'
+                )
+                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '14 days')
+                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '14 days')
                   AND NOT EXISTS (
                       SELECT 1 FROM prediction_log ex
                       WHERE ex.match_id = m.id AND ex.id != pl.id
@@ -185,10 +191,16 @@ def do_evaluate_predictions(conn) -> int:
                 SELECT 1 FROM matches m
                 JOIN teams ht ON ht.id = m.home_team_id
                 JOIN teams at ON at.id = m.away_team_id
-                WHERE ht.name ILIKE '%' || pl.home_team || '%'
-                  AND at.name ILIKE '%' || pl.away_team || '%'
-                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
-                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
+                WHERE (
+                    ht.name ILIKE '%' || pl.home_team || '%'
+                    OR pl.home_team ILIKE '%' || ht.name || '%'
+                )
+                  AND (
+                    at.name ILIKE '%' || pl.away_team || '%'
+                    OR pl.away_team ILIKE '%' || at.name || '%'
+                )
+                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '14 days')
+                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '14 days')
                   AND NOT EXISTS (
                       SELECT 1 FROM prediction_log ex
                       WHERE ex.match_id = m.id AND ex.id != pl.id
