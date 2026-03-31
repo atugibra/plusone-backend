@@ -21,27 +21,100 @@ def safe_num(val):
     try: return float(val)
     except: return None
 
+
+# ClubElo uses 2-4 char country/league codes; map each to the canonical full name
+# used by FBref so we don't create duplicate league rows.
+CLUBELO_LEAGUE_MAP = {
+    # Top divisions
+    "Aut": "Austrian Bundesliga",
+    "Bel": "Belgian Pro League",
+    "Bul": "Bulgarian First League",
+    "Cro": "Croatian Football League",
+    "Cze": "Czech First League",
+    "Den": "Danish Superliga",
+    "Eng": "Premier League",
+    "Fra": "Ligue 1",
+    "Ger": "Bundesliga",
+    "Esp": "La Liga",
+    "Gre": "Super League Greece",
+    "Hun": "Hungarian OTP Bank Liga",
+    "Ita": "Serie A",
+    "Ned": "Eredivisie",
+    "Por": "Primeira Liga",
+    "Rus": "Russian Premier League",
+    "Sco": "Scottish Premiership",
+    "Srb": "Serbian SuperLiga",
+    "Sui": "Swiss Super League",
+    "Tur": "\u00dcber Lig",
+    "Ukr": "Ukrainian Premier League",
+    # Second divisions
+    "Eng2": "Championship",
+    "Ger2": "2. Bundesliga",
+    "Esp2": "La Liga 2",
+    "Ita2": "Serie B",
+    "Fra2": "Ligue 2",
+    "Ned2": "Eerste Divisie",
+    "Por2": "Liga Portugal 2",
+    "Sco2": "Scottish Championship",
+    # European / continental
+    "UCL":  "UEFA Champions League",
+    "UEL":  "UEFA Europa League",
+    "UECL": "UEFA Europa Conference League",
+}
+
+
 def _get_league(cur, name: str):
-    cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (name.strip(),))
+    """Resolve a league name (including ClubElo short codes) to a leagues.id.
+    Short codes are mapped to full names to avoid duplicate league rows.
+    """
+    raw = name.strip()
+    # Resolve ClubElo short code to its full canonical name
+    canonical = CLUBELO_LEAGUE_MAP.get(raw, raw)
+
+    # 1. Exact match (case-insensitive)
+    cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (canonical,))
     res = cur.fetchone()
-    if res: return res["id"]
-    cur.execute("INSERT INTO leagues (name) VALUES (%s) RETURNING id", (name.title().strip(),))
+    if res:
+        return res["id"]
+
+    # 2. Partial keyword match: helps when FBref used a slightly different spelling
+    #    e.g. canonical="Austrian Bundesliga", DB has "Austrian Football Bundesliga"
+    keyword = canonical.split()[0]  # use the most distinctive first word
+    if len(keyword) > 3:  # skip very short words like 'La', 'De'
+        cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (f"%{keyword}%",))
+        res = cur.fetchone()
+        if res:
+            return res["id"]
+
+    # 3. Insert with canonical full name (never insert a bare short code)
+    cur.execute("INSERT INTO leagues (name) VALUES (%s) RETURNING id", (canonical,))
     return cur.fetchone()["id"]
 
+
 def _get_team(cur, name: str, league_id: int, team_cache: dict):
+    clean = name.strip()
     # In-memory deduplication during massive sync batches
-    cache_key = (name.lower().strip(), league_id)
+    cache_key = (clean.lower(), league_id)
     if cache_key in team_cache:
         return team_cache[cache_key]
 
-    # Primitive mapping, assumes exact or subset matching will be handled by data normalizers later
-    cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (name.strip(), league_id))
+    # 1. Exact match within league
+    cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (clean, league_id))
     res = cur.fetchone()
     if res:
         team_cache[cache_key] = res["id"]
         return res["id"]
-        
-    cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (name.strip(), league_id))
+
+    # 2. Cross-league fallback: team may be registered under a domestic league
+    #    but also appear in enrichment data for UCL / Europa etc.
+    cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (clean,))
+    res = cur.fetchone()
+    if res:
+        team_cache[cache_key] = res["id"]
+        return res["id"]
+
+    # 3. Genuinely new team — insert
+    cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (clean, league_id))
     new_id = cur.fetchone()["id"]
     team_cache[cache_key] = new_id
     return new_id

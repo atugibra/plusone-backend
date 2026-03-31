@@ -321,12 +321,45 @@ def get_or_create_season(cur, name):
     return cur.fetchone()["id"]
 
 
+def _normalize_fbref_team_name(name: str) -> str:
+    """
+    FBref prefixes UEFA team names with a 2-3 char country code:
+      'eng Arsenal'    -> 'Arsenal'  (own-stats row)
+      'eng vs Arsenal' -> 'Arsenal'  (opponent-stats row)
+    Also strips plain 'vs Arsenal' domestic prefix.
+    """
+    s = name.strip()
+    # "cc vs TeamName" or "cc  vs  TeamName"
+    m = re.match(r'^[a-z]{2,3}\s+vs\s+(.+)$', s)
+    if m:
+        return m.group(1).strip()
+    # "cc TeamName"
+    m = re.match(r'^[a-z]{2,3}\s+(.+)$', s)
+    if m:
+        return m.group(1).strip()
+    # "vs TeamName" (domestic opponent row)
+    if s.startswith("vs "):
+        return s[3:].strip()
+    return s
+
+
 def get_or_create_team(cur, name, league_id):
-    clean = safe_text(name) or name.strip()
+    raw = safe_text(name) or name.strip()
+    clean = _normalize_fbref_team_name(raw)
+    if not clean:
+        return None
+    # 1. Preferred: exact match within this league
     cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (clean, league_id))
     row = cur.fetchone()
     if row:
         return row["id"]
+    # 2. Cross-league fallback: UEFA teams live under their domestic league_id
+    #    e.g. Arsenal is stored under Premier League but also appears in UCL fixtures
+    cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (clean,))
+    row = cur.fetchone()
+    if row:
+        return row["id"]
+    # 3. Brand-new team — insert with clean name
     cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (clean, league_id))
     return cur.fetchone()["id"]
 
@@ -608,9 +641,11 @@ def _insert_squad_stats(cur, league_id, season_id, stats_rows):
         team_raw = safe_text(row.get("team", ""))
         if not team_raw:
             continue
-        split = "against" if team_raw.startswith("vs ") else "for"
-        team_name = team_raw[3:].strip() if split == "against" else team_raw
-        team_id = get_or_create_team(cur, team_name, league_id)
+        # Detect FBref "against" split — handles both domestic ("vs Arsenal")
+        # and UEFA-prefixed ("eng vs Arsenal") patterns
+        is_against = team_raw.startswith("vs ") or bool(re.match(r'^[a-z]{2,3}\s+vs\s+', team_raw))
+        split = "against" if is_against else "for"
+        team_id = get_or_create_team(cur, team_raw, league_id)  # normalization happens inside
         cur.execute("""
             INSERT INTO team_squad_stats
                 (team_id, league_id, season_id, split, players_used, avg_age, possession,
