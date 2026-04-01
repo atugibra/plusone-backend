@@ -548,7 +548,7 @@ def run_consensus(
         home_xg = float(expected_goals.get("home_xg", 1.35))
         away_xg = float(expected_goals.get("away_xg", 1.10))
         try:
-            _calc, _blend, _bets, _ovr = _get_market_calculator()
+            _calc, _mkt_blend, _bets, _ovr = _get_market_calculator()
             _fetch_pmw = _get_market_weights()
 
             # Apply league xG bias correction before computing markets
@@ -568,7 +568,7 @@ def run_consensus(
             per_mkt_w = _fetch_pmw(cur, _w3)
 
             # Blend
-            consensus_markets = _blend(
+            consensus_markets = _mkt_blend(
                 {"dc": dc_markets, "ml": ml_markets, "legacy": leg_markets},
                 _w3, per_mkt_w,
             )
@@ -706,11 +706,11 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
 
         # Load market helpers once for the whole batch
         try:
-            _calc, _blend, _bets, _ovr = _get_market_calculator()
+            _calc, _mkt_blend, _bets, _ovr = _get_market_calculator()
             _fetch_pmw = _get_market_weights()
             _recal     = _get_recalibrator()
         except Exception:
-            _calc = _blend = _bets = _ovr = _fetch_pmw = _recal = None
+            _calc = _mkt_blend = _bets = _ovr = _fetch_pmw = _recal = None
 
         results = []
         import numpy as np
@@ -823,7 +823,7 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
                     ml_mkts  = _ovr(_calc(home_xg,  away_xg),  ml_probs)
                     leg_mkts = _ovr(_calc(leg_xg_h, leg_xg_a), legacy_probs)
                     per_mkt_w    = _fetch_pmw(cur, _w3)
-                    fx_markets   = _blend({"dc": dc_mkts, "ml": ml_mkts, "legacy": leg_mkts}, _w3, per_mkt_w)
+                    fx_markets   = _mkt_blend({"dc": dc_mkts, "ml": ml_mkts, "legacy": leg_mkts}, _w3, per_mkt_w)
                     if _recal and _recal.is_fitted:
                         fx_markets = _recal.calibrate(fx_markets, engine="consensus", league_id=fx.get("league_id"))
                     fx_best_bets = _bets(fx_markets, fx["home_name"], fx["away_name"])
