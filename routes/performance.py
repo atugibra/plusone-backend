@@ -293,87 +293,172 @@ def get_confusion_matrix():
 @router.get("/markets")
 def get_market_accuracy():
     """
-    Market accuracy: BTTS and Over 2.5 graded performance.
-    Only rows where btts_correct or over_2_5_correct have been filled
-    (via /api/prediction-log/evaluate) are included.
+    Full per-market, per-engine accuracy breakdown.
+    Uses prediction_markets_log when graded rows exist;
+    falls back to legacy prediction_log BTTS/O2.5 columns.
     """
-    conn = get_connection()
-    cur  = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT
-                league,
-                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)         AS btts_total,
-                SUM(CASE WHEN btts_correct      THEN 1 ELSE 0 END)       AS btts_correct,
-                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL)     AS over25_total,
-                SUM(CASE WHEN over_2_5_correct  THEN 1 ELSE 0 END)       AS over25_correct,
-                AVG(home_xg)  FILTER (WHERE home_xg IS NOT NULL)         AS avg_home_xg,
-                AVG(away_xg)  FILTER (WHERE away_xg IS NOT NULL)         AS avg_away_xg,
-                AVG(btts_yes) FILTER (WHERE btts_yes IS NOT NULL)        AS avg_btts_prob,
-                AVG(over_2_5) FILTER (WHERE over_2_5 IS NOT NULL)        AS avg_over25_prob
-            FROM prediction_log
-            GROUP BY league
-            ORDER BY btts_total DESC NULLS LAST
-        """)
-        rows = cur.fetchall()
+    _MARKET_META = {
+        "home_win":          "Home Win",
+        "draw":              "Draw",
+        "away_win":          "Away Win",
+        "dc_1x":             "Double Chance 1X",
+        "dc_x2":             "Double Chance X2",
+        "dc_12":             "Double Chance 12",
+        "btts_yes":          "BTTS Yes",
+        "btts_no":           "BTTS No",
+        "over_1_5":          "Over 1.5",
+        "over_2_5":          "Over 2.5",
+        "over_3_5":          "Over 3.5",
+        "under_2_5":         "Under 2.5",
+        "under_3_5":         "Under 3.5",
+        "btts_yes_over_2_5": "BTTS Yes + Over 2.5",
+        "home_over_1_5":     "Home Over 1.5",
+        "away_over_1_5":     "Away Over 1.5",
+    }
 
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)     AS btts_total,
-                SUM(CASE WHEN btts_correct      THEN 1 ELSE 0 END)   AS btts_correct,
-                COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL) AS over25_total,
-                SUM(CASE WHEN over_2_5_correct  THEN 1 ELSE 0 END)   AS over25_correct,
-                AVG(home_xg) FILTER (WHERE home_xg IS NOT NULL)      AS avg_home_xg,
-                AVG(away_xg) FILTER (WHERE away_xg IS NOT NULL)      AS avg_away_xg
-            FROM prediction_log
-        """)
-        totals = cur.fetchone()
-    finally:
-        conn.close()
+    def _acc(correct, total):
+        c, t = float(correct or 0), int(total or 0)
+        return round(c / t * 100, 1) if t > 0 else None
+
+    def _tier(acc_pct, n):
+        if n < 10:         return "learning"
+        if acc_pct >= 60:  return "reliable"
+        if acc_pct >= 45:  return "learning"
+        return "unreliable"
 
     def _pct(correct, total):
         return round(int(correct or 0) / int(total) * 100, 1) if total and int(total) > 0 else None
 
-    overall = {}
-    if totals:
-        bt = int(totals["btts_total"]   or 0)
-        ot = int(totals["over25_total"] or 0)
-        overall = {
-            "btts": {
-                "total":        bt,
-                "correct":      int(totals["btts_correct"]  or 0),
-                "accuracy_pct": _pct(totals["btts_correct"],  bt),
-            },
-            "over_2_5": {
-                "total":        ot,
-                "correct":      int(totals["over25_correct"] or 0),
-                "accuracy_pct": _pct(totals["over25_correct"], ot),
-            },
-            "avg_home_xg": round(float(totals["avg_home_xg"] or 0), 2),
-            "avg_away_xg": round(float(totals["avg_away_xg"] or 0), 2),
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    try:
+        # Check if new table has graded data
+        total_graded = 0
+        try:
+            cur.execute("SELECT COUNT(*) AS n FROM prediction_markets_log WHERE evaluated_at IS NOT NULL")
+            total_graded = int((cur.fetchone() or {}).get("n", 0))
+        except Exception:
+            pass
+
+        if total_graded == 0:
+            # Legacy fallback
+            try:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE btts_correct IS NOT NULL)     AS bt,
+                        SUM(CASE WHEN btts_correct THEN 1 ELSE 0 END)        AS bc,
+                        COUNT(*) FILTER (WHERE over_2_5_correct IS NOT NULL) AS ot,
+                        SUM(CASE WHEN over_2_5_correct THEN 1 ELSE 0 END)    AS oc
+                    FROM prediction_log
+                """)
+                t = cur.fetchone()
+                bt = int(t["bt"] or 0) if t else 0
+                ot = int(t["ot"] or 0) if t else 0
+                return {
+                    "total_graded": 0, "legacy_data": True,
+                    "markets": {
+                        "btts_yes": {"label": "BTTS Yes", "total": bt, "consensus": {"accuracy_pct": _pct(t["bc"], bt) if t else None}},
+                        "over_2_5": {"label": "Over 2.5", "total": ot, "consensus": {"accuracy_pct": _pct(t["oc"], ot) if t else None}},
+                    },
+                    "league_rankings": {}, "summary": {},
+                }
+            except Exception:
+                return {"total_graded": 0, "markets": {}, "league_rankings": {}, "summary": {}}
+
+        # Full market accuracy from prediction_markets_log
+        markets_out: dict = {}
+        for mkt_key, mkt_label in _MARKET_META.items():
+            try:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE grades ? %(mk)s)                              AS n,
+                        SUM((grades->%(mk)s->>'consensus')::boolean::int)::float             AS cons_c,
+                        AVG((brier_scores->%(mk)s->>'consensus')::float)                     AS cons_b,
+                        COUNT(*) FILTER (WHERE grades->%(mk)s->>'dc' IS NOT NULL)            AS dc_n,
+                        SUM((grades->%(mk)s->>'dc')::boolean::int)::float                    AS dc_c,
+                        AVG((brier_scores->%(mk)s->>'dc')::float)                            AS dc_b,
+                        COUNT(*) FILTER (WHERE grades->%(mk)s->>'ml' IS NOT NULL)            AS ml_n,
+                        SUM((grades->%(mk)s->>'ml')::boolean::int)::float                    AS ml_c,
+                        AVG((brier_scores->%(mk)s->>'ml')::float)                            AS ml_b,
+                        COUNT(*) FILTER (WHERE grades->%(mk)s->>'legacy' IS NOT NULL)        AS leg_n,
+                        SUM((grades->%(mk)s->>'legacy')::boolean::int)::float                AS leg_c,
+                        AVG((brier_scores->%(mk)s->>'legacy')::float)                        AS leg_b
+                    FROM prediction_markets_log
+                    WHERE evaluated_at IS NOT NULL AND grades ? %(mk)s
+                """, {"mk": mkt_key})
+                r = cur.fetchone()
+                if not r or not r["n"]:
+                    continue
+                n = int(r["n"] or 0)
+                best_eng, best_acc = "consensus", _acc(r["cons_c"], n) or 0
+                eng_stats = {}
+                for eng, cor, bri, dn in [
+                    ("consensus", "cons_c", "cons_b", "n"),
+                    ("dc",        "dc_c",   "dc_b",   "dc_n"),
+                    ("ml",        "ml_c",   "ml_b",   "ml_n"),
+                    ("legacy",    "leg_c",  "leg_b",  "leg_n"),
+                ]:
+                    en  = int(r[dn] or 0)
+                    acc = _acc(r[cor], en)
+                    eng_stats[eng] = {"n": en, "accuracy_pct": acc,
+                                      "avg_brier": round(float(r[bri] or 0), 4) if r[bri] else None}
+                    if acc is not None and acc > best_acc:
+                        best_acc, best_eng = acc, eng
+                markets_out[mkt_key] = {"label": mkt_label, "total": n,
+                                        "best_engine": best_eng, "best_accuracy": round(best_acc, 1),
+                                        **eng_stats}
+            except Exception as exc:
+                log.debug("market acc %s: %s", mkt_key, exc)
+
+        # Per-league rankings for each market
+        league_rankings: dict = {}
+        for mkt_key in list(markets_out.keys())[:9]:
+            try:
+                cur.execute("""
+                    SELECT league,
+                        COUNT(*) FILTER (WHERE grades ? %(mk)s)                          AS n,
+                        SUM((grades->%(mk)s->>'consensus')::boolean::int)::float         AS correct
+                    FROM prediction_markets_log
+                    WHERE evaluated_at IS NOT NULL AND grades ? %(mk)s AND league IS NOT NULL
+                    GROUP BY league HAVING COUNT(*) FILTER (WHERE grades ? %(mk)s) >= 5
+                    ORDER BY (SUM((grades->%(mk)s->>'consensus')::boolean::int)::float /
+                              NULLIF(COUNT(*) FILTER (WHERE grades ? %(mk)s), 0)) DESC NULLS LAST
+                    LIMIT 20
+                """, {"mk": mkt_key})
+                ranked = []
+                for rank, row in enumerate(cur.fetchall(), start=1):
+                    nr  = int(row["n"] or 0)
+                    acc = round(float(row["correct"] or 0) / nr * 100, 1) if nr > 0 else None
+                    ranked.append({"rank": rank, "league": row["league"], "n": nr,
+                                   "accuracy_pct": acc, "tier": _tier(acc or 0, nr)})
+                league_rankings[mkt_key] = ranked
+            except Exception as exc:
+                log.debug("league ranking %s: %s", mkt_key, exc)
+
+        # Summary: best and worst markets
+        ranked_mkts = sorted(
+            [(k, v.get("consensus", {}).get("accuracy_pct") or 0) for k, v in markets_out.items()],
+            key=lambda x: -x[1],
+        )
+        best_markets  = [{"market": k, "label": _MARKET_META.get(k, k), "accuracy_pct": a}
+                         for k, a in ranked_mkts[:3] if a > 0]
+        worst_markets = [{"market": k, "label": _MARKET_META.get(k, k), "accuracy_pct": a}
+                         for k, a in reversed(ranked_mkts[-3:]) if a > 0]
+
+        return {
+            "total_graded":    total_graded,
+            "markets":         markets_out,
+            "league_rankings": league_rankings,
+            "summary":         {"best_markets": best_markets, "worst_markets": worst_markets},
         }
 
-    by_league = []
-    for r in rows:
-        bt = int(r["btts_total"]   or 0)
-        ot = int(r["over25_total"] or 0)
-        if bt == 0 and ot == 0:
-            continue
-        by_league.append({
-            "league":          r["league"] or "Unknown",
-            "btts_total":      bt,
-            "btts_correct":    int(r["btts_correct"]  or 0),
-            "btts_accuracy":   _pct(r["btts_correct"],  bt),
-            "over25_total":    ot,
-            "over25_correct":  int(r["over25_correct"] or 0),
-            "over25_accuracy": _pct(r["over25_correct"], ot),
-            "avg_home_xg":     round(float(r["avg_home_xg"]  or 0), 2),
-            "avg_away_xg":     round(float(r["avg_away_xg"]  or 0), 2),
-            "avg_btts_prob":   round(float(r["avg_btts_prob"] or 0), 3),
-            "avg_over25_prob": round(float(r["avg_over25_prob"] or 0), 3),
-        })
+    except Exception as exc:
+        log.warning("get_market_accuracy failed: %s", exc)
+        return {"total_graded": 0, "markets": {}, "league_rankings": {}, "summary": {}}
+    finally:
+        conn.close()
 
-    return {"overall": overall, "by_league": by_league}
 
 
 # ─── GET /api/performance/engines ────────────────────────────────────────────

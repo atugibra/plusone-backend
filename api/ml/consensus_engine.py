@@ -37,6 +37,9 @@ DEFAULT_WEIGHTS = {
     "legacy":     0.25,
 }
 
+# Enrichment engine toggle — set True only when the enrichment engine is wired up
+ENRICHMENT_ENABLED = False
+
 # Minimum graded rows required before we trust historical weights
 MIN_GRADED_ROWS = 10
 
@@ -44,6 +47,20 @@ MIN_GRADED_ROWS = 10
 ACCURACY_WINDOW_DAYS = 30
 
 OUTCOME_LABELS = ["Home Win", "Draw", "Away Win"]
+
+# ─── Lazy market-calculation imports (avoids circular import at module load) ───
+
+def _get_market_calculator():
+    from ml.market_calculator import compute_all_markets, blend_markets, select_best_bets, _override_1x2
+    return compute_all_markets, blend_markets, select_best_bets, _override_1x2
+
+def _get_market_weights():
+    from ml.market_weights import fetch_per_market_weights
+    return fetch_per_market_weights
+
+def _get_recalibrator():
+    from ml.market_recalibrator import get_market_recalibrator
+    return get_market_recalibrator()
 
 
 # ─── Legacy heuristic helpers (self-contained, no circular imports) ───────────
@@ -124,11 +141,18 @@ def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
         idx   = int(np.argmax(probs))
         outcome = OUTCOME_LABELS[idx]
 
-        return {"home_win": home_p, "draw": draw_p, "away_win": away_p,
-                "predicted_outcome": outcome}
+        return {
+            "home_win":        home_p,
+            "draw":            draw_p,
+            "away_win":        away_p,
+            "predicted_outcome": outcome,
+            # Expose simple xG proxies for market computation
+            "home_xg": round(min(max(h_gpg * 1.05, 0.30), 4.0), 2),
+            "away_xg": round(min(max(a_gpg * 0.95, 0.30), 4.0), 2),
+        }
     except Exception as exc:
         log.warning("Legacy engine error: %s", exc)
-        return FALLBACK
+        return {**FALLBACK, "home_xg": 1.35, "away_xg": 1.10}
 
 
 # ─── Dynamic weight computation ───────────────────────────────────────────────
@@ -236,7 +260,8 @@ def _fetch_per_outcome_weights(cur) -> dict:
             leg_acc = float(row["leg_correct"] or 0) / leg_n if leg_n > 0 else 0.0
             enr_acc = 0.0   # enrichment engine not yet per-outcome tracked
 
-            # Apply a small floor (0.05) so no engine gets weight=0
+            # Apply a small floor (0.05) so no engine gets weight=0 and becomes
+            # completely silenced — we still want some diversity in the blend.
             MIN_W = 0.05
             dc_acc  = max(dc_acc,  MIN_W)
             ml_acc  = max(ml_acc,  MIN_W)
@@ -401,12 +426,16 @@ def run_consensus(
             dc_probs = {k: round(v / s, 4) for k, v in dc_probs.items()}
             dc_outcome_idx = int(np.argmax([dc_probs["home_win"], dc_probs["draw"], dc_probs["away_win"]]))
             dc_outcome = OUTCOME_LABELS[dc_outcome_idx]
+            # Extract DC xG for market computation
+            _dc_bl = dc_raw.get("blended") or {}
+            dc_xg_h = float(_dc_bl.get("exp_home_goals") or _dc_bl.get("home_xg") or 1.35)
+            dc_xg_a = float(_dc_bl.get("exp_away_goals") or _dc_bl.get("away_xg") or 1.10)
         except Exception as exc:
             log.warning("Consensus: DC engine error: %s", exc)
             errors.append(f"dc: {exc}")
-            dc_probs   = DEFAULT_WEIGHTS.copy()   # crude fallback
             dc_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
             dc_outcome = "Home Win"
+            dc_xg_h, dc_xg_a = 1.35, 1.10
             weights["dc"] = 0.0   # zero-weight broken engine
 
         # ── 3. Run ML engine ──────────────────────────────────────────────────
@@ -443,38 +472,40 @@ def run_consensus(
             expected_goals = {}
             weights["ml"] = 0.0
 
-        # ── 4. Run Enrichment engine ──────────────────────────────────────────
-        try:
-            predict_enrichment = lambda *args: {"error": "Enrichment disabled by user"}  # lazy import
-            
-            # Find exact match date if it exists
-            cur.execute("""
-                SELECT match_date FROM matches 
-                WHERE home_team_id = %s AND away_team_id = %s AND season_id = %s LIMIT 1
-            """, (home_team_id, away_team_id, season_id))
-            mr = cur.fetchone()
-            m_date = str(mr["match_date"]) if mr and mr["match_date"] else None
-            
-            enr_raw = predict_enrichment(home_team_id, away_team_id, m_date)
-            if "error" in enr_raw:
-                raise RuntimeError(enr_raw["error"])
-                
-            enr_probs = {
-                "home_win": float(enr_raw.get("home_win", 0.35)),
-                "draw":     float(enr_raw.get("draw",     0.30)),
-                "away_win": float(enr_raw.get("away_win", 0.35)),
-            }
-            s = sum(enr_probs.values()) or 1
-            enr_probs = {k: round(v / s, 4) for k, v in enr_probs.items()}
-            enr_outcome = enr_raw.get("predicted_outcome", "Home Win")
-            enr_features = enr_raw.get("_features", {})
-        except Exception as exc:
-            log.warning("Consensus: Enrichment engine error: %s", exc)
-            errors.append(f"enrichment: {exc}")
+        # ── 4. Enrichment engine — disabled until wired up ────────────────────
+        if not ENRICHMENT_ENABLED:
             enr_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
-            enr_outcome = "Home Win"
+            enr_outcome = "\u2014"
             enr_features = {}
             weights["enrichment"] = 0.0
+        else:
+            try:
+                from ml.enrichment_engine import predict_enrichment
+                cur.execute(
+                    "SELECT match_date FROM matches WHERE home_team_id=%s AND away_team_id=%s AND season_id=%s LIMIT 1",
+                    (home_team_id, away_team_id, season_id),
+                )
+                mr = cur.fetchone()
+                m_date = str(mr["match_date"]) if mr and mr["match_date"] else None
+                enr_raw = predict_enrichment(home_team_id, away_team_id, m_date)
+                if "error" in enr_raw:
+                    raise RuntimeError(enr_raw["error"])
+                enr_probs = {
+                    "home_win": float(enr_raw.get("home_win", 0.35)),
+                    "draw":     float(enr_raw.get("draw",     0.30)),
+                    "away_win": float(enr_raw.get("away_win", 0.35)),
+                }
+                s = sum(enr_probs.values()) or 1
+                enr_probs = {k: round(v / s, 4) for k, v in enr_probs.items()}
+                enr_outcome  = enr_raw.get("predicted_outcome", "Home Win")
+                enr_features = enr_raw.get("_features", {})
+            except Exception as exc:
+                log.warning("Consensus: Enrichment engine error: %s", exc)
+                errors.append(f"enrichment: {exc}")
+                enr_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+                enr_outcome = "Home Win"
+                enr_features = {}
+                weights["enrichment"] = 0.0
 
         # ── 5. Run Legacy engine ──────────────────────────────────────────────
         try:
@@ -482,11 +513,14 @@ def run_consensus(
             legacy_probs   = {k: v for k, v in legacy_raw.items()
                               if k in ("home_win", "draw", "away_win")}
             legacy_outcome = legacy_raw.get("predicted_outcome", "Home Win")
+            leg_xg_h = float(legacy_raw.get("home_xg", 1.35))
+            leg_xg_a = float(legacy_raw.get("away_xg", 1.10))
         except Exception as exc:
             log.warning("Consensus: Legacy engine error: %s", exc)
             errors.append(f"legacy: {exc}")
             legacy_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
             legacy_outcome = "Home Win"
+            leg_xg_h, leg_xg_a = 1.35, 1.10
             weights["legacy"] = 0.0
 
         # ── 6. Re-normalise weights if any engine failed ─────────────────────
@@ -510,17 +544,52 @@ def run_consensus(
         confidence_score, confidence_label = _confidence_from_entropy(blended)
         agreement = _agreement_level(dc_outcome, ml_outcome, enr_outcome, legacy_outcome)
 
-        # ── 8. Simple market proxies from blended probs + xG ─────────────────
+        # ── 8. Full market computation from per-engine xG ─────────────────────
         home_xg = float(expected_goals.get("home_xg", 1.35))
         away_xg = float(expected_goals.get("away_xg", 1.10))
-        btts_yes  = round(1 - math.exp(-home_xg) - math.exp(-away_xg)
-                          + math.exp(-(home_xg + away_xg)), 4)
-        btts_yes  = round(max(0.0, min(btts_yes, 1.0)), 4)
-        over_2_5  = round(1 - sum(
-            (math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k))
-            for k in range(3)
-        ), 4)
-        over_2_5  = round(max(0.0, min(over_2_5, 1.0)), 4)
+        try:
+            _calc, _blend, _bets, _ovr = _get_market_calculator()
+            _fetch_pmw = _get_market_weights()
+
+            # Apply league xG bias correction before computing markets
+            recal = _get_recalibrator()
+            if recal.is_fitted:
+                home_xg, away_xg = recal.calibrate_xg(home_xg, away_xg, league_id)
+                dc_xg_h, dc_xg_a = recal.calibrate_xg(dc_xg_h, dc_xg_a, league_id)
+                leg_xg_h, leg_xg_a = recal.calibrate_xg(leg_xg_h, leg_xg_a, league_id)
+
+            # Per-engine full market sheets
+            dc_markets  = _ovr(_calc(dc_xg_h,   dc_xg_a),   dc_probs)
+            ml_markets  = _ovr(_calc(home_xg,   away_xg),   ml_probs)
+            leg_markets = _ovr(_calc(leg_xg_h,  leg_xg_a),  legacy_probs)
+
+            # Per-market adaptive weights
+            _w3 = {"dc": weights.get("dc", 0.45), "ml": weights.get("ml", 0.30), "legacy": weights.get("legacy", 0.25)}
+            per_mkt_w = _fetch_pmw(cur, _w3)
+
+            # Blend
+            consensus_markets = _blend(
+                {"dc": dc_markets, "ml": ml_markets, "legacy": leg_markets},
+                _w3, per_mkt_w,
+            )
+
+            # Isotonic calibration
+            if recal.is_fitted:
+                consensus_markets = recal.calibrate(consensus_markets, engine="consensus", league_id=league_id)
+
+            best_bets = _bets(consensus_markets, home_name, away_name)
+
+            # Derive legacy btts/over for compatibility
+            btts_yes = consensus_markets.get("btts_yes", 0.50)
+            over_2_5 = consensus_markets.get("over_2_5", 0.50)
+        except Exception as _mkt_exc:
+            log.debug("Market computation failed in run_consensus: %s", _mkt_exc)
+            btts_yes = round(max(0.0, min(1 - math.exp(-home_xg) - math.exp(-away_xg) + math.exp(-(home_xg + away_xg)), 1.0)), 4)
+            over_2_5 = round(max(0.0, min(1 - sum((math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k)) for k in range(3)), 1.0)), 4)
+            consensus_markets = {"btts_yes": btts_yes, "btts_no": round(1 - btts_yes, 4), "over_2_5": over_2_5, "under_2_5": round(1 - over_2_5, 4), "home_xg": round(home_xg, 2), "away_xg": round(away_xg, 2)}
+            dc_markets = ml_markets = leg_markets = {}
+            per_mkt_w = {}
+            best_bets = []
 
         return {
             "match": {
@@ -568,14 +637,11 @@ def run_consensus(
             },
             "weights_used": {**weights, "source": weight_source},
             "agreement":    agreement,
-            "markets": {
-                "btts_yes":  btts_yes,
-                "btts_no":   round(1 - btts_yes, 4),
-                "over_2_5":  over_2_5,
-                "under_2_5": round(1 - over_2_5, 4),
-                "home_xg":   round(home_xg, 2),
-                "away_xg":   round(away_xg, 2),
-            },
+            # Full blended market sheet (all engines, all markets)
+            "markets":           consensus_markets,
+            "engine_markets":    {"dc": dc_markets, "ml": ml_markets, "legacy": leg_markets},
+            "per_market_weights": per_mkt_w,
+            "best_bets":          best_bets,
             # Individual engine picks — stored in prediction_log for grading
             "_engine_picks": {
                 "dc":         dc_outcome,
@@ -600,9 +666,10 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
     errors = []
     
     try:
-        # Compute dynamic weights once
+        # Compute dynamic weights once — save a pristine copy before the loop
         weights = _fetch_dynamic_weights(cur)
         weight_source = "dynamic_historical" if weights != DEFAULT_WEIGHTS else "default_fallback"
+        global_weights = dict(weights)  # BUG FIX: never mutate this; copy per fixture
 
         # Bulk load fixtures
         query = """
@@ -633,17 +700,26 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
         
         ml_cache = DataCache(cur)
         ml_model = ml_engine._get_engine()
-        
+
         # We need the DC engine in memory too
         from ml.dc_engine import predict_dc_match
-        
-        # We need Enrichment features lazily
-        predict_enrichment = lambda *args: {"error": "Enrichment disabled by user"}
-        
+
+        # Load market helpers once for the whole batch
+        try:
+            _calc, _blend, _bets, _ovr = _get_market_calculator()
+            _fetch_pmw = _get_market_weights()
+            _recal     = _get_recalibrator()
+        except Exception:
+            _calc = _blend = _bets = _ovr = _fetch_pmw = _recal = None
+
         results = []
         import numpy as np
 
         for fx in fixtures:
+            # BUG FIX: start each fixture with a fresh copy of the global weights
+            # so engine failures in one fixture don't bleed zero-weights into the next
+            match_weights = dict(global_weights)
+
             match_payload = {
                 "home_team":    fx["home_name"],
                 "away_team":    fx["away_name"],
@@ -655,7 +731,7 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
                 "season":       "",
             }
             
-            # --- DC 
+            # --- DC
             try:
                 dc_raw = predict_dc_match(fx["home_team_id"], fx["away_team_id"])
                 if "error" in dc_raw: raise RuntimeError(dc_raw["error"])
@@ -667,10 +743,14 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
                 s = sum(dc_probs.values()) or 1
                 dc_probs = {k: round(v / s, 4) for k, v in dc_probs.items()}
                 dc_outcome = OUTCOME_LABELS[int(np.argmax([dc_probs["home_win"], dc_probs["draw"], dc_probs["away_win"]]))]
+                _dc_bl = dc_raw.get("blended") or {}
+                dc_xg_h = float(_dc_bl.get("exp_home_goals") or _dc_bl.get("home_xg") or 1.35)
+                dc_xg_a = float(_dc_bl.get("exp_away_goals") or _dc_bl.get("away_xg") or 1.10)
             except Exception as e:
                 dc_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
                 dc_outcome = "Home Win"
-                weights["dc"] = 0.0
+                dc_xg_h, dc_xg_a = 1.35, 1.10
+                match_weights["dc"] = 0.0  # BUG FIX: was weights["dc"] = 0.0
                 
             # --- ML Engine (Instant Cache Bypass)
             try:
@@ -697,53 +777,33 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
                 ml_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
                 ml_outcome = "Home Win"
                 home_xg, away_xg = 1.35, 1.10
-                weights["ml"] = 0.0
+                match_weights["ml"] = 0.0  # BUG FIX: was weights["ml"] = 0.0
 
-            # --- Enrichment
-            try:
-                enr_raw = predict_enrichment(fx["home_team_id"], fx["away_team_id"], str(fx["match_date"]) if fx["match_date"] else None)
-                if "error" in enr_raw and "all defaults" not in str(enr_raw.get("error", "")):
-                    raise RuntimeError(enr_raw["error"])
-                
-                # If it's the "all defaults" explicit abstention loop:
-                if "error" in enr_raw and "all defaults" in str(enr_raw.get("error")):
-                    enr_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
-                    enr_outcome = "—"
-                    enr_features = enr_raw.get("_features", {})
-                    weights["enrichment"] = 0.0
-                else:
-                    enr_probs = {
-                        "home_win": float(enr_raw.get("home_win", 0.35)),
-                        "draw":     float(enr_raw.get("draw",     0.30)),
-                        "away_win": float(enr_raw.get("away_win", 0.35)),
-                    }
-                    s = sum(enr_probs.values()) or 1
-                    enr_probs = {k: round(v / s, 4) for k, v in enr_probs.items()}
-                    enr_outcome = enr_raw.get("predicted_outcome", "Home Win")
-                    enr_features = enr_raw.get("_features", {})
-            except Exception as e:
-                enr_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
-                enr_outcome = "Home Win"
-                enr_features = {}
-                weights["enrichment"] = 0.0
+            # --- Enrichment (disabled until wired up)
+            enr_probs   = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
+            enr_outcome = "\u2014"
+            enr_features = {}
+            match_weights["enrichment"] = 0.0  # BUG FIX: was weights["enrichment"] = 0.0
                 
             # --- Legacy
             try:
                 legacy_raw = _run_legacy_engine(cur, fx["home_team_id"], fx["away_team_id"])
                 legacy_probs = {k: v for k, v in legacy_raw.items() if k in ("home_win", "draw", "away_win")}
                 legacy_outcome = legacy_raw.get("predicted_outcome", "Home Win")
+                leg_xg_h = float(legacy_raw.get("home_xg", 1.35))
+                leg_xg_a = float(legacy_raw.get("away_xg", 1.10))
             except Exception as e:
                 legacy_probs = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35}
                 legacy_outcome = "Home Win"
-                weights["legacy"] = 0.0
+                leg_xg_h, leg_xg_a = 1.35, 1.10
+                match_weights["legacy"] = 0.0  # BUG FIX: was weights["legacy"] = 0.0
                 
-            # Re-normalize weights for this specific match loop
-            match_weights = weights.copy()
-            w_sum = sum(match_weights.values())
+            # Re-normalize match_weights (already a fresh copy per fixture)
+            w_sum = sum(v for k, v in match_weights.items() if k != "enrichment")
             if w_sum < 0.01:
-                match_weights = DEFAULT_WEIGHTS.copy()
-                w_sum = 1.0
-            match_weights = {k: round(v / w_sum, 4) for k, v in match_weights.items()}
+                match_weights = dict(global_weights)
+                w_sum = sum(match_weights.values()) or 1.0
+            match_weights = {k: round(v / (sum(match_weights.values()) or 1), 4) for k, v in match_weights.items()}
 
             blended = _blend(dc_probs, ml_probs, enr_probs, legacy_probs, match_weights)
             idx = int(np.argmax([blended["home_win"], blended["draw"], blended["away_win"]]))
@@ -751,11 +811,35 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
             confidence_score, confidence_label = _confidence_from_entropy(blended)
             agreement = _agreement_level(dc_outcome, ml_outcome, enr_outcome, legacy_outcome)
 
-            import math
-            btts_yes  = round(1 - math.exp(-home_xg) - math.exp(-away_xg) + math.exp(-(home_xg + away_xg)), 4)
-            btts_yes  = round(max(0.0, min(btts_yes, 1.0)), 4)
-            over_2_5  = round(1 - sum((math.exp(-(home_xg + away_xg)) * ((home_xg + away_xg) ** k) / math.factorial(k)) for k in range(3)), 4)
-            over_2_5  = round(max(0.0, min(over_2_5, 1.0)), 4)
+            # Full market computation
+            _w3 = {"dc": match_weights.get("dc", 0.45), "ml": match_weights.get("ml", 0.30), "legacy": match_weights.get("legacy", 0.25)}
+            try:
+                if _calc is not None:
+                    if _recal and _recal.is_fitted:
+                        home_xg, away_xg   = _recal.calibrate_xg(home_xg, away_xg, fx.get("league_id"))
+                        dc_xg_h, dc_xg_a   = _recal.calibrate_xg(dc_xg_h, dc_xg_a, fx.get("league_id"))
+                        leg_xg_h, leg_xg_a = _recal.calibrate_xg(leg_xg_h, leg_xg_a, fx.get("league_id"))
+                    dc_mkts  = _ovr(_calc(dc_xg_h,  dc_xg_a),  dc_probs)
+                    ml_mkts  = _ovr(_calc(home_xg,  away_xg),  ml_probs)
+                    leg_mkts = _ovr(_calc(leg_xg_h, leg_xg_a), legacy_probs)
+                    per_mkt_w    = _fetch_pmw(cur, _w3)
+                    fx_markets   = _blend({"dc": dc_mkts, "ml": ml_mkts, "legacy": leg_mkts}, _w3, per_mkt_w)
+                    if _recal and _recal.is_fitted:
+                        fx_markets = _recal.calibrate(fx_markets, engine="consensus", league_id=fx.get("league_id"))
+                    fx_best_bets = _bets(fx_markets, fx["home_name"], fx["away_name"])
+                    fx_eng_mkts  = {"dc": dc_mkts, "ml": ml_mkts, "legacy": leg_mkts}
+                else:
+                    raise RuntimeError("market helpers not loaded")
+            except Exception as _me:
+                _h, _a = home_xg, away_xg
+                _btts = round(max(0.0, min(1 - math.exp(-_h) - math.exp(-_a) + math.exp(-(_h + _a)), 1.0)), 4)
+                _o25  = round(max(0.0, min(1 - sum((math.exp(-(_h+_a)) * ((_h+_a)**k) / math.factorial(k)) for k in range(3)), 1.0)), 4)
+                fx_markets   = {"btts_yes": _btts, "btts_no": round(1-_btts,4), "over_2_5": _o25, "under_2_5": round(1-_o25,4), "home_xg": round(_h,2), "away_xg": round(_a,2)}
+                fx_best_bets = []
+                fx_eng_mkts  = {}
+                per_mkt_w    = {}
+            btts_yes = fx_markets.get("btts_yes", 0.50)
+            over_2_5 = fx_markets.get("over_2_5", 0.50)
             
             results.append({
                 "fixture_id": fx["id"],
@@ -778,14 +862,10 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
                 },
                 "weights_used": {**match_weights, "source": weight_source},
                 "agreement": agreement,
-                "markets": {
-                    "btts_yes":  btts_yes,
-                    "btts_no":   round(1 - btts_yes, 4),
-                    "over_2_5":  over_2_5,
-                    "under_2_5": round(1 - over_2_5, 4),
-                    "home_xg":   round(home_xg, 2),
-                    "away_xg":   round(away_xg, 2),
-                },
+                "markets":            fx_markets,
+                "engine_markets":     fx_eng_mkts,
+                "per_market_weights": per_mkt_w,
+                "best_bets":          fx_best_bets,
                 "_engine_picks": {
                     "dc":         dc_outcome,
                     "ml":         ml_outcome,

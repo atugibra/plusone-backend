@@ -264,6 +264,15 @@ def do_evaluate_predictions(conn) -> int:
                   dc_correct, ml_correct, legacy_correct, enrichment_correct,
                   r["id"]))
             updated += 1
+
+        # Grade per-market, per-engine predictions in the new markets log
+        try:
+            from ml.market_grader import do_evaluate_market_predictions
+            do_evaluate_market_predictions(conn)
+        except Exception as _me:
+            import logging as _log
+            _log.getLogger(__name__).warning("market_grader hook failed: %s", _me)
+
         return updated
     finally:
         cur.close()

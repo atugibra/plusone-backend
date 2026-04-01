@@ -207,17 +207,17 @@ def _poisson_prob(lam: float, k: int) -> float:
     return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
 
 def _derive_markets(h_xg: float, a_xg: float) -> tuple:
-    p_h0 = _poisson_prob(h_xg, 0)
-    p_a0 = _poisson_prob(a_xg, 0)
-    btts_no = p_h0 + p_a0 - (p_h0 * p_a0)
-    btts_yes = 1.0 - btts_no
-    
-    u25 = 0.0
-    for i in range(3):
-        for j in range(3 - i):
-            u25 += _poisson_prob(h_xg, i) * _poisson_prob(a_xg, j)
-            
-    return round(btts_yes, 4), round(1.0 - u25, 4)
+    """Legacy 2-value return kept for backward compat with non-consensus callers."""
+    from ml.market_calculator import compute_all_markets
+    m = compute_all_markets(h_xg, a_xg)
+    return m["btts_yes"], m["over_2_5"]
+
+
+def _compute_full_markets(h_xg: float, a_xg: float, calibrated_probs: dict) -> dict:
+    """Full market sheet using shared Poisson calculator + 1X2 override."""
+    from ml.market_calculator import compute_all_markets, _override_1x2
+    markets = compute_all_markets(h_xg, a_xg)
+    return _override_1x2(markets, calibrated_probs)
 
 
 def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) -> float:
@@ -418,6 +418,7 @@ def predict_match(home_team_id: int, away_team_id: int,
             }
 
         btts_prob, o25_prob = _derive_markets(home_xg, away_xg)
+        full_markets = _compute_full_markets(home_xg, away_xg, calibrated)
 
         cal = get_calibrator()
         return {
@@ -449,10 +450,8 @@ def predict_match(home_team_id: int, away_team_id: int,
                 "home": cmp(home_feats, "home"),
                 "away": cmp(away_feats, "away"),
             },
-            "markets": {
-                "btts_yes": btts_prob,
-                "over_2_5": o25_prob,
-            },
+            # Full market sheet — replaces old 2-key {btts_yes, over_2_5}
+            "markets": full_markets,
             "h2h": {
                 "home_wins":  h2h["h2h_home_wins"],
                 "draws":      h2h["h2h_draws"],

@@ -107,6 +107,15 @@ def _auto_recalibrate_bg():
                 _sync_log.info("Auto-recalibrate (DC) completed on %d samples.", n)
     except Exception as exc:
         _sync_log.warning("Auto-recalibrate (DC) failed: %s", exc)
+    try:
+        from ml.market_recalibrator import recalibrate_markets_from_log
+        res = recalibrate_markets_from_log()
+        _sync_log.info(
+            "Auto-recalibrate (Markets) fitted %d calibrators, %d league xG biases.",
+            res.get("calibrators", 0), res.get("xg_leagues", 0),
+        )
+    except Exception as exc:
+        _sync_log.warning("Auto-recalibrate (Markets) failed: %s", exc)
 
 class TableData(BaseModel):
     headers: List[str] = []

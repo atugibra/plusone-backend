@@ -132,8 +132,9 @@ def train_model():
                     sample["league_id"],
                     sample["season_id"],
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Could not extract feature names during training: %s", exc)
         finally:
             conn3.close()
 
@@ -199,6 +200,25 @@ def recalibrate_from_log() -> dict:
 
 
 # ─── Prediction ───────────────────────────────────────────────────────────────
+
+import math
+
+def _poisson_prob(lam: float, k: int) -> float:
+    return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
+
+def _derive_markets(h_xg: float, a_xg: float) -> tuple:
+    """Legacy 2-value return kept for backward compat with non-consensus callers."""
+    from ml.market_calculator import compute_all_markets
+    m = compute_all_markets(h_xg, a_xg)
+    return m["btts_yes"], m["over_2_5"]
+
+
+def _compute_full_markets(h_xg: float, a_xg: float, calibrated_probs: dict) -> dict:
+    """Full market sheet using shared Poisson calculator + 1X2 override."""
+    from ml.market_calculator import compute_all_markets, _override_1x2
+    markets = compute_all_markets(h_xg, a_xg)
+    return _override_1x2(markets, calibrated_probs)
+
 
 def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) -> float:
     if venue == "home":
@@ -307,12 +327,8 @@ def _outcome_from_probs(probs: dict) -> tuple:
     idx = int(max(range(3), key=lambda i: vals[i]))
     predicted = labels[idx]
 
-    import math
-    p = [max(v, 1e-10) for v in vals]
-    entropy     = -sum(x * math.log(x) for x in p)
-    max_entropy = -math.log(1.0 / 3.0)
-    score = round((1.0 - entropy / max_entropy) * 100, 1)
-    label = "High" if score >= 30 else ("Medium" if score >= 15 else "Low")
+    score = max(vals)
+    label = "High" if score >= 0.55 else ("Medium" if score >= 0.42 else "Low")
     return predicted, label, score
 
 
@@ -320,6 +336,7 @@ def predict_match(home_team_id: int, away_team_id: int,
                   league_id: int, season_id: int) -> dict:
     """
     Full rich prediction for one match with feedback calibration applied.
+    Uses the same batch_features path as training to guarantee feature-count consistency.
     """
     engine = _get_engine()
     if engine is None or not engine.is_trained:
@@ -328,6 +345,7 @@ def predict_match(home_team_id: int, away_team_id: int,
     conn = get_connection()
     cur  = conn.cursor()
     try:
+        # ── 1. Resolve names (always from DB, never fall back to "Team N") ──────
         cur.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)",
                     (home_team_id, away_team_id))
         name_map = {r["id"]: r["name"] for r in cur.fetchall()}
@@ -342,18 +360,26 @@ def predict_match(home_team_id: int, away_team_id: int,
         ss_row = cur.fetchone()
         season_name = ss_row["name"] if ss_row else ""
 
-        cur.execute("SELECT id FROM matches WHERE home_team_id = %s AND away_team_id = %s AND season_id = %s LIMIT 1",
-                    (home_team_id, away_team_id, season_id))
+        cur.execute(
+            "SELECT id, match_date FROM matches WHERE home_team_id = %s AND away_team_id = %s"
+            " AND season_id = %s LIMIT 1",
+            (home_team_id, away_team_id, season_id),
+        )
         match_row = cur.fetchone()
         match_id_or_none = match_row["id"] if match_row else None
+        match_date_val   = match_row["match_date"] if match_row else None
 
+        # ── 2. Build features via BATCH path (identical to training) ────────────
+        # This guarantees the feature vector has the exact same shape / ordering
+        # as the vectors used when the model's StandardScaler was fitted.
         from ml.batch_features import DataCache, _build_match_features as _batch_build
-        cache = DataCache(cur)
-        conn.close()
+        cache = DataCache(cur)          # bulk-loads all tables (no more DB calls needed)
+        conn.close()                    # cache holds everything in memory
         conn = None
 
         fv, feat_names, home_feats, away_feats, h2h = _batch_build(
-            cache, home_team_id, away_team_id, league_id, season_id
+            cache, home_team_id, away_team_id, league_id, season_id,
+            match_id=match_id_or_none, match_date=match_date_val
         )
 
         raw_proba = engine.predict_proba(fv)
@@ -391,9 +417,13 @@ def predict_match(home_team_id: int, away_team_id: int,
                 "clean_sheet_rate": round(feats.get("clean_sheet_rate", 0.0), 3),
             }
 
+        btts_prob, o25_prob = _derive_markets(home_xg, away_xg)
+        full_markets = _compute_full_markets(home_xg, away_xg, calibrated)
+
         cal = get_calibrator()
         return {
             "match": {
+                "match_id":   match_id_or_none,
                 "home_team":  home_name,
                 "away_team":  away_name,
                 "league":     league_name,
@@ -420,6 +450,8 @@ def predict_match(home_team_id: int, away_team_id: int,
                 "home": cmp(home_feats, "home"),
                 "away": cmp(away_feats, "away"),
             },
+            # Full market sheet — replaces old 2-key {btts_yes, over_2_5}
+            "markets": full_markets,
             "h2h": {
                 "home_wins":  h2h["h2h_home_wins"],
                 "draws":      h2h["h2h_draws"],
@@ -442,6 +474,7 @@ def predict_match(home_team_id: int, away_team_id: int,
         if conn:
             try: conn.close()
             except: pass
+
 
 
 # ─── Upcoming fixtures ────────────────────────────────────────────────────────
@@ -486,6 +519,9 @@ def predict_upcoming(league_id: int = None, limit: int = 50) -> list:
 
 
 def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
+    # NOTE: recalibration is now triggered automatically by sync.py after
+    # evaluate runs, not here on every prediction call. This prevents
+    # redundant DB queries and model refits on every /predictions request.
     eng = _get_engine()
     if eng is None or not eng.is_trained:
         return []
@@ -529,7 +565,8 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                 sid  = fx["season_id"]
 
                 fv, feat_names, home_feats, away_feats, h2h = _build_match_features(
-                    cache, htid, atid, lid, sid
+                    cache, htid, atid, lid, sid,
+                    match_id=fx["id"], match_date=fx["match_date"]
                 )
                 raw_proba = eng.predict_proba(fv)
 
@@ -544,6 +581,7 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
 
                 home_xg = _compute_venue_xg(home_feats, away_feats, "home")
                 away_xg = _compute_venue_xg(away_feats, home_feats, "away")
+                btts_prob, o25_prob = _derive_markets(home_xg, away_xg)
                 factors = _key_factors(home_feats, away_feats,
                                        fx["home_name"], fx["away_name"])
 
@@ -552,6 +590,7 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                     "match_date":   str(fx["match_date"]) if fx["match_date"] else None,
                     "gameweek":     fx["gameweek"],
                     "match": {
+                        "match_id":     fx["id"],
                         "home_team":    fx["home_name"],
                         "away_team":    fx["away_name"],
                         "home_logo":    fx["home_logo"],
@@ -574,6 +613,10 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                         "home_xg":         home_xg,
                         "away_xg":         away_xg,
                         "predicted_score": f"{round(home_xg)}-{round(away_xg)}",
+                    },
+                    "markets": {
+                        "btts_yes": btts_prob,
+                        "over_2_5": o25_prob,
                     },
                     "key_factors": factors,
                     "model_info": {

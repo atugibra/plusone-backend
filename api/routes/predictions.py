@@ -391,6 +391,14 @@ def _log_prediction_to_db(
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
+
+        # Log per-market probabilities for the new market analytics pipeline
+        try:
+            from ml.market_logger import log_market_prediction
+            log_market_prediction(conn, match_id, home_team, away_team,
+                                  league, match_date, result)
+        except Exception as _me:
+            log.debug("market_logger hook failed: %s", _me)
     except Exception as exc:
         log.error("Could not log prediction: %s", exc, exc_info=True)
         if conn:

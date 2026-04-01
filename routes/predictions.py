@@ -391,6 +391,28 @@ def _log_prediction_to_db(
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
+        # ── Market logging (additive — never breaks prediction_log write) ────
+        try:
+            from ml.market_logger import log_market_prediction
+            consensus_mkt = result.get("markets")
+            if consensus_mkt and isinstance(consensus_mkt, dict) and "btts_yes" in consensus_mkt:
+                match_league_id = match_info.get("league_id") or result.get("league_id")
+                match_season_id = match_info.get("season_id") or result.get("season_id")
+                log_market_prediction(
+                    match_id,
+                    home_team, away_team, league,
+                    match_league_id,
+                    match_date,
+                    match_season_id,
+                    consensus_mkt,
+                    result.get("engine_markets", {}),
+                    result.get("weights_used", {}),
+                    result.get("per_market_weights", {}),
+                    result.get("best_bets", []),
+                )
+        except Exception:
+            pass  # market logging must never crash prediction logging
+
     except Exception as exc:
         log.error("Could not log prediction: %s", exc, exc_info=True)
         if conn:

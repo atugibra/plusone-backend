@@ -264,6 +264,15 @@ def do_evaluate_predictions(conn) -> int:
                   dc_correct, ml_correct, legacy_correct, enrichment_correct,
                   r["id"]))
             updated += 1
+        # ── Grade market predictions (additive — never breaks 1X2 grading) ──
+        try:
+            from ml.market_grader import do_evaluate_market_predictions
+            market_updated = do_evaluate_market_predictions(conn)
+            if market_updated:
+                log.info("Market grader: %d row(s) evaluated.", market_updated)
+        except Exception as _mkt_exc:
+            log.debug("Market grader skipped: %s", _mkt_exc)
+
         return updated
     finally:
         cur.close()
