@@ -67,9 +67,11 @@ SQL to run ONCE in Supabase SQL Editor:
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from typing import Optional
+import logging
 from database import get_connection
 from routes.deps import require_admin
 
+log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -156,10 +158,6 @@ def do_evaluate_predictions(conn) -> int:
               AND LOWER(pl.away_team) = LOWER(at.name)
               AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '7 days')
               AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '7 days')
-              AND NOT EXISTS (
-                  SELECT 1 FROM prediction_log ex
-                  WHERE ex.match_id = m.id AND ex.id != pl.id
-              )
         """)
 
         # 1b. Fallback: bidirectional ILIKE fuzzy match for rows still without a match_id
@@ -180,32 +178,10 @@ def do_evaluate_predictions(conn) -> int:
                 )
                   AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '14 days')
                   AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '14 days')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM prediction_log ex
-                      WHERE ex.match_id = m.id AND ex.id != pl.id
-                  )
+                ORDER BY m.match_date DESC
                 LIMIT 1
             )
             WHERE pl.match_id IS NULL
-              AND EXISTS (
-                SELECT 1 FROM matches m
-                JOIN teams ht ON ht.id = m.home_team_id
-                JOIN teams at ON at.id = m.away_team_id
-                WHERE (
-                    ht.name ILIKE '%' || pl.home_team || '%'
-                    OR pl.home_team ILIKE '%' || ht.name || '%'
-                )
-                  AND (
-                    at.name ILIKE '%' || pl.away_team || '%'
-                    OR pl.away_team ILIKE '%' || at.name || '%'
-                )
-                  AND m.match_date >= (COALESCE(pl.match_date, pl.created_at::DATE) - INTERVAL '14 days')
-                  AND m.match_date <= (COALESCE(pl.match_date, pl.created_at::DATE) + INTERVAL '14 days')
-                  AND NOT EXISTS (
-                      SELECT 1 FROM prediction_log ex
-                      WHERE ex.match_id = m.id AND ex.id != pl.id
-                  )
-              )
         """)
 
         # 2. Grade all un-evaluated rows
