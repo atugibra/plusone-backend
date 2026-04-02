@@ -6,32 +6,62 @@ LLM-powered Q&A about any consensus match prediction.
 Strategy:
   1. Fetch full prediction context for the requested match
   2. Package it as structured text context
-  3. Try Groq first (fastest, 14,400 req/day free)
-  4. Fall back to Gemini if Groq fails
-  5. Return the answer + which data panels to highlight
+  3. Use the provider/model specified in the request (or default)
+  4. Fall back to the other provider if the chosen one fails
+  5. Return the answer + which provider/model was used
 
 Environment variables required:
-  GROQ_API_KEY   — from console.groq.com
-  GEMINI_API_KEY — from aistudio.google.com
+  GROQ_API_KEY       — from console.groq.com
+  GEMINI_API_KEY     — from aistudio.google.com
+
+Optional (to override default models without redeploying):
+  GROQ_MODEL         — default: llama-3.3-70b-versatile
+  GEMINI_MODEL       — default: gemini-2.0-flash
+
+Available Groq models (all free):
+  llama-3.3-70b-versatile   ← smartest, recommended
+  llama-3.1-8b-instant      ← fastest
+  mixtral-8x7b-32768        ← good for long context
+
+Available Gemini models (free tier):
+  gemini-2.0-flash          ← fast, good quality
+  gemini-2.0-flash-lite     ← fastest, lower quality
 """
 
 import os
-import json
 import logging
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 
 from database import get_connection
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
+# ── API keys ────────────────────────────────────────────────────────────────
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# ── Default models (overridable via env vars without code changes) ──────────
+DEFAULT_GROQ_MODEL   = os.getenv("GROQ_MODEL",   "llama-3.3-70b-versatile")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+# ── Available models catalogue (shown to frontend for selection UI) ─────────
+AVAILABLE_MODELS = {
+    "groq": [
+        {"id": "llama-3.3-70b-versatile", "label": "Llama 3.3 70B  · Smartest",  "free": True},
+        {"id": "llama-3.1-8b-instant",    "label": "Llama 3.1 8B   · Fastest",   "free": True},
+        {"id": "mixtral-8x7b-32768",      "label": "Mixtral 8x7B   · Long ctx",  "free": True},
+    ],
+    "gemini": [
+        {"id": "gemini-2.0-flash",      "label": "Gemini 2.0 Flash      · Fast & smart", "free": True},
+        {"id": "gemini-2.0-flash-lite", "label": "Gemini 2.0 Flash Lite · Fastest",      "free": True},
+    ],
+}
+
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 SYSTEM_PROMPT = """You are PlusOne AI, an expert football match prediction analyst.
 You answer user questions about a specific match prediction made by the PlusOne Consensus Engine.
@@ -44,6 +74,7 @@ RULES:
 5. Use plain language — no jargon unless the user specifically asks for technical detail.
 6. When mentioning probabilities, always include the percentage (e.g. 63.2% not 0.632).
 7. Highlight the most important insight first.
+8. Format your response in plain text only — no markdown, no asterisks, no bold.
 
 You are answering about the following match prediction:
 
@@ -52,22 +83,26 @@ You are answering about the following match prediction:
 Now answer the user's question concisely and clearly."""
 
 
+# ── Request schema ───────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
-    question: str
+    question:     str
     match_id:     Optional[int] = None
     home_team_id: Optional[int] = None
     away_team_id: Optional[int] = None
     league_id:    Optional[int] = None
     season_id:    Optional[int] = None
+    # Model selection — frontend passes these
+    provider:     Optional[Literal["groq", "gemini", "auto"]] = "auto"
+    model:        Optional[str] = None   # specific model id, or None = use default
 
 
+# ── Context builder ──────────────────────────────────────────────────────────
 def _build_context(match_data: dict) -> str:
-    """Convert the full prediction dict into a readable text context for the LLM."""
-    m   = match_data.get("match", {})
-    con = match_data.get("consensus", {})
-    eng = match_data.get("engines", {})
-    mkt = match_data.get("markets", {})
-    bets = match_data.get("best_bets", [])
+    m       = match_data.get("match", {})
+    con     = match_data.get("consensus", {})
+    eng     = match_data.get("engines", {})
+    mkt     = match_data.get("markets", {})
+    bets    = match_data.get("best_bets", [])
     weights = match_data.get("weights_used", {})
     agreement = match_data.get("agreement", "unknown")
 
@@ -94,7 +129,7 @@ def _build_context(match_data: dict) -> str:
         "",
         "=== ENGINE BREAKDOWN ===",
         fmt_engine("Dixon-Coles (DC)", eng.get("dc", {})),
-        fmt_engine("ML Ensemble", eng.get("ml", {})),
+        fmt_engine("ML Ensemble",      eng.get("ml", {})),
         fmt_engine("Legacy Heuristic", eng.get("legacy", {})),
         "",
         "=== ENGINE WEIGHTS ===",
@@ -104,11 +139,9 @@ def _build_context(match_data: dict) -> str:
     ]
 
     if mkt:
-        home_xg = mkt.get("home_xg", mkt.get("home_xg"))
-        away_xg = mkt.get("away_xg", mkt.get("away_xg"))
         lines += [
             "=== MARKET PROBABILITIES ===",
-            f"  Expected Goals (xG): Home {home_xg} — Away {away_xg}",
+            f"  Expected Goals (xG): Home {mkt.get('home_xg')} — Away {mkt.get('away_xg')}",
             f"  BTTS Yes: {pct(mkt.get('btts_yes'))} | BTTS No: {pct(mkt.get('btts_no'))}",
             f"  Over 1.5: {pct(mkt.get('over_1_5'))} | Over 2.5: {pct(mkt.get('over_2_5'))} | Over 3.5: {pct(mkt.get('over_3_5'))}",
             f"  Under 2.5: {pct(mkt.get('under_2_5'))} | Under 3.5: {pct(mkt.get('under_3_5'))}",
@@ -131,75 +164,55 @@ def _build_context(match_data: dict) -> str:
     return "\n".join(lines)
 
 
-async def _ask_groq(context: str, question: str) -> str:
-    try:
-        import httpx
-    except ImportError as e:
-        import traceback
-        err_msg = f"httpx import failed: {str(e)}\n{traceback.format_exc()}"
-        print(err_msg)
-        log.error(err_msg)
-        raise ValueError(f"httpx not installed or broken: {str(e)}")
+# ── Provider calls ───────────────────────────────────────────────────────────
+async def _ask_groq(context: str, question: str, model: str) -> str:
+    import httpx
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set")
     prompt = SYSTEM_PROMPT.format(context=context)
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "llama-3.1-8b-instant",
+                "model": model,
                 "messages": [
                     {"role": "system", "content": prompt},
                     {"role": "user",   "content": question},
                 ],
-                "max_tokens": 400,
+                "max_tokens": 500,
                 "temperature": 0.3,
             },
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-async def _ask_gemini(context: str, question: str) -> str:
-    try:
-        import httpx
-    except ImportError as e:
-        import traceback
-        err_msg = f"httpx import failed: {str(e)}\n{traceback.format_exc()}"
-        print(err_msg)
-        log.error(err_msg)
-        raise ValueError(f"httpx not installed or broken: {str(e)}")
+async def _ask_gemini(context: str, question: str, model: str) -> str:
+    import httpx
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
     prompt = SYSTEM_PROMPT.format(context=context)
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+    async with httpx.AsyncClient(timeout=25.0) as client:
         resp = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            url,
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": f"{prompt}\n\nUser question: {question}"}]}],
-                "generationConfig": {"maxOutputTokens": 400, "temperature": 0.3},
+                "generationConfig": {"maxOutputTokens": 500, "temperature": 0.3},
             },
         )
         resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
+# ── DB fetch ─────────────────────────────────────────────────────────────────
 def _fetch_prediction_data(
     conn, match_id=None, home_team_id=None, away_team_id=None,
     league_id=None, season_id=None
 ) -> dict:
-    """
-    Fetch the latest consensus prediction for the match from prediction_log,
-    then re-run consensus to get full market data.
-    Falls back to a live consensus run if no log entry exists.
-    """
     cur = conn.cursor()
-
-    # Try to get stored prediction from prediction_log
     stored = None
     try:
         if match_id:
@@ -232,65 +245,81 @@ def _fetch_prediction_data(
     except Exception as e:
         log.debug("Could not fetch stored prediction: %s", e)
 
-    # Run consensus live
     try:
         from ml.consensus_engine import run_consensus
         htid = home_team_id or (stored["home_team_id"] if stored else None)
         atid = away_team_id or (stored["away_team_id"] if stored else None)
-        lid  = league_id  or (stored["league_id"]  if stored else None)
-        sid  = season_id  or (stored["season_id"]  if stored else None)
+        lid  = league_id   or (stored["league_id"]    if stored else None)
+        sid  = season_id   or (stored["season_id"]    if stored else None)
         if htid and atid and lid and sid:
             result = run_consensus(htid, atid, lid, sid)
-            # Enrich with actual score if available
             if stored and stored.get("home_score") is not None:
-                result["actual_score"] = f"{stored['home_score']}-{stored['away_score']}"
-                result["actual_outcome"] = stored.get("actual")
+                result["actual_score"]       = f"{stored['home_score']}-{stored['away_score']}"
+                result["actual_outcome"]     = stored.get("actual")
                 result["prediction_correct"] = stored.get("correct")
             return result
     except Exception as e:
         log.warning("live consensus failed in ask endpoint: %s", e)
 
-    # Last resort: build a minimal dict from what we know
     if stored:
         return {
             "match": {
                 "home_team": stored.get("home_team") or "Home",
                 "away_team": stored.get("away_team") or "Away",
-                "league": stored.get("league_name") or "",
-                "season": "",
+                "league":    stored.get("league_name") or "",
+                "season":    "",
             },
             "consensus": {
-                "home_win": stored.get("home_win_prob"),
-                "draw":     stored.get("draw_prob"),
-                "away_win": stored.get("away_win_prob"),
+                "home_win":          stored.get("home_win_prob"),
+                "draw":              stored.get("draw_prob"),
+                "away_win":          stored.get("away_win_prob"),
                 "predicted_outcome": stored.get("predicted_outcome"),
-                "confidence": stored.get("confidence"),
-                "confidence_score": stored.get("confidence_score"),
+                "confidence":        stored.get("confidence"),
+                "confidence_score":  stored.get("confidence_score"),
             },
-            "engines": {},
-            "markets": {},
-            "best_bets": [],
-            "weights_used": {},
-            "agreement": "unknown",
+            "engines": {}, "markets": {}, "best_bets": [],
+            "weights_used": {}, "agreement": "unknown",
         }
 
     return {}
 
 
+# ── Models list endpoint ─────────────────────────────────────────────────────
+@router.get("/models")
+async def list_models():
+    """Return available providers and models so the frontend can build a selector."""
+    return {
+        "available": AVAILABLE_MODELS,
+        "defaults": {
+            "provider": "groq",
+            "groq_model":   DEFAULT_GROQ_MODEL,
+            "gemini_model": DEFAULT_GEMINI_MODEL,
+        },
+        "configured": {
+            "groq":   bool(GROQ_API_KEY),
+            "gemini": bool(GEMINI_API_KEY),
+        },
+    }
+
+
+# ── Main ask endpoint ────────────────────────────────────────────────────────
 @router.post("/ask")
 async def ask_prediction(req: AskRequest):
-    """
-    Answer any question about a match prediction using LLM + full context.
-    """
+    """Answer any question about a match prediction using the chosen LLM provider/model."""
+
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
-    # Safety: reject if no valid API keys
     if not GROQ_API_KEY and not GEMINI_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="No LLM API keys configured. Set GROQ_API_KEY or GEMINI_API_KEY environment variables."
+            detail="No LLM API keys configured. Set GROQ_API_KEY or GEMINI_API_KEY.",
         )
+
+    # Resolve provider + model
+    provider = req.provider or "auto"
+    groq_model   = req.model if (provider == "groq"   and req.model) else DEFAULT_GROQ_MODEL
+    gemini_model = req.model if (provider == "gemini" and req.model) else DEFAULT_GEMINI_MODEL
 
     conn = get_connection()
     try:
@@ -309,37 +338,70 @@ async def ask_prediction(req: AskRequest):
         raise HTTPException(status_code=404, detail="No prediction data found for this match.")
 
     context = _build_context(match_data)
-    answer = None
-    provider = None
+    answer       = None
+    used_provider = None
+    used_model    = None
 
-    # Try Groq first (fastest)
-    if GROQ_API_KEY:
+    # ── Explicit provider requested ──────────────────────────────────────────
+    if provider == "groq":
+        if not GROQ_API_KEY:
+            raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured.")
         try:
-            answer = await _ask_groq(context, req.question.strip())
-            provider = "groq"
+            answer = await _ask_groq(context, req.question.strip(), groq_model)
+            used_provider, used_model = "groq", groq_model
         except Exception as e:
-            log.warning("Groq failed (%s), falling back to Gemini", e)
+            log.warning("Groq (%s) failed: %s — trying Gemini fallback", groq_model, e)
+            if GEMINI_API_KEY:
+                try:
+                    answer = await _ask_gemini(context, req.question.strip(), gemini_model)
+                    used_provider, used_model = "gemini", gemini_model
+                except Exception as e2:
+                    log.error("Gemini fallback also failed: %s", e2)
 
-    # Fall back to Gemini
-    if answer is None and GEMINI_API_KEY:
+    elif provider == "gemini":
+        if not GEMINI_API_KEY:
+            raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured.")
         try:
-            answer = await _ask_gemini(context, req.question.strip())
-            provider = "gemini"
+            answer = await _ask_gemini(context, req.question.strip(), gemini_model)
+            used_provider, used_model = "gemini", gemini_model
         except Exception as e:
-            log.error("Gemini also failed: %s", e)
+            log.warning("Gemini (%s) failed: %s — trying Groq fallback", gemini_model, e)
+            if GROQ_API_KEY:
+                try:
+                    answer = await _ask_groq(context, req.question.strip(), groq_model)
+                    used_provider, used_model = "groq", groq_model
+                except Exception as e2:
+                    log.error("Groq fallback also failed: %s", e2)
+
+    # ── Auto: try Groq first, then Gemini ───────────────────────────────────
+    else:
+        if GROQ_API_KEY:
+            try:
+                answer = await _ask_groq(context, req.question.strip(), groq_model)
+                used_provider, used_model = "groq", groq_model
+            except Exception as e:
+                log.warning("Groq (%s) failed: %s — falling back to Gemini", groq_model, e)
+
+        if answer is None and GEMINI_API_KEY:
+            try:
+                answer = await _ask_gemini(context, req.question.strip(), gemini_model)
+                used_provider, used_model = "gemini", gemini_model
+            except Exception as e:
+                log.error("Gemini (%s) also failed: %s", gemini_model, e)
 
     if not answer:
-        raise HTTPException(status_code=502, detail="Both LLM providers failed. Please try again.")
+        raise HTTPException(status_code=502, detail="All LLM providers failed. Please try again.")
 
     return {
         "answer":   answer,
-        "provider": provider,
+        "provider": used_provider,
+        "model":    used_model,
         "match":    match_data.get("match", {}),
         "context_snapshot": {
-            "consensus_outcome":   match_data.get("consensus", {}).get("predicted_outcome"),
-            "confidence":          match_data.get("consensus", {}).get("confidence"),
-            "agreement":           match_data.get("agreement"),
-            "best_bets_count":     len(match_data.get("best_bets", [])),
-            "has_market_data":     bool(match_data.get("markets")),
+            "consensus_outcome": match_data.get("consensus", {}).get("predicted_outcome"),
+            "confidence":        match_data.get("consensus", {}).get("confidence"),
+            "agreement":         match_data.get("agreement"),
+            "best_bets_count":   len(match_data.get("best_bets", [])),
+            "has_market_data":   bool(match_data.get("markets")),
         },
     }
