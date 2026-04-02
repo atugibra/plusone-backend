@@ -148,7 +148,7 @@ async def _ask_groq(context: str, question: str) -> str:
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": "llama3-8b-8192",
+                "model": "llama-3.1-8b-instant",
                 "messages": [
                     {"role": "system", "content": prompt},
                     {"role": "user",   "content": question},
