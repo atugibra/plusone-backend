@@ -11,6 +11,15 @@ from routes import leagues, teams, matches, standings, squad_stats, player_stats
 
 load_dotenv()
 
+import subprocess
+import sys
+try:
+    import httpx
+except ImportError:
+    print("Force downloading httpx...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx>=0.27.0"])
+
+
 # ─── Numpy → psycopg2 type adapters ──────────────────────────────────────────
 # Prevents "schema np does not exist" errors when numpy float64/int64 values
 # are passed directly to psycopg2 inserts across the entire app.
