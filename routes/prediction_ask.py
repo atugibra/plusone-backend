@@ -18,7 +18,6 @@ Environment variables required:
 import os
 import json
 import logging
-import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -133,6 +132,10 @@ def _build_context(match_data: dict) -> str:
 
 
 async def _ask_groq(context: str, question: str) -> str:
+    try:
+        import httpx
+    except ImportError:
+        raise ValueError("httpx not installed — add 'httpx>=0.27.0' to requirements.txt")
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set")
     prompt = SYSTEM_PROMPT.format(context=context)
@@ -156,6 +159,10 @@ async def _ask_groq(context: str, question: str) -> str:
 
 
 async def _ask_gemini(context: str, question: str) -> str:
+    try:
+        import httpx
+    except ImportError:
+        raise ValueError("httpx not installed — add 'httpx>=0.27.0' to requirements.txt")
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
     prompt = SYSTEM_PROMPT.format(context=context)
