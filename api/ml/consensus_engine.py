@@ -599,6 +599,8 @@ def run_consensus(
                 "away_team_id": away_team_id,
                 "league":       league_name,
                 "season":       season_name,
+                "season_id":    season_id,    # ← needed by prediction_ask for DB context scoping
+                "league_id":    league_id,    # ← needed by prediction_ask for standings filtering
             },
             "consensus": {
                 "home_win":        blended["home_win"],

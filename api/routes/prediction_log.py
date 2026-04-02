@@ -193,10 +193,18 @@ def do_evaluate_predictions(conn) -> int:
         """)
 
         # 2. Grade all un-evaluated rows
+        # Gracefully handle DBs where enrichment_predicted_outcome was never added.
         cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'prediction_log'
+              AND column_name = 'enrichment_predicted_outcome'
+        """)
+        _enr_col = "pl.enrichment_predicted_outcome," if cur.fetchone() else "NULL AS enrichment_predicted_outcome,"
+
+        cur.execute(f"""
             SELECT pl.id, pl.predicted, pl.btts_yes, pl.over_2_5,
                    pl.dc_predicted_outcome, pl.ml_predicted_outcome,
-                   pl.legacy_predicted_outcome, pl.enrichment_predicted_outcome,
+                   pl.legacy_predicted_outcome, {_enr_col}
                    m.home_score, m.away_score
             FROM prediction_log pl
             JOIN matches m ON m.id = pl.match_id

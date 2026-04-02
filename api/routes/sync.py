@@ -464,6 +464,17 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        # Self-healing: ensure enrichment_predicted_outcome column exists.
+        # This column was added after initial release; older DBs may be missing it.
+        try:
+            cur.execute("""
+                ALTER TABLE prediction_log
+                ADD COLUMN IF NOT EXISTS enrichment_predicted_outcome TEXT
+            """)
+            conn.commit()
+        except Exception:
+            conn.rollback()  # Column may already exist or table locked — safe to ignore
+
         league_id = get_or_create_league(cur, payload.league)
         season_id = get_or_create_season(cur, payload.season)
         fixtures_list = payload.fixtures or []
