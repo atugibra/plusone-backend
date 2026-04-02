@@ -5,7 +5,15 @@ LLM-powered Q&A about any consensus match prediction.
 
 Strategy:
   1. Fetch full consensus prediction (all 3 engines + markets + best bets)
-  2. Fetch rich DB context: last-5 form, season stats, H2H last-8, standings
+  2. Fetch rich DB context from ALL relevant tables:
+       - matches            → recent form, H2H, season stats (with season filter + fallback)
+       - league_standings   → current standings (season + league filtered)
+       - team_squad_stats   → possession, shooting %, save %, squad depth
+       - team_venue_stats   → home/away goal splits and xG
+       - player_stats       → top scorers / assisters
+       - player_injuries    → current injuries and suspensions
+       - team_clubelo       → ELO ratings and match-specific win probabilities
+       - match_odds         → bookmaker implied probabilities (B365 + Over/Under)
   3. Ask the LLM to:
        a) Analyse the raw DB data independently
        b) Compare its own reading against the 3 engine predictions
@@ -71,19 +79,22 @@ SYSTEM_PROMPT = """You are PlusOne AI, an expert football analyst and data scien
 
 You have been given two sources of information about an upcoming match:
 
-1. RAW DATABASE DATA - real historical facts: recent form, head-to-head history,
-   season statistics, and league standings for both teams.
+1. RAW DATABASE DATA — real historical facts pulled directly from the database:
+   recent form, head-to-head history, season statistics, league standings,
+   squad stats (possession, shooting, goalkeeping), venue splits (home/away),
+   top scorers, injury list, ClubElo ratings, and bookmaker odds.
 
-2. ENGINE PREDICTIONS - outputs from three independent prediction models
+2. ENGINE PREDICTIONS — outputs from three independent prediction models
    (Dixon-Coles statistical model, ML ensemble, and a legacy heuristic model),
-   which have already processed the data and produced probability estimates.
+   which have already processed this data and produced probability estimates.
 
-YOUR TASK - follow these steps in order:
+YOUR TASK — follow these steps in order:
 
 STEP 1 - YOUR OWN ASSESSMENT:
-Read the raw database data carefully. Based purely on the form, H2H record,
-season stats and standings, decide what you think the most likely outcome is
-and why. State this clearly and reference specific numbers.
+Read the raw database data carefully. Based on the form, H2H record, season
+stats, standings, squad quality, venue splits, ELO ratings, and odds, decide
+what you think the most likely outcome is and why. State this clearly and
+reference specific numbers.
 
 STEP 2 - COMPARE WITH ENGINES:
 Look at what each of the three engines predicted. Note where they agree and
@@ -99,10 +110,11 @@ Now directly answer the user's specific question using everything above.
 
 RULES:
 - Use plain text only. No markdown, no asterisks, no bullet symbols.
-- Be specific - always reference actual numbers from the data.
-- If data is missing or insufficient, say so clearly rather than guessing.
-- Keep the full response under 400 words unless the question genuinely needs more.
+- Be specific — always reference actual numbers from the data.
+- If data is missing or insufficient for a section, note it briefly and move on.
+- Keep the full response under 450 words unless the question genuinely needs more.
 - Probabilities should always be shown as percentages (e.g. 63.2% not 0.632).
+- ELO ratings above 1800 indicate elite clubs; below 1400 indicates weaker sides.
 
 Match context and data follow below.
 
@@ -122,10 +134,23 @@ class AskRequest(BaseModel):
     model:        Optional[str] = None
 
 
-def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
-    """Fetch rich real-world DB context: form, season stats, H2H, standings."""
+# ─── DB Context Fetcher ────────────────────────────────────────────────────────
 
-    def recent_results(tid: int, n: int = 5):
+def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
+                      season_id: int = None, league_id: int = None,
+                      match_id: int = None) -> dict:
+    """
+    Fetch the full rich DB context the engines use, from ALL relevant tables:
+      matches, league_standings, team_squad_stats, team_venue_stats,
+      player_stats, player_injuries, team_clubelo, match_odds.
+
+    season_id is used for season-scoped queries. If the current season has
+    fewer than 3 completed matches, we automatically fall back to include the
+    previous season so the AI always has real data to work with.
+    """
+
+    # ── 1. Recent form (last 6 completed matches, any season) ──────────────
+    def recent_results(tid: int, n: int = 6):
         try:
             cur.execute("""
                 SELECT
@@ -133,10 +158,12 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
                     CASE WHEN m.home_team_id = %(t)s THEN at2.name ELSE ht2.name END AS opponent,
                     CASE WHEN m.home_team_id = %(t)s THEN 'H' ELSE 'A'           END AS venue,
                     CASE WHEN m.home_team_id = %(t)s THEN m.home_score ELSE m.away_score END AS ts,
-                    CASE WHEN m.home_team_id = %(t)s THEN m.away_score ELSE m.home_score END AS os
+                    CASE WHEN m.home_team_id = %(t)s THEN m.away_score ELSE m.home_score END AS os,
+                    l.name AS league_name
                 FROM matches m
                 JOIN teams ht2 ON ht2.id = m.home_team_id
                 JOIN teams at2 ON at2.id = m.away_team_id
+                LEFT JOIN leagues l ON l.id = m.league_id
                 WHERE (m.home_team_id = %(t)s OR m.away_team_id = %(t)s)
                   AND m.home_score IS NOT NULL
                 ORDER BY m.match_date DESC
@@ -149,6 +176,7 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
                     "date":     str(r["match_date"]) if r["match_date"] else None,
                     "opponent": r["opponent"],
                     "venue":    r["venue"],
+                    "league":   r.get("league_name") or "",
                     "score":    f"{ts}-{os_}",
                     "result":   "W" if ts > os_ else ("L" if ts < os_ else "D"),
                 })
@@ -157,9 +185,15 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
             log.debug("recent_results failed: %s", e)
             return []
 
-    def season_stats(tid: int):
+    # ── 2. Season stats — current season first, fallback to broader range ──
+    def season_stats(tid: int, sid: int = None):
+        """
+        Stats filtered to the current season. If fewer than 3 games found
+        (early season / brand-new season), automatically widens to include
+        the previous season as well, so the AI never sees empty data.
+        """
         try:
-            cur.execute("""
+            base_sql = """
                 SELECT
                     COUNT(*) AS played,
                     SUM(CASE WHEN (home_team_id=%(t)s AND home_score>away_score)
@@ -174,9 +208,41 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
                 FROM matches
                 WHERE (home_team_id=%(t)s OR away_team_id=%(t)s)
                   AND home_score IS NOT NULL
-            """, {"t": tid})
-            r = cur.fetchone()
-            if not r or not r["played"]: return {}
+                  {season_filter}
+            """
+
+            def _run(extra_filter, params):
+                cur.execute(base_sql.format(season_filter=extra_filter), params)
+                r = cur.fetchone()
+                return r if (r and r["played"]) else None
+
+            r = None
+            note = "all seasons"
+
+            # Try current season
+            if sid:
+                r = _run("AND season_id = %(s)s", {"t": tid, "s": sid})
+                if r and r["played"]:
+                    note = "current season"
+
+            # If fewer than 3 games in current season, include previous season too
+            if (not r or r["played"] < 3) and sid:
+                r2 = _run(
+                    "AND season_id IN (%(s)s, %(s)s - 1)",
+                    {"t": tid, "s": sid}
+                )
+                if r2 and r2["played"] >= (r["played"] if r else 0):
+                    r = r2
+                    note = "current + previous season"
+
+            # Last resort: all seasons (always has data)
+            if not r or not r["played"]:
+                r = _run("", {"t": tid})
+                note = "all seasons (fallback)"
+
+            if not r or not r["played"]:
+                return {}
+
             p = r["played"]
             return {
                 "played":            p,
@@ -188,21 +254,25 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
                 "avg_goals_for":     round((r["gf"] or 0) / p, 2),
                 "avg_goals_against": round((r["ga"] or 0) / p, 2),
                 "clean_sheets":      r["cs"]     or 0,
+                "data_scope":        note,
             }
         except Exception as e:
             log.debug("season_stats failed: %s", e)
             return {}
 
+    # ── 3. Head-to-head (last 8 meetings, all time) ────────────────────────
     def h2h(htid: int, atid: int, n: int = 8):
         try:
             cur.execute("""
                 SELECT
                     m.match_date,
                     ht4.name AS home_team, at4.name AS away_team,
-                    m.home_team_id, m.home_score, m.away_score
+                    m.home_team_id, m.home_score, m.away_score,
+                    l.name AS league_name
                 FROM matches m
                 JOIN teams ht4 ON ht4.id = m.home_team_id
                 JOIN teams at4 ON at4.id = m.away_team_id
+                LEFT JOIN leagues l ON l.id = m.league_id
                 WHERE ((m.home_team_id=%(h)s AND m.away_team_id=%(a)s)
                     OR (m.home_team_id=%(a)s AND m.away_team_id=%(h)s))
                   AND m.home_score IS NOT NULL
@@ -230,26 +300,49 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
                     "away":   r["away_team"],
                     "score":  f"{hs}-{as_}",
                     "winner": winner,
+                    "league": r.get("league_name") or "",
                 })
             return {"summary": {"home_wins": hw, "draws": dr, "away_wins": aw}, "matches": matches}
         except Exception as e:
             log.debug("h2h failed: %s", e)
             return {}
 
-    def standings(tid: int):
+    # ── 4. League standings (season + league filtered, with fallback) ───────
+    def standings(tid: int, sid: int = None, lid: int = None):
         try:
-            cur.execute("""
+            params: dict = {"t": tid}
+            filters = ["ls.team_id = %(t)s"]
+            if sid:
+                filters.append("ls.season_id = %(s)s"); params["s"] = sid
+            if lid:
+                filters.append("ls.league_id = %(l)s"); params["l"] = lid
+            where = " AND ".join(filters)
+            cur.execute(f"""
                 SELECT ls.wins, ls.ties, ls.losses, ls.games,
-                       ls.goals_for, ls.goals_against, ls.points, ls.rank
+                       ls.goals_for, ls.goals_against, ls.points, ls.rank,
+                       ls.points_avg
                 FROM league_standings ls
-                WHERE ls.team_id = %s
+                WHERE {where}
                 ORDER BY ls.season_id DESC LIMIT 1
-            """, (tid,))
+            """, params)
             r = cur.fetchone()
-            if not r: return {}
+            # Fallback: no season/league filter
+            if not r:
+                cur.execute("""
+                    SELECT ls.wins, ls.ties, ls.losses, ls.games,
+                           ls.goals_for, ls.goals_against, ls.points, ls.rank,
+                           ls.points_avg
+                    FROM league_standings ls
+                    WHERE ls.team_id = %s
+                    ORDER BY ls.season_id DESC LIMIT 1
+                """, (tid,))
+                r = cur.fetchone()
+            if not r:
+                return {}
             return {
                 "rank":          r["rank"],
                 "points":        r["points"],
+                "points_avg":    r.get("points_avg"),
                 "played":        r["games"],
                 "wins":          r["wins"],
                 "draws":         r["ties"],
@@ -262,16 +355,325 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int) -> dict:
             log.debug("standings failed: %s", e)
             return {}
 
+    # ── 5. Squad stats (possession, shooting %, save %) ────────────────────
+    def squad_stats(tid: int, sid: int = None):
+        try:
+            params: dict = {"t": tid}
+            season_filter = "AND tss.season_id = %(s)s" if sid else ""
+            if sid:
+                params["s"] = sid
+            # Try 'overall' split first, fall back to 'for'
+            for split in ("overall", "for"):
+                params["sp"] = split
+                cur.execute(f"""
+                    SELECT tss.possession, tss.avg_age, tss.players_used,
+                           tss.goals, tss.assists, tss.games,
+                           tss.shooting, tss.goalkeeping, tss.misc_stats,
+                           tss.standard_stats
+                    FROM team_squad_stats tss
+                    WHERE tss.team_id = %(t)s
+                      AND tss.split = %(sp)s
+                      {season_filter}
+                    ORDER BY tss.season_id DESC LIMIT 1
+                """, params)
+                r = cur.fetchone()
+                if r:
+                    break
+            if not r:
+                return {}
+            shooting = r["shooting"] if isinstance(r["shooting"], dict) else {}
+            gk       = r["goalkeeping"] if isinstance(r["goalkeeping"], dict) else {}
+            misc     = r["misc_stats"] if isinstance(r["misc_stats"], dict) else {}
+            ss       = r["standard_stats"] if isinstance(r["standard_stats"], dict) else {}
+            return {
+                "possession":          r.get("possession"),
+                "avg_age":             r.get("avg_age"),
+                "players_used":        r.get("players_used"),
+                "goals":               r.get("goals"),
+                "assists":             r.get("assists"),
+                "games":               r.get("games"),
+                "shots_on_target_pct": shooting.get("shots_on_target_pct"),
+                "goals_per_shot":      shooting.get("goals_per_shot"),
+                "shots_per90":         shooting.get("shots_per90"),
+                "save_pct":            gk.get("gk_save_pct"),
+                "clean_sheet_pct":     gk.get("gk_clean_sheets_pct"),
+                "goals_per90":         ss.get("goals_per90"),
+                "assists_per90":       ss.get("assists_per90"),
+                "yellow_cards":        misc.get("yellow_cards") or misc.get("cards_yellow"),
+                "red_cards":           misc.get("red_cards") or misc.get("cards_red"),
+            }
+        except Exception as e:
+            log.debug("squad_stats failed: %s", e)
+            return {}
+
+    # ── 6. Venue stats — home/away splits ──────────────────────────────────
+    def venue_stats(tid: int, sid: int = None):
+        try:
+            params: dict = {"t": tid}
+            season_filter = "AND tvs.season_id = %(s)s" if sid else ""
+            if sid:
+                params["s"] = sid
+            cur.execute(f"""
+                SELECT tvs.split, tvs.games, tvs.wins, tvs.ties, tvs.losses,
+                       tvs.goals_for, tvs.goals_against,
+                       tvs.xg_for, tvs.xg_against
+                FROM team_venue_stats tvs
+                WHERE tvs.team_id = %(t)s
+                  AND tvs.games > 0
+                  {season_filter}
+                ORDER BY tvs.season_id DESC, tvs.split
+            """, params)
+            rows = cur.fetchall()
+            result = {}
+            for r in rows:
+                split = r.get("split") or r.get("venue")
+                if split not in ("home", "away"):
+                    continue
+                g = r["games"] or 1
+                result[split] = {
+                    "games":         r["games"],
+                    "wins":          r["wins"],
+                    "draws":         r["ties"],
+                    "losses":        r["losses"],
+                    "goals_for":     r["goals_for"],
+                    "goals_against": r["goals_against"],
+                    "avg_gf":        round((r["goals_for"]  or 0) / g, 2),
+                    "avg_ga":        round((r["goals_against"] or 0) / g, 2),
+                    "win_rate":      round((r["wins"] or 0) / g, 2),
+                    "xg_for":        r.get("xg_for"),
+                    "xg_against":    r.get("xg_against"),
+                }
+            return result
+        except Exception as e:
+            log.debug("venue_stats failed: %s", e)
+            return {}
+
+    # ── 7. Top scorers ──────────────────────────────────────────────────────
+    def top_scorers(tid: int, sid: int = None):
+        try:
+            params: dict = {"t": tid}
+            season_filter = "AND ps.season_id = %(s)s" if sid else ""
+            if sid:
+                params["s"] = sid
+            cur.execute(f"""
+                SELECT ps.player_name, ps.goals, ps.assists, ps.minutes
+                FROM player_stats ps
+                WHERE ps.team_id = %(t)s
+                  AND ps.goals IS NOT NULL
+                  {season_filter}
+                ORDER BY ps.goals DESC, ps.assists DESC
+                LIMIT 4
+            """, params)
+            return [
+                {"name": r["player_name"], "goals": r["goals"],
+                 "assists": r.get("assists"), "minutes": r.get("minutes")}
+                for r in cur.fetchall()
+            ]
+        except Exception as e:
+            log.debug("top_scorers failed: %s", e)
+            return []
+
+    # ── 8. Current injuries / suspensions ──────────────────────────────────
+    def injuries(tid: int):
+        try:
+            cur.execute("""
+                SELECT pi.player_name, pi.status, pi.injury_type, pi.return_date
+                FROM player_injuries pi
+                WHERE pi.team_id = %s
+                  AND pi.status IN ('injured', 'doubtful', 'suspended')
+                ORDER BY pi.updated_at DESC
+                LIMIT 6
+            """, (tid,))
+            return [
+                {
+                    "name":   r["player_name"],
+                    "status": r["status"],
+                    "type":   r.get("injury_type"),
+                    "return": str(r["return_date"]) if r.get("return_date") else None,
+                }
+                for r in cur.fetchall()
+            ]
+        except Exception as e:
+            log.debug("injuries failed: %s", e)
+            return []
+
+    # ── 9. ClubElo ratings (most recent available for each team) ───────────
+    def clubelo(htid: int, atid: int):
+        """
+        Fetch latest ELO ratings + the match-specific win probability forecast
+        from team_clubelo (the same data the DC engine blends with its Poisson).
+        Falls back to latest available rating if no fixture-specific row exists.
+        """
+        try:
+            result = {}
+
+            def _latest_elo(tid: int, label: str):
+                cur.execute("""
+                    SELECT elo, elo_date, raw_data
+                    FROM team_clubelo
+                    WHERE team_id = %s
+                    ORDER BY elo_date DESC LIMIT 1
+                """, (tid,))
+                r = cur.fetchone()
+                if not r:
+                    return
+                result[f"{label}_elo"]      = r["elo"]
+                result[f"{label}_elo_date"] = str(r["elo_date"]) if r["elo_date"] else None
+                rd = r.get("raw_data") or {}
+                if isinstance(rd, str):
+                    import json as _json
+                    try: rd = _json.loads(rd)
+                    except Exception: rd = {}
+                inner = rd.get("raw", rd)
+                if inner:
+                    def _pf(key):
+                        v = inner.get(key)
+                        try: return float(v) if v is not None else None
+                        except (TypeError, ValueError): return None
+                    # Rebuild 1X2 from goal-difference probability buckets
+                    hw = sum(filter(None, [_pf(f"GD={i}") for i in range(1, 6)])) or 0
+                    hw += _pf("GD>5") or 0
+                    dr  = _pf("GD=0") or 0
+                    aw  = sum(filter(None, [_pf(f"GD={-i}") for i in range(1, 6)])) or 0
+                    aw += _pf("GD<-5") or 0
+                    total = hw + dr + aw
+                    if total > 0.5 and label == "home":   # only store once from home row
+                        result["clubelo_home_win_pct"] = round(hw / total * 100, 1)
+                        result["clubelo_draw_pct"]     = round(dr / total * 100, 1)
+                        result["clubelo_away_win_pct"] = round(aw / total * 100, 1)
+
+            _latest_elo(htid, "home")
+            _latest_elo(atid, "away")
+
+            if "home_elo" in result and "away_elo" in result:
+                result["elo_gap"] = round(result["home_elo"] - result["away_elo"], 1)
+
+            return result
+        except Exception as e:
+            log.debug("clubelo failed: %s", e)
+            return {}
+
+    # ── 10. Bookmaker odds (B365 + Over/Under, latest scraped) ─────────────
+    def match_odds(mid: int = None, htid: int = None, atid: int = None):
+        """
+        Fetch latest bookmaker odds from match_odds.
+        Tries match_id lookup first; falls back to home+away team lookup.
+        Converts raw B365 decimal odds to implied probability percentages.
+        """
+        try:
+            row = None
+            if mid:
+                cur.execute("""
+                    SELECT b365_home_win, b365_draw, b365_away_win, raw_data
+                    FROM match_odds
+                    WHERE match_id = %s
+                    ORDER BY scraped_at DESC LIMIT 1
+                """, (mid,))
+                row = cur.fetchone()
+
+            if not row and htid and atid:
+                cur.execute("""
+                    SELECT mo.b365_home_win, mo.b365_draw, mo.b365_away_win, mo.raw_data
+                    FROM match_odds mo
+                    JOIN matches m ON m.id = mo.match_id
+                    WHERE (m.home_team_id = %s AND m.away_team_id = %s)
+                      AND m.home_score IS NULL
+                    ORDER BY mo.scraped_at DESC LIMIT 1
+                """, (htid, atid))
+                row = cur.fetchone()
+
+            if not row:
+                return {}
+
+            def _implied(decimal_odds):
+                """Convert decimal odds to implied probability %."""
+                try:
+                    v = float(decimal_odds)
+                    return round((1.0 / v) * 100, 1) if v > 1.0 else None
+                except (TypeError, ValueError, ZeroDivisionError):
+                    return None
+
+            hw_prob = _implied(row.get("b365_home_win"))
+            dr_prob = _implied(row.get("b365_draw"))
+            aw_prob = _implied(row.get("b365_away_win"))
+
+            # Margin-normalised implied probs (remove the bookmaker's overround)
+            margin = (hw_prob or 0) + (dr_prob or 0) + (aw_prob or 0)
+            if margin > 0:
+                hw_norm = round(hw_prob / margin * 100, 1) if hw_prob else None
+                dr_norm = round(dr_prob / margin * 100, 1) if dr_prob else None
+                aw_norm = round(aw_prob / margin * 100, 1) if aw_prob else None
+            else:
+                hw_norm = dr_norm = aw_norm = None
+
+            result: dict = {
+                "b365_home_win":     row.get("b365_home_win"),
+                "b365_draw":         row.get("b365_draw"),
+                "b365_away_win":     row.get("b365_away_win"),
+                "implied_home_pct":  hw_prob,
+                "implied_draw_pct":  dr_prob,
+                "implied_away_pct":  aw_prob,
+                "norm_home_pct":     hw_norm,
+                "norm_draw_pct":     dr_norm,
+                "norm_away_pct":     aw_norm,
+                "overround_pct":     round(margin - 100, 1) if margin > 0 else None,
+            }
+
+            # Additional markets from raw_data JSON if available
+            rd = row.get("raw_data") or {}
+            if isinstance(rd, str):
+                import json as _json
+                try: rd = _json.loads(rd)
+                except Exception: rd = {}
+            if rd:
+                def _safe_float(key):
+                    try: return float(rd[key]) if rd.get(key) else None
+                    except (TypeError, ValueError): return None
+
+                for key, label in [
+                    ("b365_over_2_5",  "b365_over25"),
+                    ("b365_under_2_5", "b365_under25"),
+                    ("asian_hdcp",     "asian_hdcp"),
+                    ("ah_home",        "ah_home_odds"),
+                    ("ah_away",        "ah_away_odds"),
+                ]:
+                    v = _safe_float(key)
+                    if v:
+                        result[label] = v
+                        if key in ("b365_over_2_5", "b365_under_2_5"):
+                            result[f"implied_{label}_pct"] = round((1.0 / v) * 100, 1)
+
+            return result
+        except Exception as e:
+            log.debug("match_odds failed: %s", e)
+            return {}
+
+    # ── Assemble everything ─────────────────────────────────────────────────
+    elo_data  = clubelo(home_team_id, away_team_id)
+    odds_data = match_odds(mid=match_id, htid=home_team_id, atid=away_team_id)
+
     return {
-        "home_form":      recent_results(home_team_id),
-        "away_form":      recent_results(away_team_id),
-        "home_season":    season_stats(home_team_id),
-        "away_season":    season_stats(away_team_id),
-        "h2h":            h2h(home_team_id, away_team_id),
-        "home_standings": standings(home_team_id),
-        "away_standings": standings(away_team_id),
+        "home_form":         recent_results(home_team_id),
+        "away_form":         recent_results(away_team_id),
+        "home_season":       season_stats(home_team_id, season_id),
+        "away_season":       season_stats(away_team_id, season_id),
+        "h2h":               h2h(home_team_id, away_team_id),
+        "home_standings":    standings(home_team_id, season_id, league_id),
+        "away_standings":    standings(away_team_id, season_id, league_id),
+        "home_squad":        squad_stats(home_team_id, season_id),
+        "away_squad":        squad_stats(away_team_id, season_id),
+        "home_venue":        venue_stats(home_team_id, season_id),
+        "away_venue":        venue_stats(away_team_id, season_id),
+        "home_top_scorers":  top_scorers(home_team_id, season_id),
+        "away_top_scorers":  top_scorers(away_team_id, season_id),
+        "home_injuries":     injuries(home_team_id),
+        "away_injuries":     injuries(away_team_id),
+        "clubelo":           elo_data,
+        "odds":              odds_data,
     }
 
+
+# ─── Context Builder ───────────────────────────────────────────────────────────
 
 def _build_context(match_data: dict, db_ctx: dict) -> str:
     m         = match_data.get("match", {})
@@ -300,14 +702,16 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
             return f"  {team_name}: no recent results available"
         lines = [f"  {team_name} last {len(form_list)} results:"]
         for f in form_list:
-            lines.append(f"    {f.get('date','?')} [{f.get('venue','?')}] vs {f.get('opponent','?')} "
-                         f"{f.get('score','?')} ({f.get('result','?')})")
+            league_tag = f" ({f.get('league','')})" if f.get("league") else ""
+            lines.append(f"    {f.get('date','?')} [{f.get('venue','?')}] vs {f.get('opponent','?')}"
+                         f"{league_tag} {f.get('score','?')} ({f.get('result','?')})")
         return "\n".join(lines)
 
     def fmt_stats(stats, team_name):
         if not stats:
             return f"  {team_name}: no season stats available"
-        return (f"  {team_name}: P{stats.get('played',0)} "
+        scope = f" [{stats.get('data_scope','')}]" if stats.get("data_scope") else ""
+        return (f"  {team_name}{scope}: P{stats.get('played',0)} "
                 f"W{stats.get('wins',0)} D{stats.get('draws',0)} L{stats.get('losses',0)} | "
                 f"GF {stats.get('goals_for',0)} GA {stats.get('goals_against',0)} | "
                 f"Avg scored {stats.get('avg_goals_for','?')} conceded {stats.get('avg_goals_against','?')} | "
@@ -316,8 +720,11 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
     def fmt_standings(st, team_name):
         if not st:
             return f"  {team_name}: no standings data"
+        pts_avg = f" | {st.get('points_avg'):.2f} pts/game" if st.get("points_avg") else ""
         return (f"  {team_name}: Rank {st.get('rank','?')} | "
-                f"{st.get('points','?')} pts | GD {st.get('goal_diff','?')}")
+                f"{st.get('points','?')} pts{pts_avg} | "
+                f"W{st.get('wins',0)} D{st.get('draws',0)} L{st.get('losses',0)} | "
+                f"GD {st.get('goal_diff','?')}")
 
     def fmt_h2h(h2h_data, home_name, away_name):
         if not h2h_data or not h2h_data.get("matches"):
@@ -327,20 +734,116 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
                  f"{home_name} wins {s.get('home_wins',0)} | "
                  f"Draws {s.get('draws',0)} | "
                  f"{away_name} wins {s.get('away_wins',0)}"]
-        for match in h2h_data.get("matches", [])[:5]:
-            lines.append(f"    {match.get('date','?')}: {match.get('home','?')} vs {match.get('away','?')} "
+        for match in h2h_data.get("matches", [])[:6]:
+            league_tag = f" ({match.get('league','')})" if match.get("league") else ""
+            lines.append(f"    {match.get('date','?')}{league_tag}: "
+                         f"{match.get('home','?')} vs {match.get('away','?')} "
                          f"{match.get('score','?')} -> {match.get('winner','?')}")
         return "\n".join(lines)
 
+    def fmt_squad(sq, team_name):
+        if not sq:
+            return f"  {team_name}: no squad stats available"
+        parts = []
+        if sq.get("possession") is not None:
+            parts.append(f"Possession {sq['possession']}%")
+        if sq.get("avg_age"):
+            parts.append(f"Avg age {sq['avg_age']}")
+        if sq.get("shots_on_target_pct") is not None:
+            parts.append(f"SoT% {sq['shots_on_target_pct']}")
+        if sq.get("goals_per_shot") is not None:
+            parts.append(f"Goals/shot {sq['goals_per_shot']}")
+        if sq.get("save_pct") is not None:
+            parts.append(f"Save% {sq['save_pct']}")
+        if sq.get("clean_sheet_pct") is not None:
+            parts.append(f"CS% {sq['clean_sheet_pct']}")
+        return f"  {team_name}: {' | '.join(parts)}" if parts else f"  {team_name}: data present but all null"
+
+    def fmt_venue(venue_dict, team_name):
+        if not venue_dict:
+            return f"  {team_name}: no venue split data"
+        lines = []
+        for split in ("home", "away"):
+            v = venue_dict.get(split)
+            if not v:
+                continue
+            xg_tag = f" | xG for {v['xg_for']} against {v['xg_against']}" if v.get("xg_for") else ""
+            lines.append(
+                f"  {team_name} ({split.upper()}): {v['games']}G "
+                f"W{v['wins']} D{v['draws']} L{v['losses']} | "
+                f"Avg {v['avg_gf']}-{v['avg_ga']}{xg_tag}"
+            )
+        return "\n".join(lines) if lines else f"  {team_name}: no venue data"
+
+    def fmt_scorers(scorers, team_name):
+        if not scorers:
+            return f"  {team_name}: no scorer data"
+        parts = [f"{s['name']} {s['goals']}G/{s.get('assists','?')}A" for s in scorers]
+        return f"  {team_name}: {', '.join(parts)}"
+
+    def fmt_injuries(inj_list, team_name):
+        if not inj_list:
+            return f"  {team_name}: no injury/suspension concerns reported"
+        parts = [f"{i['name']} ({i['status']}" + (f", {i['type']}" if i.get('type') else "") +
+                 (f", back {i['return']}" if i.get('return') else "") + ")"
+                 for i in inj_list]
+        return f"  {team_name}: {', '.join(parts)}"
+
+    def fmt_elo(elo):
+        if not elo:
+            return "  No ClubElo data available"
+        lines = []
+        if elo.get("home_elo"):
+            lines.append(f"  {home}: ELO {elo['home_elo']} (as of {elo.get('home_elo_date','?')})")
+        if elo.get("away_elo"):
+            lines.append(f"  {away}: ELO {elo['away_elo']} (as of {elo.get('away_elo_date','?')})")
+        if elo.get("elo_gap") is not None:
+            lines.append(f"  ELO gap (home - away): {elo['elo_gap']}")
+        if elo.get("clubelo_home_win_pct") is not None:
+            lines.append(f"  ClubElo forecast: {home} {elo['clubelo_home_win_pct']}% | "
+                         f"Draw {elo['clubelo_draw_pct']}% | {away} {elo['clubelo_away_win_pct']}%")
+        return "\n".join(lines) if lines else "  ClubElo: no data"
+
+    def fmt_odds(odds):
+        if not odds:
+            return "  No bookmaker odds available"
+        lines = []
+        if odds.get("b365_home_win"):
+            lines.append(
+                f"  B365 odds: {home} {odds['b365_home_win']} | "
+                f"Draw {odds['b365_draw']} | {away} {odds['b365_away_win']}"
+            )
+        if odds.get("norm_home_pct") is not None:
+            lines.append(
+                f"  Implied (margin-adjusted): {home} {odds['norm_home_pct']}% | "
+                f"Draw {odds['norm_draw_pct']}% | {away} {odds['norm_away_pct']}%"
+                + (f" (overround {odds['overround_pct']}%)" if odds.get("overround_pct") else "")
+            )
+        if odds.get("b365_over25"):
+            lines.append(
+                f"  Over 2.5 odds: {odds['b365_over25']} "
+                f"({odds.get('implied_b365_over25_pct','?')}% implied)"
+            )
+        if odds.get("b365_under25"):
+            lines.append(
+                f"  Under 2.5 odds: {odds['b365_under25']} "
+                f"({odds.get('implied_b365_under25_pct','?')}% implied)"
+            )
+        if odds.get("asian_hdcp") is not None:
+            lines.append(f"  Asian handicap: {odds['asian_hdcp']} | "
+                         f"Home {odds.get('ah_home_odds','?')} / Away {odds.get('ah_away_odds','?')}")
+        return "\n".join(lines) if lines else "  Odds: data present but empty"
+
+    # ── Assemble the full context string ───────────────────────────────────
     lines = [
         "=" * 60,
         f"MATCH: {home} vs {away}",
         f"League: {m.get('league', 'Unknown')} | Season: {m.get('season', 'Unknown')}",
         "=" * 60,
         "",
-        "--- SECTION 1: RAW DATABASE DATA ---",
+        "━━━ SECTION 1: RAW DATABASE DATA ━━━",
         "",
-        "RECENT FORM (last 5 matches):",
+        "RECENT FORM (last 6 matches, any competition):",
         fmt_form(db_ctx.get("home_form", []), home),
         fmt_form(db_ctx.get("away_form", []), away),
         "",
@@ -352,10 +855,32 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
         fmt_standings(db_ctx.get("home_standings", {}), home),
         fmt_standings(db_ctx.get("away_standings", {}), away),
         "",
-        "HEAD-TO-HEAD HISTORY:",
+        "HEAD-TO-HEAD HISTORY (last 8 meetings):",
         fmt_h2h(db_ctx.get("h2h", {}), home, away),
         "",
-        "--- SECTION 2: ENGINE PREDICTIONS ---",
+        "SQUAD STATS (possession, shooting, goalkeeping):",
+        fmt_squad(db_ctx.get("home_squad", {}), home),
+        fmt_squad(db_ctx.get("away_squad", {}), away),
+        "",
+        "VENUE SPLITS (home/away performance):",
+        fmt_venue(db_ctx.get("home_venue", {}), home),
+        fmt_venue(db_ctx.get("away_venue", {}), away),
+        "",
+        "TOP SCORERS:",
+        fmt_scorers(db_ctx.get("home_top_scorers", []), home),
+        fmt_scorers(db_ctx.get("away_top_scorers", []), away),
+        "",
+        "INJURIES / SUSPENSIONS:",
+        fmt_injuries(db_ctx.get("home_injuries", []), home),
+        fmt_injuries(db_ctx.get("away_injuries", []), away),
+        "",
+        "CLUBELO RATINGS:",
+        fmt_elo(db_ctx.get("clubelo", {})),
+        "",
+        "BOOKMAKER ODDS:",
+        fmt_odds(db_ctx.get("odds", {})),
+        "",
+        "━━━ SECTION 2: ENGINE PREDICTIONS ━━━",
         "",
         "CONSENSUS (blended output):",
         f"  Predicted outcome: {con.get('predicted_outcome', 'N/A')}",
@@ -376,7 +901,7 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
 
     if mkt:
         lines += [
-            "MARKET PROBABILITIES:",
+            "MARKET PROBABILITIES (from prediction engine):",
             f"  xG: {home} {mkt.get('home_xg','?')} - {away} {mkt.get('away_xg','?')}",
             f"  BTTS Yes: {pct(mkt.get('btts_yes'))} | Over 2.5: {pct(mkt.get('over_2_5'))} | Under 2.5: {pct(mkt.get('under_2_5'))}",
             f"  Double Chance 1X: {pct(mkt.get('dc_1x'))} | X2: {pct(mkt.get('dc_x2'))}",
@@ -392,6 +917,8 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
 
     return "\n".join(lines)
 
+
+# ─── Prediction Data Fetcher ──────────────────────────────────────────────────
 
 def _fetch_prediction_data(
     conn, match_id=None, home_team_id=None, away_team_id=None,
@@ -471,6 +998,8 @@ def _fetch_prediction_data(
     return {}
 
 
+# ─── LLM Callers ──────────────────────────────────────────────────────────────
+
 async def _ask_groq(context: str, question: str, model: str) -> str:
     import httpx
     if not GROQ_API_KEY:
@@ -483,7 +1012,7 @@ async def _ask_groq(context: str, question: str, model: str) -> str:
             json={
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 700,
+                "max_tokens": 800,
                 "temperature": 0.3,
             },
         )
@@ -503,12 +1032,14 @@ async def _ask_gemini(context: str, question: str, model: str) -> str:
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 700, "temperature": 0.3},
+                "generationConfig": {"maxOutputTokens": 800, "temperature": 0.3},
             },
         )
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
 
 @router.get("/models")
 async def list_models():
@@ -531,8 +1062,9 @@ async def list_models():
 async def ask_prediction(req: AskRequest):
     """
     Answer any question about a match prediction.
-    The LLM reads raw DB data (form, H2H, stats, standings), makes its own
-    independent assessment, compares it against the three engine predictions,
+    The LLM reads ALL available DB data (form, H2H, stats, standings, squad stats,
+    venue splits, top scorers, injuries, ClubElo ratings, bookmaker odds), makes
+    its own independent assessment, compares it against the three engine predictions,
     then directly answers the user's question.
     """
     if not req.question or not req.question.strip():
@@ -561,11 +1093,22 @@ async def ask_prediction(req: AskRequest):
         if not match_data:
             raise HTTPException(status_code=404, detail="No prediction data found for this match.")
 
-        htid = req.home_team_id or match_data.get("match", {}).get("home_team_id")
-        atid = req.away_team_id or match_data.get("match", {}).get("away_team_id")
+        htid    = req.home_team_id or match_data.get("match", {}).get("home_team_id")
+        atid    = req.away_team_id or match_data.get("match", {}).get("away_team_id")
+        sid_ctx = req.season_id    or match_data.get("match", {}).get("season_id")
+        lid_ctx = req.league_id    or match_data.get("match", {}).get("league_id")
+        mid_ctx = req.match_id     or match_data.get("match", {}).get("id")
 
         cur = conn.cursor()
-        db_ctx = _fetch_db_context(cur, htid, atid) if htid and atid else {}
+        db_ctx = (
+            _fetch_db_context(
+                cur, htid, atid,
+                season_id=sid_ctx,
+                league_id=lid_ctx,
+                match_id=mid_ctx,
+            )
+            if htid and atid else {}
+        )
 
     finally:
         conn.close()
@@ -628,14 +1171,20 @@ async def ask_prediction(req: AskRequest):
         "model":    used_model,
         "match":    match_data.get("match", {}),
         "context_snapshot": {
-            "consensus_outcome": match_data.get("consensus", {}).get("predicted_outcome"),
-            "confidence":        match_data.get("consensus", {}).get("confidence"),
-            "agreement":         match_data.get("agreement"),
-            "best_bets_count":   len(match_data.get("best_bets", [])),
-            "has_market_data":   bool(match_data.get("markets")),
-            "has_db_context":    bool(db_ctx),
-            "home_form_games":   len(db_ctx.get("home_form", [])),
-            "away_form_games":   len(db_ctx.get("away_form", [])),
-            "h2h_games":         len(db_ctx.get("h2h", {}).get("matches", [])),
+            "consensus_outcome":  match_data.get("consensus", {}).get("predicted_outcome"),
+            "confidence":         match_data.get("consensus", {}).get("confidence"),
+            "agreement":          match_data.get("agreement"),
+            "best_bets_count":    len(match_data.get("best_bets", [])),
+            "has_market_data":    bool(match_data.get("markets")),
+            "has_db_context":     bool(db_ctx),
+            "home_form_games":    len(db_ctx.get("home_form", [])),
+            "away_form_games":    len(db_ctx.get("away_form", [])),
+            "h2h_games":          len(db_ctx.get("h2h", {}).get("matches", [])),
+            "has_squad_stats":    bool(db_ctx.get("home_squad") or db_ctx.get("away_squad")),
+            "has_venue_stats":    bool(db_ctx.get("home_venue") or db_ctx.get("away_venue")),
+            "has_clubelo":        bool(db_ctx.get("clubelo")),
+            "has_odds":           bool(db_ctx.get("odds")),
+            "home_injuries":      len(db_ctx.get("home_injuries", [])),
+            "away_injuries":      len(db_ctx.get("away_injuries", [])),
         },
     }
