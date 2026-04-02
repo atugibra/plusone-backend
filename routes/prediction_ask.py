@@ -31,7 +31,7 @@ GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
 SYSTEM_PROMPT = """You are PlusOne AI, an expert football match prediction analyst.
 You answer user questions about a specific match prediction made by the PlusOne Consensus Engine.
@@ -134,8 +134,12 @@ def _build_context(match_data: dict) -> str:
 async def _ask_groq(context: str, question: str) -> str:
     try:
         import httpx
-    except ImportError:
-        raise ValueError("httpx not installed — add 'httpx>=0.27.0' to requirements.txt")
+    except ImportError as e:
+        import traceback
+        err_msg = f"httpx import failed: {str(e)}\n{traceback.format_exc()}"
+        print(err_msg)
+        log.error(err_msg)
+        raise ValueError(f"httpx not installed or broken: {str(e)}")
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set")
     prompt = SYSTEM_PROMPT.format(context=context)
@@ -161,8 +165,12 @@ async def _ask_groq(context: str, question: str) -> str:
 async def _ask_gemini(context: str, question: str) -> str:
     try:
         import httpx
-    except ImportError:
-        raise ValueError("httpx not installed — add 'httpx>=0.27.0' to requirements.txt")
+    except ImportError as e:
+        import traceback
+        err_msg = f"httpx import failed: {str(e)}\n{traceback.format_exc()}"
+        print(err_msg)
+        log.error(err_msg)
+        raise ValueError(f"httpx not installed or broken: {str(e)}")
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
     prompt = SYSTEM_PROMPT.format(context=context)
