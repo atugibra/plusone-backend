@@ -357,50 +357,90 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
 
     # ── 5. Squad stats (possession, shooting %, save %) ────────────────────
     def squad_stats(tid: int, sid: int = None):
+        """
+        team_squad_stats splits: 'for' (attacking) and 'against' (defensive).
+        'overall' does NOT exist. goals/assists columns are NULL — they live
+        inside the standard_stats/shooting/goalkeeping JSONB columns.
+        season_id = 1 is current (2025-26). Falls back across seasons if empty.
+        """
         try:
             params: dict = {"t": tid}
             season_filter = "AND tss.season_id = %(s)s" if sid else ""
             if sid:
                 params["s"] = sid
-            # Try 'overall' split first, fall back to 'for'
-            for split in ("overall", "for"):
-                params["sp"] = split
-                cur.execute(f"""
+            # Fetch 'for' split (attacking stats) — this is the primary row
+            params["sp"] = "for"
+            cur.execute(f"""
+                SELECT tss.possession, tss.avg_age, tss.players_used,
+                       tss.games, tss.minutes_90s,
+                       tss.shooting, tss.goalkeeping, tss.misc_stats,
+                       tss.standard_stats, tss.playing_time
+                FROM team_squad_stats tss
+                WHERE tss.team_id = %(t)s
+                  AND tss.split = %(sp)s
+                  {season_filter}
+                ORDER BY tss.season_id DESC LIMIT 1
+            """, params)
+            r_for = cur.fetchone()
+            # If nothing for this season, try without season filter
+            if not r_for and sid:
+                cur.execute("""
                     SELECT tss.possession, tss.avg_age, tss.players_used,
-                           tss.goals, tss.assists, tss.games,
+                           tss.games, tss.minutes_90s,
                            tss.shooting, tss.goalkeeping, tss.misc_stats,
-                           tss.standard_stats
+                           tss.standard_stats, tss.playing_time
                     FROM team_squad_stats tss
-                    WHERE tss.team_id = %(t)s
-                      AND tss.split = %(sp)s
-                      {season_filter}
+                    WHERE tss.team_id = %s AND tss.split = 'for'
                     ORDER BY tss.season_id DESC LIMIT 1
-                """, params)
-                r = cur.fetchone()
-                if r:
-                    break
-            if not r:
+                """, (tid,))
+                r_for = cur.fetchone()
+            # Also fetch 'against' split for GK/defensive stats
+            params2 = {"t": tid, "sp": "against"}
+            sf2 = "AND tss.season_id = %(s)s" if sid else ""
+            if sid: params2["s"] = sid
+            cur.execute(f"""
+                SELECT tss.goalkeeping, tss.shooting
+                FROM team_squad_stats tss
+                WHERE tss.team_id = %(t)s
+                  AND tss.split = %(sp)s
+                  {sf2}
+                ORDER BY tss.season_id DESC LIMIT 1
+            """, params2)
+            r_ag = cur.fetchone()
+            if not r_for:
                 return {}
-            shooting = r["shooting"] if isinstance(r["shooting"], dict) else {}
-            gk       = r["goalkeeping"] if isinstance(r["goalkeeping"], dict) else {}
-            misc     = r["misc_stats"] if isinstance(r["misc_stats"], dict) else {}
-            ss       = r["standard_stats"] if isinstance(r["standard_stats"], dict) else {}
+            def _jget(blob, *keys):
+                if not isinstance(blob, dict): return None
+                for k in keys:
+                    v = blob.get(k)
+                    if v is not None:
+                        try: return float(v)
+                        except (TypeError, ValueError): pass
+                return None
+            sh  = r_for.get("shooting")  or {}
+            ss  = r_for.get("standard_stats") or {}
+            ms  = r_for.get("misc_stats") or {}
+            gk_ag = (r_ag.get("goalkeeping") if r_ag else None) or {}
             return {
-                "possession":          r.get("possession"),
-                "avg_age":             r.get("avg_age"),
-                "players_used":        r.get("players_used"),
-                "goals":               r.get("goals"),
-                "assists":             r.get("assists"),
-                "games":               r.get("games"),
-                "shots_on_target_pct": shooting.get("shots_on_target_pct"),
-                "goals_per_shot":      shooting.get("goals_per_shot"),
-                "shots_per90":         shooting.get("shots_per90"),
-                "save_pct":            gk.get("gk_save_pct"),
-                "clean_sheet_pct":     gk.get("gk_clean_sheets_pct"),
-                "goals_per90":         ss.get("goals_per90"),
-                "assists_per90":       ss.get("assists_per90"),
-                "yellow_cards":        misc.get("yellow_cards") or misc.get("cards_yellow"),
-                "red_cards":           misc.get("red_cards") or misc.get("cards_red"),
+                "possession":          r_for.get("possession"),
+                "avg_age":             r_for.get("avg_age"),
+                "players_used":        r_for.get("players_used"),
+                "games":               r_for.get("games"),
+                # Goals / assists come from standard_stats JSONB
+                "goals":               _jget(ss, "goals"),
+                "assists":             _jget(ss, "assists"),
+                "goals_per90":         _jget(ss, "goals_per90"),
+                "assists_per90":       _jget(ss, "assists_per90"),
+                # Shooting from shooting JSONB
+                "shots_on_target_pct": _jget(sh, "shots_on_target_pct"),
+                "goals_per_shot":      _jget(sh, "goals_per_shot"),
+                "shots_per90":         _jget(sh, "shots_per90"),
+                # GK from against split goalkeeping JSONB
+                "save_pct":            _jget(gk_ag, "gk_save_pct"),
+                "clean_sheet_pct":     _jget(gk_ag, "gk_clean_sheets_pct"),
+                # Discipline
+                "yellow_cards":        _jget(ms, "cards_yellow") or _jget(ms, "yellow_cards"),
+                "red_cards":           _jget(ms, "cards_red")    or _jget(ms, "red_cards"),
             }
         except Exception as e:
             log.debug("squad_stats failed: %s", e)
@@ -414,34 +454,34 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             if sid:
                 params["s"] = sid
             cur.execute(f"""
-                SELECT tvs.split, tvs.games, tvs.wins, tvs.ties, tvs.losses,
+                SELECT tvs.venue, tvs.games, tvs.wins, tvs.draws, tvs.losses,
                        tvs.goals_for, tvs.goals_against,
-                       tvs.xg_for, tvs.xg_against
+                       tvs.goal_diff, tvs.points
                 FROM team_venue_stats tvs
                 WHERE tvs.team_id = %(t)s
                   AND tvs.games > 0
                   {season_filter}
-                ORDER BY tvs.season_id DESC, tvs.split
+                ORDER BY tvs.season_id DESC, tvs.venue
             """, params)
             rows = cur.fetchall()
             result = {}
             for r in rows:
-                split = r.get("split") or r.get("venue")
+                split = r.get("venue") or r.get("split")  # column is 'venue' in DB
                 if split not in ("home", "away"):
                     continue
                 g = r["games"] or 1
                 result[split] = {
                     "games":         r["games"],
                     "wins":          r["wins"],
-                    "draws":         r["ties"],
+                    "draws":         r.get("draws") or 0,
                     "losses":        r["losses"],
                     "goals_for":     r["goals_for"],
                     "goals_against": r["goals_against"],
+                    "goal_diff":     r.get("goal_diff"),
+                    "points":        r.get("points"),
                     "avg_gf":        round((r["goals_for"]  or 0) / g, 2),
                     "avg_ga":        round((r["goals_against"] or 0) / g, 2),
                     "win_rate":      round((r["wins"] or 0) / g, 2),
-                    "xg_for":        r.get("xg_for"),
-                    "xg_against":    r.get("xg_against"),
                 }
             return result
         except Exception as e:
@@ -450,24 +490,38 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
 
     # ── 7. Top scorers ──────────────────────────────────────────────────────
     def top_scorers(tid: int, sid: int = None):
+        """
+        player_stats.season_id is NULL for all rows — cannot filter by it.
+        Uses the v_top_scorers view (which already joins team name + season)
+        then falls back to raw player_stats without season filter.
+        """
         try:
-            params: dict = {"t": tid}
-            season_filter = "AND ps.season_id = %(s)s" if sid else ""
-            if sid:
-                params["s"] = sid
-            cur.execute(f"""
-                SELECT ps.player_name, ps.goals, ps.assists, ps.minutes
-                FROM player_stats ps
-                WHERE ps.team_id = %(t)s
-                  AND ps.goals IS NOT NULL
-                  {season_filter}
-                ORDER BY ps.goals DESC, ps.assists DESC
-                LIMIT 4
-            """, params)
+            # Try the view first — it resolves team name so we match by team_id via join
+            cur.execute("""
+                SELECT vts.player_name, vts.goals, vts.assists, vts.minutes, vts.games
+                FROM v_top_scorers vts
+                JOIN teams t ON t.name = vts.team
+                WHERE t.id = %s
+                ORDER BY vts.goals DESC, vts.assists DESC
+                LIMIT 5
+            """, (tid,))
+            rows = cur.fetchall()
+            if not rows:
+                # Fallback: direct player_stats without season filter (season_id is NULL)
+                cur.execute("""
+                    SELECT ps.player_name, ps.goals, ps.assists, ps.minutes, ps.games
+                    FROM player_stats ps
+                    WHERE ps.team_id = %s
+                      AND ps.goals IS NOT NULL
+                    ORDER BY ps.goals DESC, ps.assists DESC
+                    LIMIT 5
+                """, (tid,))
+                rows = cur.fetchall()
             return [
                 {"name": r["player_name"], "goals": r["goals"],
-                 "assists": r.get("assists"), "minutes": r.get("minutes")}
-                for r in cur.fetchall()
+                 "assists": r.get("assists"), "minutes": r.get("minutes"),
+                 "games": r.get("games")}
+                for r in rows
             ]
         except Exception as e:
             log.debug("top_scorers failed: %s", e)
@@ -475,24 +529,47 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
 
     # ── 8. Current injuries / suspensions ──────────────────────────────────
     def injuries(tid: int):
+        """
+        player_injuries has: id, team_id, player_name, injury_type,
+        return_date, raw_data (jsonb), scraped_at. NO status column.
+        Pulls latest batch; falls back to all-time most recent if none in 30d.
+        """
         try:
             cur.execute("""
-                SELECT pi.player_name, pi.status, pi.injury_type, pi.return_date
+                SELECT pi.player_name, pi.injury_type, pi.return_date,
+                       pi.raw_data, pi.scraped_at
                 FROM player_injuries pi
                 WHERE pi.team_id = %s
-                  AND pi.status IN ('injured', 'doubtful', 'suspended')
-                ORDER BY pi.updated_at DESC
-                LIMIT 6
+                  AND pi.scraped_at >= NOW() - INTERVAL '30 days'
+                ORDER BY pi.scraped_at DESC
+                LIMIT 8
             """, (tid,))
-            return [
-                {
+            rows = cur.fetchall()
+            if not rows:
+                cur.execute("""
+                    SELECT pi.player_name, pi.injury_type, pi.return_date,
+                           pi.raw_data, pi.scraped_at
+                    FROM player_injuries pi
+                    WHERE pi.team_id = %s
+                    ORDER BY pi.scraped_at DESC
+                    LIMIT 8
+                """, (tid,))
+                rows = cur.fetchall()
+            result = []
+            for r in rows:
+                import json as _jj
+                rd = r.get("raw_data") or {}
+                if isinstance(rd, str):
+                    try: rd = _jj.loads(rd)
+                    except Exception: rd = {}
+                inj_type = r.get("injury_type") or rd.get("Injury") or "Unknown"
+                ret_date = r.get("return_date") or rd.get("Return") or None
+                result.append({
                     "name":   r["player_name"],
-                    "status": r["status"],
-                    "type":   r.get("injury_type"),
-                    "return": str(r["return_date"]) if r.get("return_date") else None,
-                }
-                for r in cur.fetchall()
-            ]
+                    "type":   inj_type if inj_type != "Unknown" else "injury/concern",
+                    "return": str(ret_date) if ret_date and str(ret_date) != "EMPTY" else None,
+                })
+            return result
         except Exception as e:
             log.debug("injuries failed: %s", e)
             return []
@@ -508,6 +585,11 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             result = {}
 
             def _latest_elo(tid: int, label: str):
+                """
+                team_clubelo: elo column is always NULL — ELO value is inside
+                raw_data JSONB. Structure: {"raw": {"Elo": "1850", "Away": "...",
+                "GD=0": "0.29", "GD=1": "0.24", ...}}.
+                """
                 cur.execute("""
                     SELECT elo, elo_date, raw_data
                     FROM team_clubelo
@@ -517,8 +599,23 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
                 r = cur.fetchone()
                 if not r:
                     return
-                result[f"{label}_elo"]      = r["elo"]
                 result[f"{label}_elo_date"] = str(r["elo_date"]) if r["elo_date"] else None
+                # Parse raw_data for the actual ELO value
+                import json as _jj2
+                rd = r.get("raw_data") or {}
+                if isinstance(rd, str):
+                    try: rd = _jj2.loads(rd)
+                    except Exception: rd = {}
+                inner = rd.get("raw", rd)
+                # ELO may be stored as "Elo" key, or fall back to r["elo"] if not NULL
+                elo_val = None
+                if isinstance(inner, dict):
+                    elo_val = inner.get("Elo") or inner.get("elo")
+                if elo_val is None and r.get("elo") is not None:
+                    elo_val = r["elo"]
+                if elo_val is not None:
+                    try: result[f"{label}_elo"] = float(elo_val)
+                    except (TypeError, ValueError): pass
                 rd = r.get("raw_data") or {}
                 if isinstance(rd, str):
                     import json as _json
@@ -619,29 +716,37 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
                 "overround_pct":     round(margin - 100, 1) if margin > 0 else None,
             }
 
-            # Additional markets from raw_data JSON if available
+            # Additional markets from raw_data JSON
+            # raw_data keys (from scraper): B365H, B365D, B365A, BbMx>2.5,
+            # BbMxAHH (Asian Handicap Home), AH (handicap size), etc.
+            import json as _json2
             rd = row.get("raw_data") or {}
             if isinstance(rd, str):
-                import json as _json
-                try: rd = _json.loads(rd)
+                try: rd = _json2.loads(rd)
                 except Exception: rd = {}
             if rd:
-                def _safe_float(key):
-                    try: return float(rd[key]) if rd.get(key) else None
+                def _sf(key):
+                    try: return float(rd[key]) if rd.get(key) not in (None, "", "0", 0) else None
                     except (TypeError, ValueError): return None
-
-                for key, label in [
-                    ("b365_over_2_5",  "b365_over25"),
-                    ("b365_under_2_5", "b365_under25"),
-                    ("asian_hdcp",     "asian_hdcp"),
-                    ("ah_home",        "ah_home_odds"),
-                    ("ah_away",        "ah_away_odds"),
-                ]:
-                    v = _safe_float(key)
-                    if v:
-                        result[label] = v
-                        if key in ("b365_over_2_5", "b365_under_2_5"):
-                            result[f"implied_{label}_pct"] = round((1.0 / v) * 100, 1)
+                # Over/Under 2.5 — try multiple possible key names
+                o25 = _sf("BbMx>2.5") or _sf("B365>2.5") or _sf("Bb1X2") or _sf("AvgC>2.5")
+                u25 = _sf("BbMx<2.5") or _sf("B365<2.5") or _sf("AvgC<2.5")
+                if o25:
+                    result["over25_odds"]         = o25
+                    result["implied_over25_pct"]  = round((1.0 / o25) * 100, 1)
+                if u25:
+                    result["under25_odds"]        = u25
+                    result["implied_under25_pct"] = round((1.0 / u25) * 100, 1)
+                # Asian handicap
+                ah_size = _sf("AH") or _sf("AHh")
+                ah_home = _sf("BbMxAHH") or _sf("LAHH") or _sf("AHH")
+                ah_away = _sf("BbMxAHA") or _sf("LAHA") or _sf("AHA")
+                if ah_size is not None: result["asian_hdcp"]    = ah_size
+                if ah_home:            result["ah_home_odds"]  = ah_home
+                if ah_away:            result["ah_away_odds"]  = ah_away
+                # BTTS (if available)
+                btts_y = _sf("BbMxBCH") or _sf("BTSSH")
+                if btts_y: result["btts_yes_odds"] = btts_y
 
             return result
         except Exception as e:
@@ -819,20 +924,22 @@ def _build_context(match_data: dict, db_ctx: dict) -> str:
                 f"Draw {odds['norm_draw_pct']}% | {away} {odds['norm_away_pct']}%"
                 + (f" (overround {odds['overround_pct']}%)" if odds.get("overround_pct") else "")
             )
-        if odds.get("b365_over25"):
+        if odds.get("over25_odds"):
             lines.append(
-                f"  Over 2.5 odds: {odds['b365_over25']} "
-                f"({odds.get('implied_b365_over25_pct','?')}% implied)"
+                f"  Over 2.5 odds: {odds['over25_odds']} "
+                f"({odds.get('implied_over25_pct','?')}% implied)"
             )
-        if odds.get("b365_under25"):
+        if odds.get("under25_odds"):
             lines.append(
-                f"  Under 2.5 odds: {odds['b365_under25']} "
-                f"({odds.get('implied_b365_under25_pct','?')}% implied)"
+                f"  Under 2.5 odds: {odds['under25_odds']} "
+                f"({odds.get('implied_under25_pct','?')}% implied)"
             )
         if odds.get("asian_hdcp") is not None:
             lines.append(f"  Asian handicap: {odds['asian_hdcp']} | "
                          f"Home {odds.get('ah_home_odds','?')} / Away {odds.get('ah_away_odds','?')}")
-        return "\n".join(lines) if lines else "  Odds: data present but empty"
+        if odds.get("btts_yes_odds"):
+            lines.append(f"  BTTS Yes odds: {odds['btts_yes_odds']}")
+        return "\n".join(lines) if lines else "  Odds fetched but no displayable fields"
 
     # ── Assemble the full context string ───────────────────────────────────
     lines = [
