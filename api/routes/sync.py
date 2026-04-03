@@ -399,23 +399,29 @@ def sync_status():
     conn = get_connection()
     cur = conn.cursor()
     try:
-        # Per-league: last sync time and total rows inserted
-        cur.execute("""
-            SELECT
-                l.name            AS league,
-                s.name            AS season,
-                sl.page_type,
-                SUM(sl.rows_inserted) AS rows,
-                MAX(sl.scraped_at)    AS last_sync
-            FROM scrape_log sl
-            JOIN leagues  l ON l.id = sl.league_id
-            JOIN seasons  s ON s.id = sl.season_id
-            GROUP BY l.name, s.name, sl.page_type
-            ORDER BY l.name, sl.page_type
-        """)
-        log_rows = cur.fetchall()
+        # ── Sync log history (requires scrape_log table) ───────────────────────
+        # If the table doesn't exist yet (fresh DB), skip gracefully.
+        log_rows = []
+        try:
+            cur.execute("""
+                SELECT
+                    l.name            AS league,
+                    s.name            AS season,
+                    sl.page_type,
+                    SUM(sl.rows_inserted) AS rows,
+                    MAX(sl.scraped_at)    AS last_sync
+                FROM scrape_log sl
+                JOIN leagues  l ON l.id = sl.league_id
+                JOIN seasons  s ON s.id = sl.season_id
+                GROUP BY l.name, s.name, sl.page_type
+                ORDER BY l.name, sl.page_type
+            """)
+            log_rows = cur.fetchall()
+        except Exception:
+            # scrape_log table may not exist on fresh deployments — safe to ignore
+            conn.rollback()
 
-        # Live counts per league from key tables
+        # ── Live counts per league from key tables ─────────────────────────────
         cur.execute("""
             SELECT l.name AS league,
                 COUNT(DISTINCT m.id)   AS fixtures,
@@ -430,7 +436,7 @@ def sync_status():
         """)
         live_rows = cur.fetchall()
 
-        # Build structured response
+        # ── Build structured response ──────────────────────────────────────────
         by_league = {}
         for r in log_rows:
             lg = r["league"]
