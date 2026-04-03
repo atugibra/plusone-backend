@@ -35,6 +35,7 @@ Usage:
 
 import logging
 import pickle
+import psycopg2
 import numpy as np
 from typing import Optional
 
@@ -257,7 +258,10 @@ class FeedbackCalibrator:
                      self.n_samples, self.post_accuracy * 100)
             return True
         except Exception as exc:
-            log.warning("FeedbackCalibrator.load() failed: %s", exc)
+            # Silently skip on fresh deployments where ml_models table doesn't exist yet
+            err = str(exc)
+            if "ml_models" not in err and "does not exist" not in err:
+                log.warning("FeedbackCalibrator.load() failed: %s", exc)
             return False
 
 
