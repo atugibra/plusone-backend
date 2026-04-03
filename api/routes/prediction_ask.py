@@ -91,10 +91,10 @@ You have been given two sources of information about an upcoming match:
 YOUR TASK — follow these steps in order:
 
 STEP 1 - YOUR OWN ASSESSMENT:
-Read the raw database data carefully. Use whatever data IS available — even if
-some sections say "no data available", work with what you have. Reference
-specific numbers wherever possible. If a section is missing, briefly note it
-and move on — do NOT spend more than one sentence on what is missing.
+Read the raw database data carefully. Based on the form, H2H record, season
+stats, standings, squad quality, venue splits, ELO ratings, and odds, decide
+what you think the most likely outcome is and why. State this clearly and
+reference specific numbers.
 
 STEP 2 - COMPARE WITH ENGINES:
 Look at what each of the three engines predicted. Note where they agree and
@@ -113,6 +113,7 @@ RULES:
 - Be specific — always reference actual numbers from the data.
 - Work constructively with the data you DO have. Do not open your response by
   listing what data is missing — lead with insight, not caveats.
+- If a section has no data, mention it in one sentence maximum, then continue.
 - Keep the full response under 450 words unless the question genuinely needs more.
 - Probabilities should always be shown as percentages (e.g. 63.2% not 0.632).
 - ELO ratings above 1800 indicate elite clubs; below 1400 indicates weaker sides.
@@ -184,6 +185,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return out
         except Exception as e:
             log.warning("recent_results failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return []
 
     # ── 2. Season stats — current season first, fallback to broader range ──
@@ -259,6 +262,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             }
         except Exception as e:
             log.warning("season_stats failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 3. Head-to-head (last 8 meetings, all time) ────────────────────────
@@ -306,6 +311,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return {"summary": {"home_wins": hw, "draws": dr, "away_wins": aw}, "matches": matches}
         except Exception as e:
             log.warning("h2h failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 4. League standings (season + league filtered, with fallback) ───────
@@ -354,6 +361,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             }
         except Exception as e:
             log.warning("standings failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 5. Squad stats (possession, shooting %, save %) ────────────────────
@@ -445,6 +454,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             }
         except Exception as e:
             log.warning("squad_stats failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 6. Venue stats — home/away splits ──────────────────────────────────
@@ -487,6 +498,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("venue_stats failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 7. Top scorers ──────────────────────────────────────────────────────
@@ -526,6 +539,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             ]
         except Exception as e:
             log.warning("top_scorers failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return []
 
     # ── 8. Current injuries / suspensions ──────────────────────────────────
@@ -573,6 +588,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("injuries failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return []
 
     # ── 9. ClubElo ratings (most recent available for each team) ───────────
@@ -649,6 +666,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("clubelo failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 10. Bookmaker odds (B365 + Over/Under, latest scraped) ─────────────
@@ -752,6 +771,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("match_odds failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── Assemble everything ─────────────────────────────────────────────────
@@ -1173,7 +1194,6 @@ async def debug_db_context(req: AskRequest):
     """
     Debug endpoint: returns the raw DB context that would be passed to the AI,
     without calling any LLM. Use this to diagnose missing data for a match.
-    Shows exactly which sections have data and which are empty.
     """
     conn = get_connection()
     try:
@@ -1185,58 +1205,44 @@ async def debug_db_context(req: AskRequest):
             league_id=req.league_id,
             season_id=req.season_id,
         )
-
         htid    = req.home_team_id or match_data.get("match", {}).get("home_team_id")
         atid    = req.away_team_id or match_data.get("match", {}).get("away_team_id")
         sid_ctx = req.season_id    or match_data.get("match", {}).get("season_id")
         lid_ctx = req.league_id    or match_data.get("match", {}).get("league_id")
         mid_ctx = req.match_id     or match_data.get("match", {}).get("id")
-
         cur = conn.cursor()
         db_ctx = (
-            _fetch_db_context(
-                cur, htid, atid,
-                season_id=sid_ctx,
-                league_id=lid_ctx,
-                match_id=mid_ctx,
-            )
+            _fetch_db_context(cur, htid, atid, season_id=sid_ctx, league_id=lid_ctx, match_id=mid_ctx)
             if htid and atid else {}
         )
     finally:
         conn.close()
 
-    # Build a summary of what was found
-    summary = {
-        "resolved_ids": {
-            "home_team_id": htid,
-            "away_team_id": atid,
-            "season_id":    sid_ctx,
-            "league_id":    lid_ctx,
-            "match_id":     mid_ctx,
-        },
+    return {
+        "resolved_ids": {"home_team_id": htid, "away_team_id": atid,
+                         "season_id": sid_ctx, "league_id": lid_ctx, "match_id": mid_ctx},
         "data_found": {
-            "home_form_games":   len(db_ctx.get("home_form", [])),
-            "away_form_games":   len(db_ctx.get("away_form", [])),
+            "home_form_games":  len(db_ctx.get("home_form", [])),
+            "away_form_games":  len(db_ctx.get("away_form", [])),
             "home_season_stats": bool(db_ctx.get("home_season")),
             "away_season_stats": bool(db_ctx.get("away_season")),
-            "h2h_games":         len(db_ctx.get("h2h", {}).get("matches", [])),
-            "home_standings":    bool(db_ctx.get("home_standings")),
-            "away_standings":    bool(db_ctx.get("away_standings")),
-            "home_squad_stats":  bool(db_ctx.get("home_squad")),
-            "away_squad_stats":  bool(db_ctx.get("away_squad")),
-            "home_venue_stats":  bool(db_ctx.get("home_venue")),
-            "away_venue_stats":  bool(db_ctx.get("away_venue")),
-            "home_top_scorers":  len(db_ctx.get("home_top_scorers", [])),
-            "away_top_scorers":  len(db_ctx.get("away_top_scorers", [])),
-            "home_injuries":     len(db_ctx.get("home_injuries", [])),
-            "away_injuries":     len(db_ctx.get("away_injuries", [])),
-            "clubelo":           bool(db_ctx.get("clubelo")),
-            "odds":              bool(db_ctx.get("odds")),
+            "h2h_games":        len(db_ctx.get("h2h", {}).get("matches", [])),
+            "home_standings":   bool(db_ctx.get("home_standings")),
+            "away_standings":   bool(db_ctx.get("away_standings")),
+            "home_squad_stats": bool(db_ctx.get("home_squad")),
+            "away_squad_stats": bool(db_ctx.get("away_squad")),
+            "home_venue_stats": bool(db_ctx.get("home_venue")),
+            "away_venue_stats": bool(db_ctx.get("away_venue")),
+            "home_top_scorers": len(db_ctx.get("home_top_scorers", [])),
+            "away_top_scorers": len(db_ctx.get("away_top_scorers", [])),
+            "home_injuries":    len(db_ctx.get("home_injuries", [])),
+            "away_injuries":    len(db_ctx.get("away_injuries", [])),
+            "clubelo":          bool(db_ctx.get("clubelo")),
+            "odds":             bool(db_ctx.get("odds")),
         },
         "raw_context": db_ctx,
         "context_string_preview": _build_context(match_data, db_ctx)[:2000] if match_data else "",
     }
-    return summary
 
 
 @router.post("/ask")

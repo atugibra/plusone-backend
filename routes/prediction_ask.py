@@ -185,6 +185,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return out
         except Exception as e:
             log.warning("recent_results failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return []
 
     # ── 2. Season stats — current season first, fallback to broader range ──
@@ -260,6 +262,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             }
         except Exception as e:
             log.warning("season_stats failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 3. Head-to-head (last 8 meetings, all time) ────────────────────────
@@ -307,6 +311,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return {"summary": {"home_wins": hw, "draws": dr, "away_wins": aw}, "matches": matches}
         except Exception as e:
             log.warning("h2h failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 4. League standings (season + league filtered, with fallback) ───────
@@ -355,6 +361,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             }
         except Exception as e:
             log.warning("standings failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 5. Squad stats (possession, shooting %, save %) ────────────────────
@@ -446,6 +454,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             }
         except Exception as e:
             log.warning("squad_stats failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 6. Venue stats — home/away splits ──────────────────────────────────
@@ -488,6 +498,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("venue_stats failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 7. Top scorers ──────────────────────────────────────────────────────
@@ -527,6 +539,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             ]
         except Exception as e:
             log.warning("top_scorers failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return []
 
     # ── 8. Current injuries / suspensions ──────────────────────────────────
@@ -574,6 +588,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("injuries failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return []
 
     # ── 9. ClubElo ratings (most recent available for each team) ───────────
@@ -650,6 +666,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("clubelo failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── 10. Bookmaker odds (B365 + Over/Under, latest scraped) ─────────────
@@ -753,6 +771,8 @@ def _fetch_db_context(cur, home_team_id: int, away_team_id: int,
             return result
         except Exception as e:
             log.warning("match_odds failed: %s", e)
+            try: cur.connection.rollback()
+            except Exception: pass
             return {}
 
     # ── Assemble everything ─────────────────────────────────────────────────

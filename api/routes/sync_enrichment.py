@@ -45,7 +45,7 @@ CLUBELO_LEAGUE_MAP = {
     "Sco": "Scottish Premiership",
     "Srb": "Serbian SuperLiga",
     "Sui": "Swiss Super League",
-    "Tur": "Süper Lig",
+    "Tur": "\u00dcber Lig",
     "Ukr": "Ukrainian Premier League",
     # Second divisions
     "Eng2": "Championship",
@@ -62,14 +62,77 @@ CLUBELO_LEAGUE_MAP = {
     "UECL": "UEFA Europa Conference League",
 }
 
+# Football-Data.co.uk uses Div codes in their CSVs (E0, D1, SP1, etc.)
+# Map these to canonical league names to prevent ghost league rows.
+FOOTBALL_DATA_DIV_MAP = {
+    # England
+    "E0":  "Premier League",
+    "E1":  "Championship",
+    "E2":  "League One",
+    "E3":  "League Two",
+    "EC":  "National League",          # Non-League / Conference
+    # Germany
+    "D1":  "Bundesliga",
+    "D2":  "2. Bundesliga",
+    # Spain
+    "SP1": "La Liga",
+    "SP2": "Segunda Division",
+    # Italy
+    "I1":  "Serie A",
+    "I2":  "Serie B",
+    # France
+    "F1":  "Ligue 1",
+    "F2":  "Ligue 2",
+    # Netherlands
+    "N1":  "Eredivisie",
+    # Belgium
+    "B1":  "Belgian Pro League",
+    # Turkey
+    "T1":  "Super Lig",
+    # Scotland
+    "SC0": "Scottish Premiership",
+    "SC1": "Scottish Championship",
+    "SC2": "Scottish League One",
+    "SC3": "Scottish League Two",
+    # Greece
+    "G1":  "Super League Greece",
+    # Portugal
+    "P1":  "Primeira Liga",
+    "P2":  "Liga Portugal 2",
+    # Austria
+    "A1":  "Austrian Bundesliga",
+    # USA
+    "USA": "MLS",
+    # Brazil
+    "BSA": "Brasileirao Serie A",
+    # Argentina
+    "ARG": "Argentine Primera Division",
+    # Japan
+    "J1":  "J1 League",
+    # Catch-all codes seen in fixtures.csv
+    "CONF": "UEFA Europa Conference League",
+    "UCL":  "UEFA Champions League",
+    "UEL":  "UEFA Europa League",
+}
+
 
 def _get_league(cur, name: str):
-    """Resolve a league name (including ClubElo short codes) to a leagues.id.
-    Short codes are mapped to full names to avoid duplicate league rows.
+    """Resolve a league name (including ClubElo short codes and Football-Data Div
+    codes) to a leagues.id.  Short codes are mapped to canonical full names to
+    avoid duplicate league rows.
     """
     raw = name.strip()
-    # Resolve ClubElo short code to its full canonical name
-    canonical = CLUBELO_LEAGUE_MAP.get(raw, raw)
+
+    # Resolve ClubElo short code to its full canonical name (case-insensitive)
+    canonical = (
+        CLUBELO_LEAGUE_MAP.get(raw)
+        or CLUBELO_LEAGUE_MAP.get(raw.capitalize())
+        or CLUBELO_LEAGUE_MAP.get(raw.upper())
+        # Resolve Football-Data.co.uk Div codes (E0, D1, SP1 …)
+        or FOOTBALL_DATA_DIV_MAP.get(raw)
+        or FOOTBALL_DATA_DIV_MAP.get(raw.upper())
+        or raw
+    )
 
     # 1. Exact match (case-insensitive)
     cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (canonical,))
@@ -78,8 +141,9 @@ def _get_league(cur, name: str):
         return res["id"]
 
     # 2. Partial keyword match: helps when FBref used a slightly different spelling
-    keyword = canonical.split()[0]
-    if len(keyword) > 3:
+    #    e.g. canonical="Austrian Bundesliga", DB has "Austrian Football Bundesliga"
+    keyword = canonical.split()[0]  # use the most distinctive first word
+    if len(keyword) > 3:  # skip very short words like 'La', 'De'
         cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (f"%{keyword}%",))
         res = cur.fetchone()
         if res:
@@ -117,7 +181,6 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict):
     new_id = cur.fetchone()["id"]
     team_cache[cache_key] = new_id
     return new_id
-
 
 def _find_match(cur, home_team_id, away_team_id, match_date: str):
     if not match_date:
