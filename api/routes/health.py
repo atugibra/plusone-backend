@@ -8,28 +8,30 @@ def health_check():
     try:
         conn = get_connection()
         conn.close()
-        
-        import sys
-        sys_info = {
-            "executable": sys.executable,
-            "path": sys.path
-        }
-        
-        httpx_info = "not imported"
+
+        # Check httpx is importable (used by prediction_ask.py for LLM calls)
+        httpx_ok = False
+        httpx_version = None
         try:
             import httpx
-            httpx_info = f"installed (version {getattr(httpx, '__version__', 'unknown')}) at {httpx.__file__}"
-        except ImportError as e:
-            httpx_info = f"ImportError: {str(e)}"
-        except Exception as e:
-            httpx_info = f"Crash: {str(e)}"
-            
+            httpx_ok = True
+            httpx_version = getattr(httpx, "__version__", "unknown")
+        except ImportError:
+            pass
+
         return {
-            "status": "healthy", 
-            "version": "1.0.0", 
+            "status": "healthy",
+            "version": "1.0.0",
             "database": "connected",
-            "sys_info": sys_info,
-            "httpx": httpx_info
+            "httpx": f"v{httpx_version}" if httpx_ok else "not installed",
+            "message": "All systems operational"
         }
     except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+        return {
+            "status": "unhealthy",
+            "version": "1.0.0",
+            "database": "error",
+            "error": str(e),
+            "message": "Database connection failed"
+        }
+
