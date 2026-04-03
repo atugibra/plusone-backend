@@ -193,18 +193,34 @@ def do_evaluate_predictions(conn) -> int:
         """)
 
         # 2. Grade all un-evaluated rows
-        # Gracefully handle DBs where enrichment_predicted_outcome was never added.
+        # Dynamically check which optional columns exist to handle fresh/partial DBs
         cur.execute("""
             SELECT column_name FROM information_schema.columns
             WHERE table_name = 'prediction_log'
-              AND column_name = 'enrichment_predicted_outcome'
+              AND column_name IN (
+                'enrichment_predicted_outcome',
+                'dc_predicted_outcome',
+                'ml_predicted_outcome',
+                'legacy_predicted_outcome',
+                'dc_correct', 'ml_correct', 'legacy_correct', 'enrichment_correct',
+                'btts_yes', 'over_2_5', 'btts_correct', 'over_2_5_correct', 'correct_score'
+              )
         """)
-        _enr_col = "pl.enrichment_predicted_outcome," if cur.fetchone() else "NULL AS enrichment_predicted_outcome,"
+        _existing_cols = {r["column_name"] for r in cur.fetchall()}
+
+        def _col(name, alias=None):
+            """Return 'pl.<name>' if the column exists, else 'NULL AS <alias|name>'."""
+            a = alias or name
+            return f"pl.{name}" if name in _existing_cols else f"NULL AS {a}"
 
         cur.execute(f"""
-            SELECT pl.id, pl.predicted, pl.btts_yes, pl.over_2_5,
-                   pl.dc_predicted_outcome, pl.ml_predicted_outcome,
-                   pl.legacy_predicted_outcome, {_enr_col}
+            SELECT pl.id, pl.predicted,
+                   {_col('btts_yes')},
+                   {_col('over_2_5')},
+                   {_col('dc_predicted_outcome')},
+                   {_col('ml_predicted_outcome')},
+                   {_col('legacy_predicted_outcome')},
+                   {_col('enrichment_predicted_outcome')},
                    m.home_score, m.away_score
             FROM prediction_log pl
             JOIN matches m ON m.id = pl.match_id
@@ -227,43 +243,48 @@ def do_evaluate_predictions(conn) -> int:
             # Market grading
             btts_correct     = None
             over_2_5_correct = None
-            if r["btts_yes"] is not None:
+            if r.get("btts_yes") is not None:
                 btts_correct = ((float(r["btts_yes"]) > 0.5) == both_scored)
-            if r["over_2_5"] is not None:
+            if r.get("over_2_5") is not None:
                 over_2_5_correct = ((float(r["over_2_5"]) > 0.5) == (total_goals > 2))
 
-            # Per-engine outcome grading
-            dc_correct         = (r["dc_predicted_outcome"]         == actual) if r["dc_predicted_outcome"]         else None
-            ml_correct         = (r["ml_predicted_outcome"]         == actual) if r["ml_predicted_outcome"]         else None
-            legacy_correct     = (r["legacy_predicted_outcome"]     == actual) if r["legacy_predicted_outcome"]     else None
-            enrichment_correct = (r["enrichment_predicted_outcome"] == actual) if r["enrichment_predicted_outcome"] else None
+            # Per-engine outcome grading (only if columns exist)
+            dc_correct         = (r["dc_predicted_outcome"]         == actual) if r.get("dc_predicted_outcome")         else None
+            ml_correct         = (r["ml_predicted_outcome"]         == actual) if r.get("ml_predicted_outcome")         else None
+            legacy_correct     = (r["legacy_predicted_outcome"]     == actual) if r.get("legacy_predicted_outcome")     else None
+            enrichment_correct = (r["enrichment_predicted_outcome"] == actual) if r.get("enrichment_predicted_outcome") else None
 
-            cur.execute("""
-                UPDATE prediction_log
-                SET actual            = %s,
-                    correct           = %s,
-                    correct_score     = %s,
-                    evaluated_at      = NOW(),
-                    btts_correct      = %s,
-                    over_2_5_correct  = %s,
-                    dc_correct        = %s,
-                    ml_correct        = %s,
-                    legacy_correct    = %s,
-                    enrichment_correct= %s
-                WHERE id = %s
-            """, (actual, correct, correct_score,
-                  btts_correct, over_2_5_correct,
-                  dc_correct, ml_correct, legacy_correct, enrichment_correct,
-                  r["id"]))
+            # Build UPDATE dynamically based on which columns exist
+            set_parts = [
+                "actual = %s",
+                "correct = %s",
+                "evaluated_at = NOW()",
+            ]
+            params = [actual, correct]
+
+            if "correct_score"     in _existing_cols: set_parts.append("correct_score = %s");     params.append(correct_score)
+            if "btts_correct"      in _existing_cols: set_parts.append("btts_correct = %s");      params.append(btts_correct)
+            if "over_2_5_correct"  in _existing_cols: set_parts.append("over_2_5_correct = %s");  params.append(over_2_5_correct)
+            if "dc_correct"        in _existing_cols: set_parts.append("dc_correct = %s");        params.append(dc_correct)
+            if "ml_correct"        in _existing_cols: set_parts.append("ml_correct = %s");        params.append(ml_correct)
+            if "legacy_correct"    in _existing_cols: set_parts.append("legacy_correct = %s");    params.append(legacy_correct)
+            if "enrichment_correct"in _existing_cols: set_parts.append("enrichment_correct = %s");params.append(enrichment_correct)
+
+            params.append(r["id"])
+            cur.execute(
+                f"UPDATE prediction_log SET {', '.join(set_parts)} WHERE id = %s",
+                params
+            )
             updated += 1
 
-        # Grade per-market, per-engine predictions in the new markets log
+        # ── Grade market predictions (additive — never breaks 1X2 grading) ──
         try:
             from ml.market_grader import do_evaluate_market_predictions
-            do_evaluate_market_predictions(conn)
-        except Exception as _me:
-            import logging as _log
-            _log.getLogger(__name__).warning("market_grader hook failed: %s", _me)
+            market_updated = do_evaluate_market_predictions(conn)
+            if market_updated:
+                log.info("Market grader: %d row(s) evaluated.", market_updated)
+        except Exception as _mkt_exc:
+            log.debug("Market grader skipped: %s", _mkt_exc)
 
         return updated
     finally:

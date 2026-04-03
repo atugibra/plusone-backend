@@ -553,7 +553,7 @@ def run_consensus(
 
             # Apply league xG bias correction before computing markets
             recal = _get_recalibrator()
-            if recal.is_fitted:
+            if recal and recal.is_fitted:
                 home_xg, away_xg = recal.calibrate_xg(home_xg, away_xg, league_id)
                 dc_xg_h, dc_xg_a = recal.calibrate_xg(dc_xg_h, dc_xg_a, league_id)
                 leg_xg_h, leg_xg_a = recal.calibrate_xg(leg_xg_h, leg_xg_a, league_id)
@@ -574,7 +574,7 @@ def run_consensus(
             )
 
             # Isotonic calibration
-            if recal.is_fitted:
+            if recal and recal.is_fitted:
                 consensus_markets = recal.calibrate(consensus_markets, engine="consensus", league_id=league_id)
 
             best_bets = _bets(consensus_markets, home_name, away_name)
