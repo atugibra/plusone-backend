@@ -428,14 +428,10 @@ def sync_status():
         # ── Live counts per league from key tables ─────────────────────────────
         cur.execute("""
             SELECT l.name AS league,
-                COUNT(DISTINCT m.id)   AS fixtures,
-                COUNT(DISTINCT tvs.id) AS home_away_rows,
-                COUNT(DISTINCT st.id)  AS standings_rows
+                (SELECT COUNT(*) FROM matches m WHERE m.league_id = l.id) AS fixtures,
+                (SELECT COUNT(*) FROM team_venue_stats tvs WHERE tvs.league_id = l.id) AS home_away_rows,
+                (SELECT COUNT(*) FROM league_standings st WHERE st.league_id = l.id) AS standings_rows
             FROM leagues l
-            LEFT JOIN matches          m   ON m.league_id   = l.id
-            LEFT JOIN team_venue_stats tvs ON tvs.league_id = l.id
-            LEFT JOIN league_standings st  ON st.league_id  = l.id
-            GROUP BY l.name
             ORDER BY l.name
         """)
         live_rows = cur.fetchall()

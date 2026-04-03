@@ -274,10 +274,12 @@ _calibrator: Optional[FeedbackCalibrator] = None
 
 def get_calibrator() -> FeedbackCalibrator:
     global _calibrator
-    if _calibrator is None:
-        _calibrator = FeedbackCalibrator()
-        _calibrator.load()   # try loading from DB on first access
-    return _calibrator
+    cal = _calibrator
+    if cal is None:
+        cal = FeedbackCalibrator()
+        cal.load()   # try loading from DB on first access
+        _calibrator = cal
+    return cal
 
 
 def reset_calibrator():
