@@ -75,54 +75,25 @@ AVAILABLE_MODELS = {
 GROQ_URL    = "https://api.groq.com/openai/v1/chat/completions"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
-SYSTEM_PROMPT = """You are PlusOne AI, an expert football analyst and data scientist.
+SYSTEM_PROMPT = """You are PlusOne AI, a sharp football analyst embedded in a prediction app.
 
-You have been given two sources of information about an upcoming match:
+You have full match context: recent form, H2H record, season stats, standings, squad data, \
+venue splits, top scorers, injuries, ClubElo ELO ratings, bookmaker odds, and outputs from \
+three prediction engines (Dixon-Coles, ML Ensemble, Legacy Heuristic).
 
-1. RAW DATABASE DATA — real historical facts pulled directly from the database:
-   recent form, head-to-head history, season statistics, league standings,
-   squad stats (possession, shooting, goalkeeping), venue splits (home/away),
-   top scorers, injury list, ClubElo ratings, and bookmaker odds.
+RULES — follow strictly:
+- Answer the user's question FIRST, in the opening sentence. No preamble.
+- Support your answer with 2-3 specific numbers from the data (probabilities as %, e.g. 63.2%).
+- If engines disagree, note it in one sentence only.
+- Plain text only. No markdown, no asterisks, no bullet points.
+- Hard limit: 120 words. If the question needs a list (e.g. best bets), use numbered lines.
+- Never open with "Based on..." or "I think..." — state the answer directly.
 
-2. ENGINE PREDICTIONS — outputs from three independent prediction models
-   (Dixon-Coles statistical model, ML ensemble, and a legacy heuristic model),
-   which have already processed this data and produced probability estimates.
-
-YOUR TASK — follow these steps in order:
-
-STEP 1 - YOUR OWN ASSESSMENT:
-Read the raw database data carefully. Based on the form, H2H record, season
-stats, standings, squad quality, venue splits, ELO ratings, and odds, decide
-what you think the most likely outcome is and why. State this clearly and
-reference specific numbers.
-
-STEP 2 - COMPARE WITH ENGINES:
-Look at what each of the three engines predicted. Note where they agree and
-where they disagree. Highlight any engine that contradicts your own reading
-and explain why that might be.
-
-STEP 3 - FINAL VERDICT:
-State whether you agree or disagree with the consensus prediction, give a
-confidence level (Low / Medium / High), and explain your reasoning concisely.
-
-STEP 4 - ANSWER THE USER'S QUESTION:
-Now directly answer the user's specific question using everything above.
-
-RULES:
-- Use plain text only. No markdown, no asterisks, no bullet symbols.
-- Be specific — always reference actual numbers from the data.
-- Work constructively with the data you DO have. Do not open your response by
-  listing what data is missing — lead with insight, not caveats.
-- If a section has no data, mention it in one sentence maximum, then continue.
-- Keep the full response under 450 words unless the question genuinely needs more.
-- Probabilities should always be shown as percentages (e.g. 63.2% not 0.632).
-- ELO ratings above 1800 indicate elite clubs; below 1400 indicates weaker sides.
-
-Match context and data follow below.
-
+Match data:
 {context}
 
 User question: {question}"""
+
 
 
 class AskRequest(BaseModel):
@@ -134,6 +105,8 @@ class AskRequest(BaseModel):
     season_id:    Optional[int] = None
     provider:     Optional[Literal["groq", "gemini", "auto"]] = "auto"
     model:        Optional[str] = None
+    # Multi-turn conversation history: list of {"role": "user"|"assistant", "content": str}
+    history:      Optional[list] = []
 
 
 # ─── DB Context Fetcher ────────────────────────────────────────────────────────
@@ -1131,19 +1104,26 @@ def _fetch_prediction_data(
 
 # ─── LLM Callers ──────────────────────────────────────────────────────────────
 
-async def _ask_groq(context: str, question: str, model: str) -> str:
+async def _ask_groq(context: str, question: str, model: str, history: list = None) -> str:
     import httpx
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set")
-    prompt = SYSTEM_PROMPT.format(context=context, question=question)
+    system_msg = SYSTEM_PROMPT.format(context=context, question="")
+    messages = [{"role": "system", "content": system_msg}]
+    # Inject prior conversation turns for multi-turn context
+    for turn in (history or []):
+        role = turn.get("role") if turn.get("role") in ("user", "assistant") else "user"
+        messages.append({"role": role, "content": turn.get("content", "")})
+    # Current question as fresh user message
+    messages.append({"role": "user", "content": question})
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             GROQ_URL,
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 800,
+                "messages": messages,
+                "max_tokens": 300,
                 "temperature": 0.3,
             },
         )
@@ -1151,11 +1131,19 @@ async def _ask_groq(context: str, question: str, model: str) -> str:
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-async def _ask_gemini(context: str, question: str, model: str) -> str:
+async def _ask_gemini(context: str, question: str, model: str, history: list = None) -> str:
     import httpx
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
-    prompt = SYSTEM_PROMPT.format(context=context, question=question)
+    # Gemini uses a flat prompt — prepend history as plain text turns
+    history_text = ""
+    for turn in (history or []):
+        role_label = "User" if turn.get("role") == "user" else "Assistant"
+        history_text += f"{role_label}: {turn.get('content', '')}\n"
+    prompt = SYSTEM_PROMPT.format(context=context, question="")
+    if history_text:
+        prompt += f"\nConversation so far:\n{history_text}"
+    prompt += f"\nUser question: {question}"
     url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=35.0) as client:
         resp = await client.post(
@@ -1163,7 +1151,7 @@ async def _ask_gemini(context: str, question: str, model: str) -> str:
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 800, "temperature": 0.3},
+                "generationConfig": {"maxOutputTokens": 300, "temperature": 0.3},
             },
         )
         resp.raise_for_status()
@@ -1309,13 +1297,13 @@ async def ask_prediction(req: AskRequest):
         if not GROQ_API_KEY:
             raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured.")
         try:
-            answer = await _ask_groq(context, req.question.strip(), groq_model)
+            answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [])
             used_provider, used_model = "groq", groq_model
         except Exception as e:
             log.warning("Groq (%s) failed: %s - trying Gemini fallback", groq_model, e)
             if GEMINI_API_KEY:
                 try:
-                    answer = await _ask_gemini(context, req.question.strip(), gemini_model)
+                    answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [])
                     used_provider, used_model = "gemini", gemini_model
                 except Exception as e2:
                     log.error("Gemini fallback also failed: %s", e2)
@@ -1324,13 +1312,13 @@ async def ask_prediction(req: AskRequest):
         if not GEMINI_API_KEY:
             raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured.")
         try:
-            answer = await _ask_gemini(context, req.question.strip(), gemini_model)
+            answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [])
             used_provider, used_model = "gemini", gemini_model
         except Exception as e:
             log.warning("Gemini (%s) failed: %s - trying Groq fallback", gemini_model, e)
             if GROQ_API_KEY:
                 try:
-                    answer = await _ask_groq(context, req.question.strip(), groq_model)
+                    answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [])
                     used_provider, used_model = "groq", groq_model
                 except Exception as e2:
                     log.error("Groq fallback also failed: %s", e2)
@@ -1338,16 +1326,17 @@ async def ask_prediction(req: AskRequest):
     else:  # auto
         if GROQ_API_KEY:
             try:
-                answer = await _ask_groq(context, req.question.strip(), groq_model)
+                answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [])
                 used_provider, used_model = "groq", groq_model
             except Exception as e:
                 log.warning("Groq (%s) failed: %s - falling back to Gemini", groq_model, e)
         if answer is None and GEMINI_API_KEY:
             try:
-                answer = await _ask_gemini(context, req.question.strip(), gemini_model)
+                answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [])
                 used_provider, used_model = "gemini", gemini_model
             except Exception as e:
                 log.error("Gemini (%s) also failed: %s", gemini_model, e)
+
 
     if not answer:
         raise HTTPException(status_code=502, detail="All LLM providers failed. Please try again.")
