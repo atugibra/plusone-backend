@@ -27,7 +27,7 @@ def do_evaluate_market_predictions(conn) -> int:
             SELECT
                 pml.id,
                 pml.consensus_markets,
-                pml.engine_markets,
+                pml.engine_predictions,
                 m.home_score,
                 m.away_score
             FROM prediction_markets_log pml
@@ -50,7 +50,7 @@ def do_evaluate_market_predictions(conn) -> int:
             both_scored = actual_h > 0 and actual_a > 0
 
             cons_mkt   = r["consensus_markets"] or {}
-            engine_mkt = r["engine_markets"]    or {}
+            engine_mkt = r["engine_predictions"] or {}
 
             # ── Market → actual boolean ──────────────────────────────────────
             actual_values = {
