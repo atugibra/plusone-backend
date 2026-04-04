@@ -47,12 +47,12 @@ def log_market_prediction(
             INSERT INTO prediction_markets_log
                 (match_id, home_team, away_team, league, league_id,
                  match_date, season_id,
-                 consensus_markets, engine_markets,
+                 consensus_markets, engine_predictions,
                  weights_used, per_market_weights, best_bets)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (match_id) DO UPDATE SET
                 consensus_markets  = EXCLUDED.consensus_markets,
-                engine_markets     = EXCLUDED.engine_markets,
+                engine_predictions = EXCLUDED.engine_predictions,
                 weights_used       = EXCLUDED.weights_used,
                 per_market_weights = EXCLUDED.per_market_weights,
                 best_bets          = EXCLUDED.best_bets,
