@@ -79,18 +79,20 @@ CORS_ORIGINS = [
 #   - Any *.vercel.app deployment (including previews)   (Vercel)
 #   - Any *.onrender.com service                         (Render)
 #   - Any *.railway.app service (including *.up.railway) (Railway)
+#   - Chrome extensions (needed for Authorization header from extension)
 CORS_ORIGIN_REGEX = (
     r"https?://localhost(:\d+)?"
     r"|https://[a-z0-9-]+(?:\.[a-z0-9-]+)*\.vercel\.app"
     r"|https://[a-z0-9-]+\.onrender\.com"
     r"|https://[a-z0-9-]+(?:\.up)?\.railway\.app"
+    r"|chrome-extension://[a-z0-9]+"
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_origin_regex=CORS_ORIGIN_REGEX,
-    allow_credentials=False,
+    allow_credentials=True,   # Required so the Authorization header is forwarded from the extension
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Length"],
