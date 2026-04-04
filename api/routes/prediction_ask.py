@@ -108,6 +108,9 @@ class AskRequest(BaseModel):
     model:        Optional[str] = None
     # Multi-turn conversation history: list of {"role": "user"|"assistant", "content": str}
     history:      Optional[list] = []
+    # Attachments (images or text files)
+    file_base64:  Optional[str] = None
+    file_mime:    Optional[str] = None
 
 
 # ─── DB Context Fetcher ────────────────────────────────────────────────────────
@@ -1105,10 +1108,20 @@ def _fetch_prediction_data(
 
 # ─── LLM Callers ──────────────────────────────────────────────────────────────
 
-async def _ask_groq(context: str, question: str, model: str, history: list = None) -> str:
+async def _ask_groq(context: str, question: str, model: str, history: list = None, file_base64: str = None, file_mime: str = None) -> str:
     import httpx
+    import base64
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set")
+    
+    final_question = question
+    if file_base64 and file_mime and ("text/" in file_mime or "json" in file_mime or "csv" in file_mime):
+        try:
+            decoded_text = base64.b64decode(file_base64).decode("utf-8")
+            final_question += f"\n\n[Attached File Content]:\n{decoded_text[:10000]}"
+        except Exception as e:
+            log.warning("Failed to decode text attachment for Groq: %s", e)
+            
     system_msg = SYSTEM_PROMPT.format(context=context, question="")
     messages = [{"role": "system", "content": system_msg}]
     # Inject prior conversation turns for multi-turn context
@@ -1116,7 +1129,7 @@ async def _ask_groq(context: str, question: str, model: str, history: list = Non
         role = turn.get("role") if turn.get("role") in ("user", "assistant") else "user"
         messages.append({"role": role, "content": turn.get("content", "")})
     # Current question as fresh user message
-    messages.append({"role": "user", "content": question})
+    messages.append({"role": "user", "content": final_question})
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             GROQ_URL,
@@ -1132,7 +1145,7 @@ async def _ask_groq(context: str, question: str, model: str, history: list = Non
         return resp.json()["choices"][0]["message"]["content"].strip()
 
 
-async def _ask_gemini(context: str, question: str, model: str, history: list = None) -> str:
+async def _ask_gemini(context: str, question: str, model: str, history: list = None, file_base64: str = None, file_mime: str = None) -> str:
     import httpx
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY not set")
@@ -1145,13 +1158,23 @@ async def _ask_gemini(context: str, question: str, model: str, history: list = N
     if history_text:
         prompt += f"\nConversation so far:\n{history_text}"
     prompt += f"\nUser question: {question}"
+    
+    parts = [{"text": prompt}]
+    if file_base64 and file_mime:
+        parts.append({
+            "inline_data": {
+                "mime_type": file_mime,
+                "data": file_base64
+            }
+        })
+        
     url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
     async with httpx.AsyncClient(timeout=35.0) as client:
         resp = await client.post(
             url,
             headers={"Content-Type": "application/json"},
             json={
-                "contents": [{"parts": [{"text": prompt}]}],
+                "contents": [{"parts": parts}],
                 "generationConfig": {"maxOutputTokens": 300, "temperature": 0.3},
             },
         )
@@ -1256,6 +1279,14 @@ async def ask_prediction(req: AskRequest):
     groq_model   = req.model if (provider == "groq"   and req.model) else DEFAULT_GROQ_MODEL
     gemini_model = req.model if (provider == "gemini" and req.model) else DEFAULT_GEMINI_MODEL
 
+    # If an image was provided but Groq is selected, automatically route to Gemini
+    # because standard Groq text models won't accept image inputs.
+    if req.file_mime and req.file_mime.startswith("image/"):
+        if provider == "groq" and GEMINI_API_KEY:
+            provider = "gemini"
+        elif provider == "auto" and GEMINI_API_KEY:
+            provider = "gemini"
+
     conn = get_connection()
     try:
         match_data = {}
@@ -1298,13 +1329,13 @@ async def ask_prediction(req: AskRequest):
         if not GROQ_API_KEY:
             raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured.")
         try:
-            answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [])
+            answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [], file_base64=req.file_base64, file_mime=req.file_mime)
             used_provider, used_model = "groq", groq_model
         except Exception as e:
             log.warning("Groq (%s) failed: %s - trying Gemini fallback", groq_model, e)
             if GEMINI_API_KEY:
                 try:
-                    answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [])
+                    answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [], file_base64=req.file_base64, file_mime=req.file_mime)
                     used_provider, used_model = "gemini", gemini_model
                 except Exception as e2:
                     log.error("Gemini fallback also failed: %s", e2)
@@ -1313,13 +1344,13 @@ async def ask_prediction(req: AskRequest):
         if not GEMINI_API_KEY:
             raise HTTPException(status_code=503, detail="GEMINI_API_KEY not configured.")
         try:
-            answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [])
+            answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [], file_base64=req.file_base64, file_mime=req.file_mime)
             used_provider, used_model = "gemini", gemini_model
         except Exception as e:
             log.warning("Gemini (%s) failed: %s - trying Groq fallback", gemini_model, e)
             if GROQ_API_KEY:
                 try:
-                    answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [])
+                    answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [], file_base64=req.file_base64, file_mime=req.file_mime)
                     used_provider, used_model = "groq", groq_model
                 except Exception as e2:
                     log.error("Groq fallback also failed: %s", e2)
@@ -1327,13 +1358,13 @@ async def ask_prediction(req: AskRequest):
     else:  # auto
         if GROQ_API_KEY:
             try:
-                answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [])
+                answer = await _ask_groq(context, req.question.strip(), groq_model, req.history or [], file_base64=req.file_base64, file_mime=req.file_mime)
                 used_provider, used_model = "groq", groq_model
             except Exception as e:
                 log.warning("Groq (%s) failed: %s - falling back to Gemini", groq_model, e)
         if answer is None and GEMINI_API_KEY:
             try:
-                answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [])
+                answer = await _ask_gemini(context, req.question.strip(), gemini_model, req.history or [], file_base64=req.file_base64, file_mime=req.file_mime)
                 used_provider, used_model = "gemini", gemini_model
             except Exception as e:
                 log.error("Gemini (%s) also failed: %s", gemini_model, e)
