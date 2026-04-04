@@ -398,6 +398,20 @@ def predict_match(home_team_id: int, away_team_id: int,
 
         home_xg = _compute_venue_xg(home_feats, away_feats, "home")
         away_xg = _compute_venue_xg(away_feats, home_feats, "away")
+        
+        # Align predicted score with predicted outcome
+        pred_h = round(home_xg)
+        pred_a = round(away_xg)
+        if predicted_outcome == "Home Win" and pred_h <= pred_a:
+            pred_h = pred_a + 1
+        elif predicted_outcome == "Away Win" and pred_a <= pred_h:
+            pred_a = pred_h + 1
+        elif predicted_outcome == "Draw" and pred_h != pred_a:
+            avg_s = round((home_xg + away_xg) / 2)
+            pred_h = avg_s
+            pred_a = avg_s
+        aligned_score = f"{pred_h}-{pred_a}"
+
         factors = _key_factors(home_feats, away_feats, home_name, away_name)
 
         def cmp(feats, venue_key):
@@ -443,7 +457,7 @@ def predict_match(home_team_id: int, away_team_id: int,
             "expected_goals": {
                 "home_xg": home_xg,
                 "away_xg": away_xg,
-                "predicted_score": f"{round(home_xg)}-{round(away_xg)}",
+                "predicted_score": aligned_score,
             },
             "key_factors":    factors,
             "team_comparison": {
@@ -581,6 +595,20 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
 
                 home_xg = _compute_venue_xg(home_feats, away_feats, "home")
                 away_xg = _compute_venue_xg(away_feats, home_feats, "away")
+                
+                # Align predicted score
+                pred_h = round(home_xg)
+                pred_a = round(away_xg)
+                if predicted_outcome == "Home Win" and pred_h <= pred_a:
+                    pred_h = pred_a + 1
+                elif predicted_outcome == "Away Win" and pred_a <= pred_h:
+                    pred_a = pred_h + 1
+                elif predicted_outcome == "Draw" and pred_h != pred_a:
+                    avg_s = round((home_xg + away_xg) / 2)
+                    pred_h = avg_s
+                    pred_a = avg_s
+                aligned_score_fast = f"{pred_h}-{pred_a}"
+                
                 btts_prob, o25_prob = _derive_markets(home_xg, away_xg)
                 factors = _key_factors(home_feats, away_feats,
                                        fx["home_name"], fx["away_name"])
@@ -612,7 +640,7 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                     "expected_goals": {
                         "home_xg":         home_xg,
                         "away_xg":         away_xg,
-                        "predicted_score": f"{round(home_xg)}-{round(away_xg)}",
+                        "predicted_score": aligned_score_fast,
                     },
                     "markets": {
                         "btts_yes": btts_prob,
