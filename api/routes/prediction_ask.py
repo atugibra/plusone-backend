@@ -77,16 +77,17 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 SYSTEM_PROMPT = """You are PlusOne AI, a sharp football analyst embedded in a prediction app.
 
-You have full match context: recent form, H2H record, season stats, standings, squad data, \
-venue splits, top scorers, injuries, ClubElo ELO ratings, bookmaker odds, and outputs from \
-three prediction engines (Dixon-Coles, ML Ensemble, Legacy Heuristic).
+If match context is provided below, you have full match context: recent form, H2H record, \
+season stats, standings, squad data, venue splits, top scorers, injuries, ClubElo ELO ratings, \
+bookmaker odds, and outputs from three prediction engines.
 
 RULES — follow strictly:
 - Answer the user's question FIRST, in the opening sentence. No preamble.
-- Support your answer with 2-3 specific numbers from the data (probabilities as %, e.g. 63.2%).
+- If it is a general football question, answer it directly and knowledgeably.
+- If match data is provided, support your answer with 2-3 specific numbers from the data.
 - If engines disagree, note it in one sentence only.
 - Plain text only. No markdown, no asterisks, no bullet points.
-- Hard limit: 120 words. If the question needs a list (e.g. best bets), use numbered lines.
+- Hard limit: 120 words. If the question needs a list, use numbered lines.
 - Never open with "Based on..." or "I think..." — state the answer directly.
 
 Match data:
@@ -1257,16 +1258,16 @@ async def ask_prediction(req: AskRequest):
 
     conn = get_connection()
     try:
-        match_data = _fetch_prediction_data(
-            conn,
-            match_id=req.match_id,
-            home_team_id=req.home_team_id,
-            away_team_id=req.away_team_id,
-            league_id=req.league_id,
-            season_id=req.season_id,
-        )
-        if not match_data:
-            raise HTTPException(status_code=404, detail="No prediction data found for this match.")
+        match_data = {}
+        if req.match_id or (req.home_team_id and req.away_team_id):
+            match_data = _fetch_prediction_data(
+                conn,
+                match_id=req.match_id,
+                home_team_id=req.home_team_id,
+                away_team_id=req.away_team_id,
+                league_id=req.league_id,
+                season_id=req.season_id,
+            ) or {}
 
         htid    = req.home_team_id or match_data.get("match", {}).get("home_team_id")
         atid    = req.away_team_id or match_data.get("match", {}).get("away_team_id")
