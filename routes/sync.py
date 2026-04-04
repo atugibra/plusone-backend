@@ -81,6 +81,7 @@ def _auto_evaluate_predictions(conn) -> int:
         conn.commit()
         return updated
     except Exception as e:
+        _sync_log.warning("Auto-evaluate predictions failed: %s", e)
         try: conn.rollback()
         except Exception: pass
         return 0
@@ -401,13 +402,13 @@ def parse_date(raw):
 def sync_status():
     """Return per-league sync history from scrape_log + live row counts from DB."""
     conn = get_connection()
-    cur = conn.cursor()
     try:
         # ── Sync log history (requires scrape_log table) ───────────────────────
-        # If the table doesn't exist yet (fresh DB), skip gracefully.
+        # Use a dedicated cursor so a failure here never poisons the next query.
         log_rows = []
         try:
-            cur.execute("""
+            cur_log = conn.cursor()
+            cur_log.execute("""
                 SELECT
                     l.name            AS league,
                     s.name            AS season,
@@ -420,21 +421,32 @@ def sync_status():
                 GROUP BY l.name, s.name, sl.page_type
                 ORDER BY l.name, sl.page_type
             """)
-            log_rows = cur.fetchall()
+            log_rows = cur_log.fetchall()
         except Exception:
-            # scrape_log table may not exist on fresh deployments — safe to ignore
-            conn.rollback()
+            # scrape_log table may not exist or may be missing scraped_at column
+            # on older deployments — safe to skip gracefully.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
 
         # ── Live counts per league from key tables ─────────────────────────────
-        cur.execute("""
-            SELECT l.name AS league,
-                (SELECT COUNT(*) FROM matches m WHERE m.league_id = l.id) AS fixtures,
-                (SELECT COUNT(*) FROM team_venue_stats tvs WHERE tvs.league_id = l.id) AS home_away_rows,
-                (SELECT COUNT(*) FROM league_standings st WHERE st.league_id = l.id) AS standings_rows
+        # Always use a fresh cursor after any possible rollback above.
+        cur_live = conn.cursor()
+        cur_live.execute("""
+            SELECT
+                l.name AS league,
+                COUNT(DISTINCT m.id)   AS fixtures,
+                COUNT(DISTINCT tvs.id) AS home_away_rows,
+                COUNT(DISTINCT st.id)  AS standings_rows
             FROM leagues l
+            LEFT JOIN matches          m   ON m.league_id   = l.id
+            LEFT JOIN team_venue_stats tvs ON tvs.league_id = l.id
+            LEFT JOIN league_standings st  ON st.league_id  = l.id
+            GROUP BY l.name
             ORDER BY l.name
         """)
-        live_rows = cur.fetchall()
+        live_rows = cur_live.fetchall()
 
         # ── Build structured response ──────────────────────────────────────────
         by_league = {}
@@ -444,8 +456,9 @@ def sync_status():
                 by_league[lg] = {"league": lg, "season": r["season"], "log": [], "live": {}}
             by_league[lg]["log"].append({
                 "type": r["page_type"],
-                "rows": r["rows"],
-                "last_sync": r["last_sync"].isoformat() if r["last_sync"] else None
+                # SUM() returns Decimal in psycopg2 — convert to int for JSON safety
+                "rows": int(r["rows"]) if r["rows"] is not None else 0,
+                "last_sync": r["last_sync"].isoformat() if r["last_sync"] else None,
             })
 
         for r in live_rows:
@@ -453,9 +466,9 @@ def sync_status():
             if lg not in by_league:
                 by_league[lg] = {"league": lg, "season": None, "log": [], "live": {}}
             by_league[lg]["live"] = {
-                "fixtures": r["fixtures"],
-                "home_away_rows": r["home_away_rows"],
-                "standings_rows": r["standings_rows"]
+                "fixtures":      int(r["fixtures"])      if r["fixtures"]      is not None else 0,
+                "home_away_rows": int(r["home_away_rows"]) if r["home_away_rows"] is not None else 0,
+                "standings_rows": int(r["standings_rows"]) if r["standings_rows"] is not None else 0,
             }
 
         return {"success": True, "leagues": list(by_league.values())}
