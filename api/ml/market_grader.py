@@ -20,7 +20,8 @@ def do_evaluate_market_predictions(conn) -> int:
     Grade all un-evaluated prediction_markets_log rows whose match now has a score.
     Returns number of rows updated.
     """
-    cur = conn.cursor()
+    import psycopg2.extras
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute("""
             SELECT

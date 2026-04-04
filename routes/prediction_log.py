@@ -142,7 +142,8 @@ def do_evaluate_predictions(conn) -> int:
     Grade un-evaluated prediction_log rows whose match has now completed.
     First tries to link any missing match_ids.
     """
-    cur = conn.cursor()
+    import psycopg2.extras
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         # 1. Backfill missing match_ids by matching team names (case-insensitive)
         #    and a ±7 day window so minor name differences or missing match_date
