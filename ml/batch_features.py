@@ -58,6 +58,23 @@ def _j(d, key, default=0.0):
     return _f(d.get(key, default), default)
 
 
+import datetime
+
+def _to_date(d):
+    if not d: return None
+    if isinstance(d, str):
+        try: return datetime.date.fromisoformat(d[:10])
+        except: return None
+    if hasattr(d, "date"): return d.date()
+    return d
+
+def _filter_before(matches, before_date):
+    if not before_date: return matches
+    bd = _to_date(before_date)
+    if not bd: return matches
+    return [m for m in matches if _to_date(m.get("match_date")) and _to_date(m.get("match_date")) < bd]
+
+
 # ─── Data Cache ────────────────────────────────────────────────────────────────
 
 class DataCache:
@@ -296,8 +313,9 @@ class DataCache:
 
 # ─── Form (in-memory) ─────────────────────────────────────────────────────────
 
-def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n: int = 5) -> dict:
+def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n: int = 5, before_date=None) -> dict:
     matches = cache.matches_by_team.get(team_id, [])
+    matches = _filter_before(matches, before_date)
     if venue == "home":
         matches = [m for m in matches if m["home_team_id"] == team_id]
     elif venue == "away":
@@ -341,12 +359,13 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n
 
 # ─── H2H (in-memory) ──────────────────────────────────────────────────────────
 
-def _compute_h2h(cache: DataCache, home_team_id: int, away_team_id: int, n: int = 10) -> dict:
+def _compute_h2h(cache: DataCache, home_team_id: int, away_team_id: int, n: int = 10, before_date=None) -> dict:
     rows = [
         m for m in cache.all_matches
         if (m["home_team_id"] == home_team_id and m["away_team_id"] == away_team_id)
         or (m["home_team_id"] == away_team_id and m["away_team_id"] == home_team_id)
-    ][:n]
+    ]
+    rows = _filter_before(rows, before_date)[:n]
 
     h_wins = d = a_wins = hg_tot = ag_tot = 0
     last_5 = []
@@ -453,21 +472,24 @@ def _build_prev_season_features(cache: DataCache, team_id: int, league_id: int) 
     }
 
 
-def _build_prev_season_form(cache: DataCache, team_id: int) -> dict:
+def _build_prev_season_form(cache: DataCache, team_id: int, before_date=None) -> dict:
     zero = {"prev_form_score": 0.5, "prev_gf_pg": 1.35,
             "prev_ga_pg": 1.35, "prev_match_wins_pct": 0.0}
+    
+    matches = cache.matches_by_team.get(team_id, [])
+    matches = _filter_before(matches, before_date)
+
     # All distinct seasons for this team from match history (desc by name)
     seasons_used = sorted(
         set((m["season_id"], cache.season_name.get(m["season_id"], ""))
-            for m in cache.matches_by_team.get(team_id, [])),
+            for m in matches),
         key=lambda x: x[1], reverse=True,
     )
     if len(seasons_used) < 2:
         return zero
 
     prev_sid = seasons_used[1][0]
-    prev_matches = [m for m in cache.matches_by_team.get(team_id, [])
-                    if m["season_id"] == prev_sid]
+    prev_matches = [m for m in matches if m["season_id"] == prev_sid]
     if not prev_matches:
         return zero
 
@@ -493,12 +515,13 @@ def _build_prev_season_form(cache: DataCache, team_id: int) -> dict:
 
 # ─── Scoring patterns (in-memory) ─────────────────────────────────────────────
 
-def _build_scoring_patterns(cache: DataCache, team_id: int, season_id: int) -> dict:
+def _build_scoring_patterns(cache: DataCache, team_id: int, season_id: int, before_date=None) -> dict:
     zero = {"goals_scored_variance": 0.0, "goals_conceded_variance": 0.0,
             "blank_rate": 0.0, "blowout_rate": 0.0,
             "defensive_collapse_rate": 0.0, "clean_sheet_rate": 0.0}
     matches = [m for m in cache.matches_by_team.get(team_id, [])
                if m["season_id"] == season_id]
+    matches = _filter_before(matches, before_date)
     if not matches:
         return zero
 
@@ -661,7 +684,7 @@ def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_
 # ─── Full team feature builder (in-memory) ────────────────────────────────────
 
 def _build_team_features(cache: DataCache, team_id: int,
-                          league_id: int, season_id: int) -> dict:
+                          league_id: int, season_id: int, before_date=None) -> dict:
     feats: dict = {}
     avgs = cache.league_avgs.get((league_id, season_id),
                                   {"avg_gf_pg": 1.3, "avg_ga_pg": 1.3, "n_teams": 20})
@@ -780,9 +803,9 @@ def _build_team_features(cache: DataCache, team_id: int,
             feats[k] = 0.0
 
     # 4. Recent form
-    form_all  = _compute_form(cache, team_id, None,   5)
-    form_home = _compute_form(cache, team_id, "home", 5)
-    form_away = _compute_form(cache, team_id, "away", 5)
+    form_all  = _compute_form(cache, team_id, None,   5, before_date)
+    form_home = _compute_form(cache, team_id, "home", 5, before_date)
+    form_away = _compute_form(cache, team_id, "away", 5, before_date)
     feats["form_score"]       = form_all["form_score"]
     feats["last3_form_score"] = form_all["last3_form_score"]
     # momentum: positive = improving, negative = fading
@@ -812,10 +835,10 @@ def _build_team_features(cache: DataCache, team_id: int,
 
     # 6. Previous season
     feats.update(_build_prev_season_features(cache, team_id, league_id))
-    feats.update(_build_prev_season_form(cache, team_id))
+    feats.update(_build_prev_season_form(cache, team_id, before_date))
 
     # 7. Scoring patterns
-    feats.update(_build_scoring_patterns(cache, team_id, season_id))
+    feats.update(_build_scoring_patterns(cache, team_id, season_id, before_date))
 
     # 8. Venue stats (home/away splits from team_venue_stats)
     feats.update(_build_venue_stats(cache, team_id, season_id))
@@ -829,9 +852,9 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
                            league_id: int, season_id: int,
                            match_id: Optional[int] = None, match_date = None):
     """Same output format as feature_engineering.build_match_features()."""
-    home_feats = _build_team_features(cache, home_team_id, league_id, season_id)
-    away_feats = _build_team_features(cache, away_team_id, league_id, season_id)
-    h2h        = _compute_h2h(cache, home_team_id, away_team_id)
+    home_feats = _build_team_features(cache, home_team_id, league_id, season_id, match_date)
+    away_feats = _build_team_features(cache, away_team_id, league_id, season_id, match_date)
+    h2h        = _compute_h2h(cache, home_team_id, away_team_id, 10, match_date)
     enrichment = _build_enrichment_features(cache, match_id, match_date, home_team_id, away_team_id, league_id)
 
     vector: dict = {}

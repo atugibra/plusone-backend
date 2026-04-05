@@ -58,6 +58,23 @@ def _j(d, key, default=0.0):
     return _f(d.get(key, default), default)
 
 
+import datetime
+
+def _to_date(d):
+    if not d: return None
+    if isinstance(d, str):
+        try: return datetime.date.fromisoformat(d[:10])
+        except: return None
+    if hasattr(d, "date"): return d.date()
+    return d
+
+def _filter_before(matches, before_date):
+    if not before_date: return matches
+    bd = _to_date(before_date)
+    if not bd: return matches
+    return [m for m in matches if _to_date(m.get("match_date")) and _to_date(m.get("match_date")) < bd]
+
+
 # ─── Data Cache ────────────────────────────────────────────────────────────────
 
 class DataCache:
@@ -224,10 +241,35 @@ class DataCache:
             log.warning("team_venue_stats unavailable (%s) — using league-average fallbacks.", _venue_err)
             self.venue_stats = {}
 
+        # 8. Match Odds (Enrichment Data) ─────────────────────────────────────
+        try:
+            cur.execute("""
+                SELECT match_id, b365_home_win, b365_draw, b365_away_win, raw_data
+                FROM match_odds
+            """)
+            self.match_odds: Dict[int, dict] = {r["match_id"]: dict(r) for r in cur.fetchall()}
+        except Exception as _odds_err:
+            log.warning("match_odds unavailable (%s)", _odds_err)
+            self.match_odds = {}
+
+        # 9. Team ClubElo (Enrichment Data) ───────────────────────────────────
+        try:
+            cur.execute("""
+                SELECT team_id, elo_date, elo, raw_data
+                FROM team_clubelo
+                ORDER BY team_id, elo_date DESC
+            """)
+            self.team_clubelo: Dict[int, List[dict]] = defaultdict(list)
+            for r in cur.fetchall():
+                self.team_clubelo[r["team_id"]].append(dict(r))
+        except Exception as _elo_err:
+            log.warning("team_clubelo unavailable (%s)", _elo_err)
+            self.team_clubelo = defaultdict(list)
+
         log.info(
-            "DataCache ready: %d standings, %d squad rows, %d player rows, %d matches, %d venue rows.",
+            "DataCache ready: %d standings, %d squad rows, %d player rows, %d matches, %d venue rows, %d odds.",
             len(self.standings), len(self.squad), sum(len(v) for v in self.players.values()),
-            len(self.all_matches), len(self.venue_stats),
+            len(self.all_matches), len(self.venue_stats), len(self.match_odds)
         )
 
         # 7. Compute league-style statistics in-memory from already-loaded matches.
@@ -271,8 +313,9 @@ class DataCache:
 
 # ─── Form (in-memory) ─────────────────────────────────────────────────────────
 
-def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n: int = 5) -> dict:
+def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n: int = 5, before_date=None) -> dict:
     matches = cache.matches_by_team.get(team_id, [])
+    matches = _filter_before(matches, before_date)
     if venue == "home":
         matches = [m for m in matches if m["home_team_id"] == team_id]
     elif venue == "away":
@@ -316,12 +359,13 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n
 
 # ─── H2H (in-memory) ──────────────────────────────────────────────────────────
 
-def _compute_h2h(cache: DataCache, home_team_id: int, away_team_id: int, n: int = 10) -> dict:
+def _compute_h2h(cache: DataCache, home_team_id: int, away_team_id: int, n: int = 10, before_date=None) -> dict:
     rows = [
         m for m in cache.all_matches
         if (m["home_team_id"] == home_team_id and m["away_team_id"] == away_team_id)
         or (m["home_team_id"] == away_team_id and m["away_team_id"] == home_team_id)
-    ][:n]
+    ]
+    rows = _filter_before(rows, before_date)[:n]
 
     h_wins = d = a_wins = hg_tot = ag_tot = 0
     last_5 = []
@@ -428,21 +472,24 @@ def _build_prev_season_features(cache: DataCache, team_id: int, league_id: int) 
     }
 
 
-def _build_prev_season_form(cache: DataCache, team_id: int) -> dict:
+def _build_prev_season_form(cache: DataCache, team_id: int, before_date=None) -> dict:
     zero = {"prev_form_score": 0.5, "prev_gf_pg": 1.35,
             "prev_ga_pg": 1.35, "prev_match_wins_pct": 0.0}
+    
+    matches = cache.matches_by_team.get(team_id, [])
+    matches = _filter_before(matches, before_date)
+
     # All distinct seasons for this team from match history (desc by name)
     seasons_used = sorted(
         set((m["season_id"], cache.season_name.get(m["season_id"], ""))
-            for m in cache.matches_by_team.get(team_id, [])),
+            for m in matches),
         key=lambda x: x[1], reverse=True,
     )
     if len(seasons_used) < 2:
         return zero
 
     prev_sid = seasons_used[1][0]
-    prev_matches = [m for m in cache.matches_by_team.get(team_id, [])
-                    if m["season_id"] == prev_sid]
+    prev_matches = [m for m in matches if m["season_id"] == prev_sid]
     if not prev_matches:
         return zero
 
@@ -468,12 +515,13 @@ def _build_prev_season_form(cache: DataCache, team_id: int) -> dict:
 
 # ─── Scoring patterns (in-memory) ─────────────────────────────────────────────
 
-def _build_scoring_patterns(cache: DataCache, team_id: int, season_id: int) -> dict:
+def _build_scoring_patterns(cache: DataCache, team_id: int, season_id: int, before_date=None) -> dict:
     zero = {"goals_scored_variance": 0.0, "goals_conceded_variance": 0.0,
             "blank_rate": 0.0, "blowout_rate": 0.0,
             "defensive_collapse_rate": 0.0, "clean_sheet_rate": 0.0}
     matches = [m for m in cache.matches_by_team.get(team_id, [])
                if m["season_id"] == season_id]
+    matches = _filter_before(matches, before_date)
     if not matches:
         return zero
 
@@ -532,10 +580,111 @@ def _build_venue_stats(cache: DataCache, team_id: int, season_id: int) -> dict:
     return result
 
 
+# ─── Enrichment features (in-memory) ──────────────────────────────────────────
+
+def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_date, home_team_id: int, away_team_id: int, league_id: int) -> dict:
+    feats = {}
+    
+    # Missing Odds fallback values based on league baseline stats
+    style = cache.league_style.get(league_id, dict(_LEAGUE_STYLE_DEFAULTS))
+    btts_rate = style.get("league_btts_rate", 0.50)
+    hw_rate   = style.get("league_home_win_rate", 0.44)
+    aw_rate   = style.get("league_away_win_rate", 0.31)
+    
+    hw_sum = hw_rate + aw_rate + style.get("league_draw_rate", 0.25)
+    
+    # ── 1. Match Odds ──
+    odds = cache.match_odds.get(match_id) if match_id else None
+    if odds and odds.get("b365_home_win"):
+        hw = _f(odds["b365_home_win"])
+        dw = _f(odds["b365_draw"])
+        aw = _f(odds["b365_away_win"])
+        
+        margin_1x2 = (1.0/hw + 1.0/dw + 1.0/aw) if (hw and dw and aw) else 1.0
+        feats["odds_home_prob"] = (1.0/hw) / margin_1x2 if hw else hw_rate/hw_sum
+        feats["odds_draw_prob"] = (1.0/dw) / margin_1x2 if dw else style.get("league_draw_rate",0.25)/hw_sum
+        feats["odds_away_prob"] = (1.0/aw) / margin_1x2 if aw else aw_rate/hw_sum
+        
+        raw_odds = odds.get("raw_data") or {}
+        o25 = _f(raw_odds.get("B365>2.5", raw_odds.get("Max>2.5", 0)))
+        u25 = _f(raw_odds.get("B365<2.5", raw_odds.get("Max<2.5", 0)))
+        margin_ou = (1.0/o25 + 1.0/u25) if (o25 > 0 and u25 > 0) else 1.0
+        feats["odds_over_25_prob"]  = (1.0/o25) / margin_ou if o25 > 0 else btts_rate
+        feats["odds_under_25_prob"] = (1.0/u25) / margin_ou if u25 > 0 else (1 - btts_rate)
+        
+        ah_size = _f(raw_odds.get("AHh", 0.0))
+        ahh     = _f(raw_odds.get("B365AHH", 0))
+        aha     = _f(raw_odds.get("B365AHA", 0))
+        margin_ah = (1.0/ahh + 1.0/aha) if (ahh > 0 and aha > 0) else 1.0
+        feats["odds_asian_hdcp_size"] = ah_size
+        feats["odds_ah_home_prob"]    = (1.0/ahh) / margin_ah if ahh > 0 else 0.50
+        feats["odds_ah_away_prob"]    = (1.0/aha) / margin_ah if aha > 0 else 0.50
+    else:
+        feats["odds_home_prob"]       = hw_rate/hw_sum
+        feats["odds_draw_prob"]       = style.get("league_draw_rate",0.25)/hw_sum
+        feats["odds_away_prob"]       = aw_rate/hw_sum
+        feats["odds_over_25_prob"]    = btts_rate
+        feats["odds_under_25_prob"]   = 1 - btts_rate
+        feats["odds_asian_hdcp_size"] = 0.0
+        feats["odds_ah_home_prob"]    = 0.50
+        feats["odds_ah_away_prob"]    = 0.50
+
+    # ── 2. Team ClubElo ──
+    from datetime import date, datetime
+    m_date = None
+    if isinstance(match_date, str):
+        try: m_date = datetime.fromisoformat(str(match_date)[:10]).date()
+        except: pass
+    elif hasattr(match_date, "date"): 
+        m_date = match_date.date()
+    elif isinstance(match_date, date):
+        m_date = match_date
+    
+    def _get_elo(tid):
+        history = cache.team_clubelo.get(tid, [])
+        if not history: return 1500.0, 0.0, 0.0
+        # If no match_date provided (predicting upcoming), use latest
+        if m_date is None: 
+            row = history[0]
+        else:
+            # find closest snapshot where elo_date <= m_date
+            row = next((r for r in history if r["elo_date"] and r["elo_date"] <= m_date), history[-1])
+        e = _f(row["elo"]) if row["elo"] else 1500.0
+        
+        raw_json = row.get("raw_data") or {}
+        raw_inner = raw_json.get("raw", {})
+        h_prob = d_prob = a_prob = 0.0
+        if raw_inner and "GD=0" in raw_inner:
+            d_prob = _f(raw_inner.get("GD=0", 0.0))
+            hw_sum_el = sum(_f(raw_inner.get(f"GD={i}", 0.0)) for i in range(1, 10))
+            h_prob = hw_sum_el
+            aw_sum_el = sum(_f(raw_inner.get(f"GD={i}", 0.0)) for i in range(-9, 0))
+            a_prob = aw_sum_el
+            
+            # Normalize just like standalone enrichment script
+            tot = h_prob + d_prob + a_prob
+            if tot > 0:
+                h_prob, d_prob, a_prob = h_prob/tot, d_prob/tot, a_prob/tot
+
+        return e, h_prob, d_prob, a_prob
+
+    h_elo, he_hw, he_dr, _ = _get_elo(home_team_id)
+    a_elo, _, _, ae_aw     = _get_elo(away_team_id)
+    
+    feats["clubelo_home_rating"] = h_elo
+    feats["clubelo_away_rating"] = a_elo
+    feats["clubelo_gap"]         = h_elo - a_elo
+    feats["clubelo_home_prob"]   = he_hw if he_hw > 0 else (hw_rate/hw_sum)
+    feats["clubelo_draw_prob"]   = he_dr if he_dr > 0 else (style.get("league_draw_rate",0.25)/hw_sum)
+    feats["clubelo_away_prob"]   = ae_aw if ae_aw > 0 else (aw_rate/hw_sum)
+    
+    return feats
+
+
 # ─── Full team feature builder (in-memory) ────────────────────────────────────
 
 def _build_team_features(cache: DataCache, team_id: int,
-                          league_id: int, season_id: int) -> dict:
+                          league_id: int, season_id: int, before_date=None) -> dict:
     feats: dict = {}
     avgs = cache.league_avgs.get((league_id, season_id),
                                   {"avg_gf_pg": 1.3, "avg_ga_pg": 1.3, "n_teams": 20})
@@ -654,9 +803,9 @@ def _build_team_features(cache: DataCache, team_id: int,
             feats[k] = 0.0
 
     # 4. Recent form
-    form_all  = _compute_form(cache, team_id, None,   5)
-    form_home = _compute_form(cache, team_id, "home", 5)
-    form_away = _compute_form(cache, team_id, "away", 5)
+    form_all  = _compute_form(cache, team_id, None,   5, before_date)
+    form_home = _compute_form(cache, team_id, "home", 5, before_date)
+    form_away = _compute_form(cache, team_id, "away", 5, before_date)
     feats["form_score"]       = form_all["form_score"]
     feats["last3_form_score"] = form_all["last3_form_score"]
     # momentum: positive = improving, negative = fading
@@ -686,10 +835,10 @@ def _build_team_features(cache: DataCache, team_id: int,
 
     # 6. Previous season
     feats.update(_build_prev_season_features(cache, team_id, league_id))
-    feats.update(_build_prev_season_form(cache, team_id))
+    feats.update(_build_prev_season_form(cache, team_id, before_date))
 
     # 7. Scoring patterns
-    feats.update(_build_scoring_patterns(cache, team_id, season_id))
+    feats.update(_build_scoring_patterns(cache, team_id, season_id, before_date))
 
     # 8. Venue stats (home/away splits from team_venue_stats)
     feats.update(_build_venue_stats(cache, team_id, season_id))
@@ -700,11 +849,13 @@ def _build_team_features(cache: DataCache, team_id: int,
 # ─── Match feature vector (in-memory) ─────────────────────────────────────────
 
 def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int,
-                           league_id: int, season_id: int, match_id=None, match_date=None):
+                           league_id: int, season_id: int,
+                           match_id: Optional[int] = None, match_date = None):
     """Same output format as feature_engineering.build_match_features()."""
-    home_feats = _build_team_features(cache, home_team_id, league_id, season_id)
-    away_feats = _build_team_features(cache, away_team_id, league_id, season_id)
-    h2h        = _compute_h2h(cache, home_team_id, away_team_id)
+    home_feats = _build_team_features(cache, home_team_id, league_id, season_id, match_date)
+    away_feats = _build_team_features(cache, away_team_id, league_id, season_id, match_date)
+    h2h        = _compute_h2h(cache, home_team_id, away_team_id, 10, match_date)
+    enrichment = _build_enrichment_features(cache, match_id, match_date, home_team_id, away_team_id, league_id)
 
     vector: dict = {}
     for k, v in home_feats.items():
@@ -744,6 +895,9 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
     # ── ELO differential (1 strong feature) ──────────────────────────────
     # elo_diff > 0  → home team stronger, < 0 → away team stronger
     vector["elo_diff"] = home_feats.get("elo_proxy", 0.5) - away_feats.get("elo_proxy", 0.5)
+    
+    # ── Inject Enrichment Data (Odds & ClubElo) ──────────────────────────
+    vector.update(enrichment)
 
     feature_names  = sorted(vector.keys())
     feature_values = [vector[k] for k in feature_names]
@@ -765,6 +919,8 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
     """
     cache = DataCache(cur)
 
+    # Fetch all training matches (already in cache, but we need the full list
+    # with training labels — same query as the original)
     completed = [
         m for m in cache.all_matches
         if m.get("league_id") is not None and m.get("season_id") is not None
@@ -780,6 +936,7 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
                 cache,
                 m["home_team_id"], m["away_team_id"],
                 m["league_id"],    m["season_id"],
+                match_id=m["id"],  match_date=m.get("match_date")
             )
             hs = _f(m["home_score"]); as_ = _f(m["away_score"])
             label = 0 if hs > as_ else (1 if hs == as_ else 2)

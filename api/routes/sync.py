@@ -70,22 +70,25 @@ router = APIRouter()
 
 from routes.prediction_log import do_evaluate_predictions
 
+_evaluate_lock = threading.Lock()
+
 def _auto_evaluate_predictions(conn) -> int:
     """
     Grade all unevaluated prediction_log rows whose match is now complete.
     Called automatically after each sync so performance metrics stay current.
     Returns the number of rows updated.
     """
-    try:
-        updated = do_evaluate_predictions(conn)
-        conn.commit()
-        return updated
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error("Auto-evaluate failed: %s", e)
-        try: conn.rollback()
-        except Exception: pass
-        return 0
+    with _evaluate_lock:
+        try:
+            updated = do_evaluate_predictions(conn)
+            conn.commit()
+            return updated
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Auto-evaluate failed: %s", e)
+            try: conn.rollback()
+            except Exception: pass
+            return 0
 
 
 def _auto_recalibrate_bg():

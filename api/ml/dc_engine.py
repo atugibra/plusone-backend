@@ -566,7 +566,7 @@ class DCPredictor:
 
         # ── ClubElo confidence-weighted blend ────────────────────────────────────────
         clubelo_probs = _fetch_clubelo_probs(home_team_id, away_team_id)
-        clubelo_w_dc  = 1.0
+        clubelo_w_dc  = 1.0          # default: no ClubElo → full DC
         if clubelo_probs:
             # Use the MINIMUM of each team's actual DC training match count.
             # The team with less data is the bottleneck — if either team is unknown
@@ -582,12 +582,15 @@ class DCPredictor:
                 n_home, n_away, n_pair, clubelo_w_dc
             )
 
+            # Blend: DC weight towards DC probs, remainder towards ClubElo
             blended["home_win"] = clubelo_w_dc * blended["home_win"] + w_elo * clubelo_probs["home_win"]
             blended["draw"]     = clubelo_w_dc * blended["draw"]     + w_elo * clubelo_probs["draw"]
             blended["away_win"] = clubelo_w_dc * blended["away_win"] + w_elo * clubelo_probs["away_win"]
+            # Re-normalise
             _s = blended["home_win"] + blended["draw"] + blended["away_win"] or 1.0
             blended = {k: v / _s for k, v in blended.items()}
 
+            # Also blend expected goals → better MC simulation
             exp_h = clubelo_w_dc * exp_h + w_elo * clubelo_probs["lambda_home"]
             exp_a = clubelo_w_dc * exp_a + w_elo * clubelo_probs["lambda_away"]
 
@@ -643,7 +646,7 @@ class DCPredictor:
             key=lambda x: -x["elo"],
         )
 
-    # ── Live feedback calibration from prediction_log ─────────────────────────
+    # ── Live feedback calibration from prediction_log ──────────────────────────
     def fit_calibrator_from_log(self) -> int:
         """
         Refit the DC ProbabilityCalibrator using real graded outcomes from
@@ -705,14 +708,30 @@ class DCPredictor:
 def _fetch_clubelo_probs(home_team_id: int, away_team_id: int) -> dict | None:
     """
     Fetch ClubElo score-probability distribution for a specific fixture.
-    Queries team_clubelo table (two rows per match, one per team).
-    raw_data structure: {"raw": {"Home":"...","Away":"...","GD=0":"0.29",...,"R:0-0":"0.09",...}}
-    Returns 1X2 probs + implied lambda, or None if not found.
+
+    The team_clubelo table stores TWO rows per fixture (one per team) with the
+    same full match JSON in raw_data. Each row's raw_data is:
+        {"raw": {"Home": "...", "Away": "...", "Date": "...",
+                 "GD<-5": "0.001", "GD=-5": "0.002", ..., "GD=0": "0.29", ..., "GD>5": "0.001",
+                 "R:0-0": "0.09", "R:1-0": "0.13", ...}}
+
+    We query by home_team_id (one of the two rows always has team_id = home team)
+    and verify the Away team name matches. Falls back to querying by away_team_id
+    and checking the Home name if the first query misses.
+
+    Returns:
+        {
+          "home_win": float, "draw": float, "away_win": float,
+          "lambda_home": float, "lambda_away": float,
+          "source": "clubelo"
+        }
+    or None if no ClubElo data found / parse error.
     """
     try:
         conn = get_connection()
         cur  = conn.cursor()
 
+        # --- Resolve team names so we can do name-based matching inside JSONB ---
         ids = [home_team_id, away_team_id]
         cur.execute("SELECT id, name FROM teams WHERE id IN (%s, %s)", ids)
         name_map = {r["id"]: r["name"] for r in cur.fetchall()}
@@ -721,59 +740,92 @@ def _fetch_clubelo_probs(home_team_id: int, away_team_id: int) -> dict | None:
 
         raw_row = None
 
-        if home_name:
+        # Strategy A: query by home team_id, strict match on Home and Away names
+        if home_name and away_name:
             cur.execute("""
-                SELECT raw_data FROM team_clubelo
+                SELECT raw_data
+                FROM team_clubelo
                 WHERE team_id = %s
                   AND elo_date >= CURRENT_DATE - INTERVAL '7 days'
-                  AND (raw_data->'raw'->>'Away' ILIKE %s OR raw_data->>'Away' ILIKE %s)
-                ORDER BY elo_date DESC LIMIT 1
-            """, (home_team_id, f"%{away_name}%", f"%{away_name}%"))
+                  AND (
+                      (raw_data->'raw'->>'Home' ILIKE %s AND raw_data->'raw'->>'Away' ILIKE %s)
+                      OR (raw_data->>'Home' ILIKE %s AND raw_data->>'Away' ILIKE %s)
+                  )
+                ORDER BY elo_date DESC
+                LIMIT 1
+            """, (home_team_id, f"%{home_name}%", f"%{away_name}%", f"%{home_name}%", f"%{away_name}%"))
             raw_row = cur.fetchone()
 
-        if not raw_row and away_name:
+        # Strategy B: query by away team_id, strict match on Home and Away names
+        if not raw_row and home_name and away_name:
             cur.execute("""
-                SELECT raw_data FROM team_clubelo
+                SELECT raw_data
+                FROM team_clubelo
                 WHERE team_id = %s
                   AND elo_date >= CURRENT_DATE - INTERVAL '7 days'
-                  AND (raw_data->'raw'->>'Home' ILIKE %s OR raw_data->>'Home' ILIKE %s)
-                ORDER BY elo_date DESC LIMIT 1
-            """, (away_team_id, f"%{home_name}%", f"%{home_name}%"))
+                  AND (
+                      (raw_data->'raw'->>'Home' ILIKE %s AND raw_data->'raw'->>'Away' ILIKE %s)
+                      OR (raw_data->>'Home' ILIKE %s AND raw_data->>'Away' ILIKE %s)
+                  )
+                ORDER BY elo_date DESC
+                LIMIT 1
+            """, (away_team_id, f"%{home_name}%", f"%{away_name}%", f"%{home_name}%", f"%{away_name}%"))
             raw_row = cur.fetchone()
 
         conn.close()
+
         if not raw_row:
             return None
 
+        # --- Parse raw_data JSONB --- 
         rd = raw_row["raw_data"]
         if isinstance(rd, str):
             import json as _json
             rd = _json.loads(rd)
+        # Handle {"raw": {...}} wrapper
         inner = rd.get("raw", rd)
 
         def _f(key):
+            """Safe float parse — values are stored as strings."""
             v = inner.get(key)
-            try: return float(v) if v is not None else 0.0
-            except (TypeError, ValueError): return 0.0
+            try:
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
 
-        p_hw = _f("GD=1") + _f("GD=2") + _f("GD=3") + _f("GD=4") + _f("GD=5") + _f("GD>5")
+        # --- Derive 1X2 from GD fields ---
+        p_hw = (_f("GD=1") + _f("GD=2") + _f("GD=3") + _f("GD=4") +
+                _f("GD=5") + _f("GD>5"))
         p_d  = _f("GD=0")
-        p_aw = _f("GD=-1") + _f("GD=-2") + _f("GD=-3") + _f("GD=-4") + _f("GD=-5") + _f("GD<-5")
+        p_aw = (_f("GD=-1") + _f("GD=-2") + _f("GD=-3") + _f("GD=-4") +
+                _f("GD=-5") + _f("GD<-5"))
         total = p_hw + p_d + p_aw or 1.0
-        p_hw /= total; p_d /= total; p_aw /= total
+        p_hw /= total
+        p_d  /= total
+        p_aw /= total
 
-        lambda_h = sum(i * _f(f"R:{i}-{j}") for i in range(7) for j in range(7))
-        lambda_a = sum(j * _f(f"R:{i}-{j}") for i in range(7) for j in range(7))
+        # --- Derive implied λ (expected goals) from R:i-j score matrix ---
+        lambda_h = 0.0
+        lambda_a = 0.0
+        for i in range(7):
+            for j in range(7):
+                p_score = _f(f"R:{i}-{j}")
+                lambda_h += i * p_score
+                lambda_a += j * p_score
+        # Floor at plausible xG values
         lambda_h = max(lambda_h, 0.5)
         lambda_a = max(lambda_a, 0.5)
 
-        if p_hw + p_d + p_aw < 0.5:
+        if p_hw + p_d + p_aw < 0.5:          # sanity: all near zero → bad data
             return None
 
         return {
-            "home_win": round(p_hw, 4), "draw": round(p_d, 4), "away_win": round(p_aw, 4),
-            "lambda_home": round(lambda_h, 3), "lambda_away": round(lambda_a, 3),
-            "source": "clubelo"
+            "home_win":    round(p_hw, 4),
+            "draw":        round(p_d,  4),
+            "away_win":    round(p_aw, 4),
+            "lambda_home": round(lambda_h, 3),
+            "lambda_away": round(lambda_a, 3),
+            "source":      "clubelo",
         }
     except Exception as exc:
         log.debug("_fetch_clubelo_probs: %s", exc)

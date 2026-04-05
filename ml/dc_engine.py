@@ -740,36 +740,36 @@ def _fetch_clubelo_probs(home_team_id: int, away_team_id: int) -> dict | None:
 
         raw_row = None
 
-        # Strategy A: query by home team_id, match Away name in JSON
-        if home_name:
+        # Strategy A: query by home team_id, strict match on Home and Away names
+        if home_name and away_name:
             cur.execute("""
                 SELECT raw_data
                 FROM team_clubelo
                 WHERE team_id = %s
                   AND elo_date >= CURRENT_DATE - INTERVAL '7 days'
                   AND (
-                      raw_data->'raw'->>'Away' ILIKE %s
-                      OR raw_data->>'Away' ILIKE %s
+                      (raw_data->'raw'->>'Home' ILIKE %s AND raw_data->'raw'->>'Away' ILIKE %s)
+                      OR (raw_data->>'Home' ILIKE %s AND raw_data->>'Away' ILIKE %s)
                   )
                 ORDER BY elo_date DESC
                 LIMIT 1
-            """, (home_team_id, f"%{away_name}%", f"%{away_name}%"))
+            """, (home_team_id, f"%{home_name}%", f"%{away_name}%", f"%{home_name}%", f"%{away_name}%"))
             raw_row = cur.fetchone()
 
-        # Strategy B: query by away team_id, match Home name in JSON
-        if not raw_row and away_name:
+        # Strategy B: query by away team_id, strict match on Home and Away names
+        if not raw_row and home_name and away_name:
             cur.execute("""
                 SELECT raw_data
                 FROM team_clubelo
                 WHERE team_id = %s
                   AND elo_date >= CURRENT_DATE - INTERVAL '7 days'
                   AND (
-                      raw_data->'raw'->>'Home' ILIKE %s
-                      OR raw_data->>'Home' ILIKE %s
+                      (raw_data->'raw'->>'Home' ILIKE %s AND raw_data->'raw'->>'Away' ILIKE %s)
+                      OR (raw_data->>'Home' ILIKE %s AND raw_data->>'Away' ILIKE %s)
                   )
                 ORDER BY elo_date DESC
                 LIMIT 1
-            """, (away_team_id, f"%{home_name}%", f"%{home_name}%"))
+            """, (away_team_id, f"%{home_name}%", f"%{away_name}%", f"%{home_name}%", f"%{away_name}%"))
             raw_row = cur.fetchone()
 
         conn.close()

@@ -70,22 +70,25 @@ router = APIRouter()
 
 from routes.prediction_log import do_evaluate_predictions
 
+_evaluate_lock = threading.Lock()
+
 def _auto_evaluate_predictions(conn) -> int:
     """
     Grade all unevaluated prediction_log rows whose match is now complete.
     Called automatically after each sync so performance metrics stay current.
     Returns the number of rows updated.
     """
-    try:
-        updated = do_evaluate_predictions(conn)
-        conn.commit()
-        return updated
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).error("Auto-evaluate failed: %s", e)
-        try: conn.rollback()
-        except Exception: pass
-        return 0
+    with _evaluate_lock:
+        try:
+            updated = do_evaluate_predictions(conn)
+            conn.commit()
+            return updated
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error("Auto-evaluate failed: %s", e)
+            try: conn.rollback()
+            except Exception: pass
+            return 0
 
 
 def _auto_recalibrate_bg():
@@ -111,13 +114,10 @@ def _auto_recalibrate_bg():
         _sync_log.warning("Auto-recalibrate (DC) failed: %s", exc)
     try:
         from ml.market_recalibrator import recalibrate_markets_from_log
-        res = recalibrate_markets_from_log()
-        _sync_log.info(
-            "Auto-recalibrate (Markets) fitted %d calibrators, %d league xG biases.",
-            res.get("calibrators", 0), res.get("xg_leagues", 0),
-        )
+        recalibrate_markets_from_log()
+        _sync_log.info("Auto-recalibrate (markets) completed after sync.")
     except Exception as exc:
-        _sync_log.warning("Auto-recalibrate (Markets) failed: %s", exc)
+        _sync_log.warning("Auto-recalibrate (markets) failed: %s", exc)
 
 class TableData(BaseModel):
     headers: List[str] = []
@@ -340,7 +340,7 @@ def _normalize_fbref_team_name(name: str) -> str:
     Also strips plain 'vs Arsenal' domestic prefix.
     """
     s = name.strip()
-    # "cc vs TeamName" or "cc  vs  TeamName"
+    # "cc vs TeamName"
     m = re.match(r'^[a-z]{2,3}\s+vs\s+(.+)$', s)
     if m:
         return m.group(1).strip()
@@ -365,7 +365,6 @@ def get_or_create_team(cur, name, league_id):
     if row:
         return row["id"]
     # 2. Cross-league fallback: UEFA teams live under their domestic league_id
-    #    e.g. Arsenal is stored under Premier League but also appears in UCL fixtures
     cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (clean,))
     row = cur.fetchone()
     if row:
@@ -403,13 +402,13 @@ def parse_date(raw):
 def sync_status():
     """Return per-league sync history from scrape_log + live row counts from DB."""
     conn = get_connection()
+    cur = conn.cursor()
     try:
         # ── Sync log history (requires scrape_log table) ───────────────────────
-        # Use a dedicated cursor so a failure here never poisons the next query.
+        # If the table doesn't exist yet (fresh DB), skip gracefully.
         log_rows = []
         try:
-            cur_log = conn.cursor()
-            cur_log.execute("""
+            cur.execute("""
                 SELECT
                     l.name            AS league,
                     s.name            AS season,
@@ -422,19 +421,13 @@ def sync_status():
                 GROUP BY l.name, s.name, sl.page_type
                 ORDER BY l.name, sl.page_type
             """)
-            log_rows = cur_log.fetchall()
+            log_rows = cur.fetchall()
         except Exception:
-            # scrape_log table may not exist or may be missing scraped_at column
-            # on older deployments — safe to skip gracefully.
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            # scrape_log table may not exist on fresh deployments — safe to ignore
+            conn.rollback()
 
         # ── Live counts per league from key tables ─────────────────────────────
-        # Always use a fresh cursor after any possible rollback above.
-        cur_live = conn.cursor()
-        cur_live.execute("""
+        cur.execute("""
             SELECT l.name AS league,
                 (SELECT COUNT(m.id) FROM matches m WHERE m.league_id = l.id) AS fixtures,
                 (SELECT COUNT(tvs.id) FROM team_venue_stats tvs WHERE tvs.league_id = l.id) AS home_away_rows,
@@ -442,7 +435,7 @@ def sync_status():
             FROM leagues l
             ORDER BY l.name
         """)
-        live_rows = cur_live.fetchall()
+        live_rows = cur.fetchall()
 
         # ── Build structured response ──────────────────────────────────────────
         by_league = {}
@@ -452,9 +445,8 @@ def sync_status():
                 by_league[lg] = {"league": lg, "season": r["season"], "log": [], "live": {}}
             by_league[lg]["log"].append({
                 "type": r["page_type"],
-                # SUM() returns Decimal in psycopg2 — convert to int for JSON safety
-                "rows": int(r["rows"]) if r["rows"] is not None else 0,
-                "last_sync": r["last_sync"].isoformat() if r["last_sync"] else None,
+                "rows": r["rows"],
+                "last_sync": r["last_sync"].isoformat() if r["last_sync"] else None
             })
 
         for r in live_rows:
@@ -462,9 +454,9 @@ def sync_status():
             if lg not in by_league:
                 by_league[lg] = {"league": lg, "season": None, "log": [], "live": {}}
             by_league[lg]["live"] = {
-                "fixtures":      int(r["fixtures"])      if r["fixtures"]      is not None else 0,
-                "home_away_rows": int(r["home_away_rows"]) if r["home_away_rows"] is not None else 0,
-                "standings_rows": int(r["standings_rows"]) if r["standings_rows"] is not None else 0,
+                "fixtures": r["fixtures"],
+                "home_away_rows": r["home_away_rows"],
+                "standings_rows": r["standings_rows"]
             }
 
         return {"success": True, "leagues": list(by_league.values())}

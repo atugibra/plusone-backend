@@ -196,6 +196,7 @@ def _log_prediction_to_db(
     dc_outcome: Optional[str] = None,
     ml_outcome: Optional[str] = None,
     legacy_outcome: Optional[str] = None,
+    enrichment_outcome: Optional[str] = None,
     predicted_score: Optional[str] = None,
 ):
     """
@@ -297,7 +298,7 @@ def _log_prediction_to_db(
             """, (home_team, away_team))
             row = cur.fetchone()
             # Only use this fallback row if we aren't stealing it from a different known match
-            if row and (row["match_id"] is None or row["match_id"] == match_id):
+            if row and (match_id is None or row["match_id"] is None or row["match_id"] == match_id):
                 existing = row
 
         if existing:
@@ -391,28 +392,14 @@ def _log_prediction_to_db(
         ))
         conn.commit()
         log.info("Logged prediction: %s vs %s → %s", home_team, away_team, predicted)
-        # ── Market logging (additive — never breaks prediction_log write) ────
+
+        # Log per-market probabilities for the new market analytics pipeline
         try:
             from ml.market_logger import log_market_prediction
-            consensus_mkt = result.get("markets")
-            if consensus_mkt and isinstance(consensus_mkt, dict) and "btts_yes" in consensus_mkt:
-                match_league_id = match_info.get("league_id") or result.get("league_id")
-                match_season_id = match_info.get("season_id") or result.get("season_id")
-                log_market_prediction(
-                    match_id,
-                    home_team, away_team, league,
-                    match_league_id,
-                    match_date,
-                    match_season_id,
-                    consensus_mkt,
-                    result.get("engine_markets", {}),
-                    result.get("weights_used", {}),
-                    result.get("per_market_weights", {}),
-                    result.get("best_bets", []),
-                )
-        except Exception:
-            pass  # market logging must never crash prediction logging
-
+            log_market_prediction(conn, match_id, home_team, away_team,
+                                  league, match_date, result)
+        except Exception as _me:
+            log.debug("market_logger hook failed: %s", _me)
     except Exception as exc:
         log.error("Could not log prediction: %s", exc, exc_info=True)
         if conn:
@@ -619,27 +606,11 @@ def prediction_accuracy_trend(
         query = """
             SELECT m.gameweek,
                    COUNT(*) AS total,
-                   COUNT(CASE
-                     WHEN (m.home_score > m.away_score
-                           AND ls_h.wins::float / NULLIF(ls_h.games,0) >
-                               ls_a.wins::float / NULLIF(ls_a.games,0))
-                       OR (m.away_score > m.home_score
-                           AND ls_a.wins::float / NULLIF(ls_a.games,0) >
-                               ls_h.wins::float / NULLIF(ls_h.games,0))
-                       OR (m.home_score = m.away_score
-                           AND ABS(ls_h.wins::float/NULLIF(ls_h.games,0)
-                                 - ls_a.wins::float/NULLIF(ls_a.games,0)) < 0.05)
-                     THEN 1 END) AS correct
-            FROM matches m
-            LEFT JOIN league_standings ls_h
-                   ON ls_h.team_id = m.home_team_id
-                  AND ls_h.league_id = m.league_id
-                  AND ls_h.season_id = m.season_id
-            LEFT JOIN league_standings ls_a
-                   ON ls_a.team_id = m.away_team_id
-                  AND ls_a.league_id = m.league_id
-                  AND ls_a.season_id = m.season_id
-            WHERE m.home_score IS NOT NULL AND m.gameweek IS NOT NULL
+                   SUM(CASE WHEN pl.correct IS TRUE THEN 1 ELSE 0 END) AS correct
+            FROM prediction_log pl
+            JOIN matches m ON pl.match_id = m.id
+            WHERE pl.correct IS NOT NULL
+              AND m.gameweek IS NOT NULL
         """
         params = []
         if league_id:
