@@ -642,7 +642,7 @@ def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_
     
     def _get_elo(tid):
         history = cache.team_clubelo.get(tid, [])
-        if not history: return 1500.0, 0.0, 0.0
+        if not history: return 1500.0, 0.0, 0.0, 0.0
         # If no match_date provided (predicting upcoming), use latest
         if m_date is None: 
             row = history[0]
