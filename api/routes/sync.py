@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import threading
 import logging
 from fastapi import APIRouter, HTTPException, Depends
@@ -9,6 +10,30 @@ from database import get_connection
 from routes.deps import require_admin
 
 _sync_log = logging.getLogger(__name__)
+
+from functools import wraps
+
+def retry_on_db_lock_errors(max_retries=4, base_delay=0.6):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_err = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    # Check for deadlocks or statement timeouts
+                    if "deadlock" in err_str or "timeout" in err_str or "lock" in err_str:
+                        last_err = e
+                        if attempt < max_retries - 1:
+                            time.sleep(base_delay + base_delay * attempt)
+                            continue
+                    # It's an unrelated DB error or we exhausted retries
+                    raise e
+            raise last_err
+        return wrapper
+    return decorator
 
 def safe_num(val):
     """Safely convert FBref values to a number, returning None for non-numeric."""
@@ -479,6 +504,7 @@ def sync_status():
 
 
 @router.post("/all")
+@retry_on_db_lock_errors()
 def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
@@ -540,6 +566,7 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
 
 
 @router.post("/fixtures")
+@retry_on_db_lock_errors()
 def sync_fixtures(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
@@ -565,6 +592,7 @@ def sync_fixtures(payload: SyncPayload, _admin: dict = Depends(require_admin)):
 
 
 @router.post("/stats")
+@retry_on_db_lock_errors()
 def sync_stats(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
@@ -585,6 +613,7 @@ def sync_stats(payload: SyncPayload, _admin: dict = Depends(require_admin)):
 
 
 @router.post("/player-stats")
+@retry_on_db_lock_errors()
 def sync_player_stats(payload: SyncPayload, _admin: dict = Depends(require_admin)):
     conn = get_connection()
     cur = conn.cursor()
