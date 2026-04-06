@@ -318,7 +318,11 @@ def get_or_create_league(cur, name):
     if row:
         return row["id"]
     normalized = clean.title()
-    cur.execute("INSERT INTO leagues (name) VALUES (%s) RETURNING id", (normalized,))
+    cur.execute("""
+        INSERT INTO leagues (name) VALUES (%s)
+        ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name
+        RETURNING id
+    """, (normalized,))
     return cur.fetchone()["id"]
 
 
@@ -328,7 +332,11 @@ def get_or_create_season(cur, name):
     row = cur.fetchone()
     if row:
         return row["id"]
-    cur.execute("INSERT INTO seasons (name) VALUES (%s) RETURNING id", (clean,))
+    cur.execute("""
+        INSERT INTO seasons (name) VALUES (%s)
+        ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name
+        RETURNING id
+    """, (clean,))
     return cur.fetchone()["id"]
 
 
@@ -370,7 +378,11 @@ def get_or_create_team(cur, name, league_id):
     if row:
         return row["id"]
     # 3. Brand-new team — insert with clean name
-    cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (clean, league_id))
+    cur.execute("""
+        INSERT INTO teams (name, league_id) VALUES (%s, %s)
+        ON CONFLICT (name, league_id) DO UPDATE SET name=EXCLUDED.name
+        RETURNING id
+    """, (clean, league_id))
     return cur.fetchone()["id"]
 
 
