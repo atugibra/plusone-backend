@@ -579,7 +579,7 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         # so the extension can flag the URL for retry.
         if total_rows == 0:
             conn.rollback()
-            logger.warning(
+            log.warning(
                 "sync_all: empty payload for league=%s season=%s — no data written. "
                 "Likely a rate-limited or failed scrape.",
                 payload.league, payload.season
