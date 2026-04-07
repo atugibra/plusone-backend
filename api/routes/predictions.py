@@ -373,6 +373,23 @@ def _log_prediction_to_db(
                  %s, %s, %s, %s,
                  %s, %s,
                  %s, %s, %s)
+            ON CONFLICT (home_team, away_team, match_date) DO UPDATE SET
+                match_id = COALESCE(EXCLUDED.match_id, prediction_log.match_id),
+                predicted = EXCLUDED.predicted,
+                confidence = EXCLUDED.confidence,
+                confidence_score = EXCLUDED.confidence_score,
+                home_win_prob = EXCLUDED.home_win_prob,
+                draw_prob = EXCLUDED.draw_prob,
+                away_win_prob = EXCLUDED.away_win_prob,
+                btts_yes = EXCLUDED.btts_yes,
+                over_2_5 = EXCLUDED.over_2_5,
+                home_xg = EXCLUDED.home_xg,
+                away_xg = EXCLUDED.away_xg,
+                dc_predicted_outcome = COALESCE(EXCLUDED.dc_predicted_outcome, prediction_log.dc_predicted_outcome),
+                ml_predicted_outcome = COALESCE(EXCLUDED.ml_predicted_outcome, prediction_log.ml_predicted_outcome),
+                legacy_predicted_outcome = COALESCE(EXCLUDED.legacy_predicted_outcome, prediction_log.legacy_predicted_outcome),
+                enrichment_predicted_outcome = COALESCE(EXCLUDED.enrichment_predicted_outcome, prediction_log.enrichment_predicted_outcome),
+                predicted_score = COALESCE(EXCLUDED.predicted_score, prediction_log.predicted_score)
         """, (
             match_id, home_team, away_team, league, match_date,
             predicted, result.get("confidence") or result.get("consensus", {}).get("confidence"),

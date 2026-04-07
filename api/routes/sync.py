@@ -13,7 +13,7 @@ _sync_log = logging.getLogger(__name__)
 
 from functools import wraps
 
-def retry_on_db_lock_errors(max_retries=4, base_delay=0.6):
+def retry_on_db_lock_errors(max_retries=6, base_delay=1.5):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -579,7 +579,7 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         # so the extension can flag the URL for retry.
         if total_rows == 0:
             conn.rollback()
-            log.warning(
+            _sync_log.warning(
                 "sync_all: empty payload for league=%s season=%s — no data written. "
                 "Likely a rate-limited or failed scrape.",
                 payload.league, payload.season
