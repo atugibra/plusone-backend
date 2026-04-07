@@ -889,13 +889,33 @@ def _compute_probabilities(h_sq, a_sq, h_st, a_st):
     h_str = 0.6 * h_gpg + 0.4 * h_wr
     a_str = 0.6 * a_gpg + 0.4 * a_wr
     total = h_str + a_str + 0.001
-    r_h = max(0.1, h_str / total + 0.06)
-    r_a = max(0.1, a_str / total - 0.03)
-    r_d = max(0.1, 1 - r_h - r_a)
+    
+    h_ties = h_st["ties"] if h_st else 0
+    a_ties = a_st["ties"] if a_st else 0
+    h_g    = h_st["games"] if h_st else 1
+    a_g    = a_st["games"] if a_st else 1
+    
+    base_draw_rate = (h_ties + a_ties) / (h_g + a_g) if (h_g + a_g) > 0 else 0.25
+    base_draw_rate = max(0.15, min(0.35, base_draw_rate))
+
+    strength_gap = abs(h_str - a_str) / total
+    r_d = base_draw_rate * (1.0 - (strength_gap * 0.7))
+
+    r_h = (h_str / total) + 0.04
+    r_a = (a_str / total) - 0.04
+
+    scale = (1.0 - r_d) / (r_h + r_a) if (r_h + r_a) > 0 else 1.0
+    r_h *= scale
+    r_a *= scale
+
+    r_h = max(0.05, r_h)
+    r_a = max(0.05, r_a)
+    r_d = max(0.05, r_d)
+
     s   = r_h + r_a + r_d
-    home_p = round(r_h / s, 3)
-    away_p = round(r_a / s, 3)
-    draw_p = round(1 - home_p - away_p, 3)
+    home_p = round(r_h / s, 4)
+    away_p = round(r_a / s, 4)
+    draw_p = round(r_d / s, 4)
     pred_h = max(0, round(h_gpg * 0.85))
     pred_a = max(0, round(a_gpg * 0.75))
     has_all = bool(h_sq and a_sq and h_st and a_st)

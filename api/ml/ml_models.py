@@ -66,7 +66,7 @@ class EnsemblePredictor:
             min_samples_leaf=5,
             class_weight="balanced",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
         )
         rf_cal = CalibratedClassifierCV(rf, cv=3, method="isotonic")
 
@@ -106,8 +106,6 @@ class EnsemblePredictor:
 
         # Compute balanced sample weights so XGBoost and RF treat
         # Home Win / Draw / Away Win with equal importance during training.
-        # Without this, XGBoost (no built-in class weighting for multi-class)
-        # collapses to always predicting the majority class (Home Win ~44%).
         sample_weights = compute_sample_weight(class_weight="balanced", y=y)
 
         # Apply exponential recency decay if match_dates provided.

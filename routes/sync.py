@@ -380,10 +380,12 @@ def _normalize_fbref_team_name(name: str) -> str:
     # "cc TeamName"
     m = re.match(r'^[a-z]{2,3}\s+(.+)$', s)
     if m:
-        return m.group(1).strip()
-    # "vs TeamName" (domestic opponent row)
-    if s.startswith("vs "):
-        return s[3:].strip()
+        s = m.group(1).strip()
+
+    # Strip away game and against identifiers
+    s = re.sub(r'^(?:vs\s+|at\s+)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'(?:\s+at|\s+vs)$', '', s, flags=re.IGNORECASE)
+    s = s.strip()
     return s
 
 

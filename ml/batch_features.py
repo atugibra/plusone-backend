@@ -91,7 +91,7 @@ class DataCache:
 
         # Identify the 2 most recent season IDs — we only need recent data.
         # Older seasons are used for prev_season_form but not for features.
-        cur.execute("SELECT id FROM seasons ORDER BY id DESC LIMIT 2")
+        cur.execute("SELECT id FROM seasons ORDER BY name DESC LIMIT 2")
         recent_season_ids = [r["id"] for r in cur.fetchall()]
         if not recent_season_ids:
             recent_season_ids = [0]   # safe fallback
@@ -735,9 +735,10 @@ def _build_team_features(cache: DataCache, team_id: int,
         feats["players_used"] = _f(sq_for.get("players_used"), 20)
         m90 = _f(sq_for.get("minutes_90s")) or 1
         ss  = sq_for.get("standard_stats") or {}
-        feats["goals_per90"]              = _j(ss, "goals_per90")
-        feats["assists_per90"]            = _j(ss, "assists_per90")
-        feats["goals_assists_per90"]      = _j(ss, "goals_assists_per90")
+        # Calculate per90 metrics strictly from the verified table totals rather than trusting the JSON scrape
+        feats["goals_per90"]              = _safe_div(sq_for.get("goals"), sq_for.get("games"))
+        feats["assists_per90"]            = _safe_div(sq_for.get("assists"), sq_for.get("games"))
+        feats["goals_assists_per90"]      = feats["goals_per90"] + feats["assists_per90"]
         feats["goals_pens_per90"]         = _j(ss, "goals_pens_per90")
         feats["goals_assists_pens_per90"] = _j(ss, "goals_assists_pens_per90")
         feats["cards_yellow_per90"]       = _safe_div(_j(ss, "cards_yellow"), m90)

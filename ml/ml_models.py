@@ -66,7 +66,7 @@ class EnsemblePredictor:
             min_samples_leaf=5,
             class_weight="balanced",
             random_state=42,
-            n_jobs=-1,
+            n_jobs=1,
         )
         rf_cal = CalibratedClassifierCV(rf, cv=3, method="isotonic")
 
