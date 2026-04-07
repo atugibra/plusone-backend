@@ -77,6 +77,53 @@ def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
         log.exception("prediction_log insert failed")
 
 
+def _log_markets_prediction_bg(
+    match_id: int, home_team: str, away_team: str,
+    league: str, match_date, markets: dict,
+    predicted_outcome: str, confidence_score: float,
+    home_xg: float, away_xg: float,
+):
+    """
+    Log market-level probabilities to prediction_markets_log.
+    Called in a background thread after every /upcoming consensus hit.
+    """
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        try:
+            # Extract the key market probabilities from the MarketPricer sheet
+            over_2_5   = markets.get("over_under", {}).get("over_2_5")   if isinstance(markets.get("over_under"), dict) else markets.get("over_2_5")
+            btts       = markets.get("btts", {}).get("yes")              if isinstance(markets.get("btts"), dict)      else markets.get("btts")
+            home_win   = markets.get("one_x_two", {}).get("home_win")   if isinstance(markets.get("one_x_two"), dict)  else markets.get("home_win")
+            draw       = markets.get("one_x_two", {}).get("draw")       if isinstance(markets.get("one_x_two"), dict)  else markets.get("draw")
+            away_win   = markets.get("one_x_two", {}).get("away_win")   if isinstance(markets.get("one_x_two"), dict)  else markets.get("away_win")
+
+            cur.execute("""
+                INSERT INTO prediction_markets_log
+                    (match_id, home_team, away_team, league, match_date,
+                     predicted_outcome, confidence_score,
+                     home_win_prob, draw_prob, away_win_prob,
+                     over_2_5_prob, btts_prob,
+                     home_xg, away_xg)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (
+                int(match_id) if match_id else None,
+                str(home_team), str(away_team), str(league), match_date,
+                str(predicted_outcome), float(confidence_score),
+                float(home_win)  if home_win  is not None else None,
+                float(draw)      if draw      is not None else None,
+                float(away_win)  if away_win  is not None else None,
+                float(over_2_5)  if over_2_5  is not None else None,
+                float(btts)      if btts       is not None else None,
+                float(home_xg), float(away_xg),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.exception("prediction_markets_log insert failed")
+
 
 # ─── 15-min cache for /upcoming (makes Free Picks near-instant after first hit) 
 _upcoming_cache: dict = {"data": None, "expires_at": 0.0}
@@ -141,7 +188,8 @@ def upcoming_dc_predictions(
     raw_results = upcoming_consensus_fast(league_id, limit)
     
     results = []
-    from .predictions import _log_prediction_to_db as _log_db
+    import threading
+    from routes.predictions import _log_prediction_to_db as _log_db
 
     for pred in raw_results:
         try:
@@ -213,10 +261,24 @@ def upcoming_dc_predictions(
             leg_out = engines.get("legacy", {}).get("predicted_outcome")
             enr_out = engines.get("enrichment", {}).get("predicted_outcome")
             
-            # Auto-log handled internally background thread
+            # Auto-log prediction_log — background thread
             threading.Thread(
                 target=_log_db,
                 args=(result_entry, int(fx_id), dc_out, ml_out, enr_out, leg_out, f"{pred_h}-{pred_a}"),
+                daemon=True,
+            ).start()
+
+            # Auto-log prediction_markets_log — background thread
+            threading.Thread(
+                target=_log_markets_prediction_bg,
+                args=(
+                    int(fx_id),
+                    fx["home_team"], fx["away_team"],
+                    fx.get("league", ""), pred["match_date"],
+                    markets,               # raw markets dict from consensus engine
+                    outcome, round(lead, 4),
+                    xg_h, xg_a,
+                ),
                 daemon=True,
             ).start()
         except Exception as exc:

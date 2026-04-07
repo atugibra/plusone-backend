@@ -115,6 +115,178 @@ FOOTBALL_DATA_DIV_MAP = {
     "UEL":  "UEFA Europa League",
 }
 
+# ─── Team name aliases ────────────────────────────────────────────────────────
+# Maps Football-Data.co.uk, ClubElo, and Transfermarkt names → FBref canonical
+# names.  Add entries whenever a new source uses a different spelling.
+TEAM_NAME_ALIASES: dict[str, str] = {
+    # ── England ───────────────────────────────────────────────────────────────
+    "man city":                   "Manchester City",
+    "manchester city":            "Manchester City",
+    "man utd":                    "Manchester Utd",
+    "man united":                 "Manchester Utd",
+    "manchester united":          "Manchester Utd",
+    "nott'm forest":              "Nott'ham Forest",
+    "nottm forest":               "Nott'ham Forest",
+    "nottingham forest":          "Nott'ham Forest",
+    "wolverhampton wanderers":    "Wolves",
+    "wolverhampton":              "Wolves",
+    "sheffield utd":              "Sheffield Utd",
+    "sheffield united":           "Sheffield Utd",
+    "luton town":                 "Luton",
+    "west bromwich albion":       "West Brom",
+    "west brom":                  "West Brom",
+    "queens park rangers":        "QPR",
+    "brighton & hove albion":     "Brighton",
+    "brighton and hove albion":   "Brighton",
+    "huddersfield town":          "Huddersfield",
+    "stoke city":                 "Stoke",
+    "swansea city":               "Swansea",
+    "cardiff city":               "Cardiff",
+    "wigan athletic":             "Wigan",
+    "blackburn rovers":           "Blackburn",
+    "bolton wanderers":           "Bolton",
+    "ipswich town":               "Ipswich",
+    "oxford united":              "Oxford Utd",
+    "bristol city":               "Bristol City",
+    "birmingham city":            "Birmingham City",
+    "leicester city":             "Leicester City",
+    "newcastle united":           "Newcastle Utd",
+    "norwich city":               "Norwich",
+    "watford fc":                 "Watford",
+    "crystal palace":             "Crystal Palace",
+    "west ham united":            "West Ham",
+    "west ham":                   "West Ham",
+    "tottenham hotspur":          "Tottenham",
+    "tottenham":                  "Tottenham",
+    "aston villa":                "Aston Villa",
+    # ── Germany ───────────────────────────────────────────────────────────────
+    "eintr frankfurt":            "Eintracht Frankfurt",
+    "eintracht frankfurt":        "Eintracht Frankfurt",
+    "hertha berlin":              "Hertha BSC",
+    "hertha bsc":                 "Hertha BSC",
+    "m'gladbach":                 "Mönchengladbach",
+    "b. monchengladbach":         "Mönchengladbach",
+    "borussia m.gladbach":        "Mönchengladbach",
+    "bayer leverkusen":           "Leverkusen",
+    "rb leipzig":                 "RB Leipzig",
+    "vfb stuttgart":               "Stuttgart",
+    "sc freiburg":                 "Freiburg",
+    "fc augsburg":                 "Augsburg",
+    "vfl bochum":                  "Bochum",
+    "fc koln":                     "Köln",
+    "1. fc koln":                  "Köln",
+    "fc heidenheim":               "Heidenheim",
+    "sv darmstadt 98":             "Darmstadt 98",
+    "vfl wolfsburg":               "Wolfsburg",
+    "borussia dortmund":           "Dortmund",
+    "fc bayern munich":            "Bayern Munich",
+    "bayern munich":               "Bayern Munich",
+    "tsg hoffenheim":              "Hoffenheim",
+    "1899 hoffenheim":             "Hoffenheim",
+    "mainz 05":                    "Mainz 05",
+    "1. fsv mainz 05":             "Mainz 05",
+    "vfb Stuttgart":               "Stuttgart",
+    # ── Spain ─────────────────────────────────────────────────────────────────
+    "athletic bilbao":            "Athletic Club",
+    "atletico madrid":            "Atlético Madrid",
+    "real madrid":                "Real Madrid",
+    "barcelona":                  "Barcelona",
+    "espanol":                    "Espanyol",
+    "deportivo alaves":           "Alavés",
+    "alaves":                     "Alavés",
+    "real sociedad":              "Real Sociedad",
+    "real betis":                 "Betis",
+    "betis":                      "Betis",
+    "rayo vallecano":             "Rayo Vallecano",
+    "villarreal":                 "Villarreal",
+    "valencia cf":                "Valencia",
+    "girona fc":                  "Girona",
+    "celta vigo":                 "Celta Vigo",
+    "cadiz cf":                   "Cádiz",
+    "cadiz":                      "Cádiz",
+    "getafe cf":                  "Getafe",
+    "las palmas":                 "Las Palmas",
+    # ── France ────────────────────────────────────────────────────────────────
+    "psg":                        "Paris S-G",
+    "paris sg":                   "Paris S-G",
+    "paris saint-germain":        "Paris S-G",
+    "paris saint germain":        "Paris S-G",
+    "st etienne":                 "Saint-Étienne",
+    "saint-etienne":              "Saint-Étienne",
+    "olympique marseille":        "Marseille",
+    "olympique lyonnais":         "Lyon",
+    "as monaco":                  "Monaco",
+    "stade rennes":               "Rennes",
+    "stade brest":                "Brest",
+    "rc lens":                    "Lens",
+    "losc lille":                 "Lille",
+    "ogc nice":                   "Nice",
+    "rc strasbourg":              "Strasbourg",
+    "toulouse fc":                "Toulouse",
+    "montpellier hsc":            "Montpellier",
+    "nantes":                     "Nantes",
+    # ── Italy ─────────────────────────────────────────────────────────────────
+    "milan":                      "AC Milan",
+    "ac milan":                   "AC Milan",
+    "inter milan":                "Inter",
+    "internazionale":             "Inter",
+    "fc internazionale":          "Inter",
+    "hellas verona":              "Verona",
+    "as roma":                    "Roma",
+    "ss lazio":                   "Lazio",
+    "ssc napoli":                 "Napoli",
+    "atalanta bc":                "Atalanta",
+    "juventus fc":                "Juventus",
+    "acf fiorentina":             "Fiorentina",
+    "torino fc":                  "Torino",
+    "genoa cfc":                  "Genoa",
+    "udinese calcio":             "Udinese",
+    "cagliari calcio":            "Cagliari",
+    "bologna fc":                 "Bologna",
+    "monza":                      "Monza",
+    "ac monza":                   "Monza",
+    "empoli fc":                  "Empoli",
+    "us lecce":                   "Lecce",
+    "frosinone calcio":           "Frosinone",
+    "salernitana":                "Salernitana",
+    # ── Netherlands ───────────────────────────────────────────────────────────
+    "psv eindhoven":              "PSV",
+    "ajax amsterdam":             "Ajax",
+    "afc ajax":                   "Ajax",
+    "feyenoord rotterdam":        "Feyenoord",
+    "az alkmaar":                 "AZ",
+    "fc utrecht":                 "Utrecht",
+    "fc twente":                  "Twente",
+    "sc heerenveen":              "Heerenveen",
+    # ── Turkey ────────────────────────────────────────────────────────────────
+    "besiktas jk":                "Beşiktaş",
+    "besiktas":                   "Beşiktaş",
+    "galatasaray sk":             "Galatasaray",
+    "fenerbahce sk":              "Fenerbahçe",
+    "fenerbahce":                 "Fenerbahçe",
+    "trabzonspor":                "Trabzonspor",
+    # ── Belgium ───────────────────────────────────────────────────────────────
+    "club brugge":                "Club Brugge",
+    "kv mechelen":                "Mechelen",
+    "rsc anderlecht":             "Anderlecht",
+    # ── Portugal ──────────────────────────────────────────────────────────────
+    "sl benfica":                 "Benfica",
+    "fc porto":                   "Porto",
+    "sporting cp":                "Sporting CP",
+    "sc braga":                   "Braga",
+    # ── Scotland ──────────────────────────────────────────────────────────────
+    "celtic fc":                  "Celtic",
+    "rangers fc":                 "Rangers",
+    "heart of midlothian":        "Hearts",
+    "hibernian fc":               "Hibernian",
+}
+
+
+def _normalize_team_name(raw: str) -> str:
+    """Map external data source names → FBref canonical names.
+    Falls through unchanged if no alias is found."""
+    return TEAM_NAME_ALIASES.get(raw.strip().lower(), raw.strip())
+
 
 def _get_league(cur, name: str):
     """Resolve a league name (including ClubElo short codes and Football-Data Div
@@ -155,7 +327,9 @@ def _get_league(cur, name: str):
 
 
 def _get_team(cur, name: str, league_id: int, team_cache: dict):
-    clean = name.strip()
+    raw   = name.strip()
+    clean = _normalize_team_name(raw)   # map aliases → FBref canonical names
+
     # In-memory deduplication during massive sync batches
     cache_key = (clean.lower(), league_id)
     if cache_key in team_cache:
@@ -176,10 +350,17 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict):
         team_cache[cache_key] = res["id"]
         return res["id"]
 
-    # 3. Genuinely new team — insert
+    # 3. Genuinely new team — only create if name looks legitimate.
+    #    Names shorter than 3 chars are almost certainly garbage from a
+    #    malformed CSV row (e.g. empty HomeTeam field parsed as "  ").
+    if len(clean) < 3:
+        logger.warning("Skipping suspect team name (too short): %r", raw)
+        return None
+
     cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (clean, league_id))
     new_id = cur.fetchone()["id"]
     team_cache[cache_key] = new_id
+    logger.debug("Created new team: %r (league_id=%s)", clean, league_id)
     return new_id
 
 def _find_match(cur, home_team_id, away_team_id, match_date: str):

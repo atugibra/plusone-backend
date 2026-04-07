@@ -160,6 +160,14 @@ class SyncPayload(BaseModel):
     team_logos: Optional[dict] = None
 
 def tables_to_fixtures(tables):
+    # FBref sends day-of-week as text abbreviations: "Sat", "Sun", "Mon" etc.
+    # Convert to ISO weekday integer (1=Mon … 7=Sun) so safe_num() doesn't
+    # silently discard them. Previously ALL dayofweek values were NULL in DB.
+    _DOW = {
+        "mon": 1, "tue": 2, "wed": 3, "thu": 4,
+        "fri": 5, "sat": 6, "sun": 7,
+    }
+
     result = []
     for table in tables:
         headers = [h.strip().lower() for h in table.headers]
@@ -171,18 +179,27 @@ def tables_to_fixtures(tables):
             away = safe_text(r.get("away_team", r.get("away", r.get("away team", ""))))
             if not home or not away or home.lower() in ("home", "home_team", ""):
                 continue
+
+            # dayofweek: map FBref text abbreviation → ISO integer (was always NULL before)
+            raw_dow = safe_text(r.get("dayofweek", r.get("day", "")))
+            dow_int = _DOW.get(raw_dow.lower()[:3], None) if raw_dow else None
+
+            # gameweek: numeric only; round stored separately as free-text
+            gw_raw = safe_text(r.get("gameweek", r.get("wk", "")))
+            gw_num = safe_num(gw_raw)
+
             result.append({
                 "home_team":  home,
                 "away_team":  away,
                 "date":       safe_text(r.get("date", r.get("dates", ""))),
                 "start_time": safe_text(r.get("start_time", r.get("time", ""))),
                 "score":      trunc(safe_text(r.get("score", "")), 30),
-                "gameweek":   safe_text(r.get("gameweek", r.get("wk", r.get("round", "")))),
-                "dayofweek":  safe_text(r.get("dayofweek", r.get("day", ""))),
+                "gameweek":   gw_num,
+                "dayofweek":  dow_int,
                 "venue":      safe_text(r.get("venue", "")),
                 "attendance": safe_num(r.get("attendance", None)),
                 "referee":    safe_text(r.get("referee", "")),
-                "round":      trunc(safe_text(r.get("round", r.get("gameweek", ""))), 100),
+                "round":      trunc(safe_text(r.get("round", r.get("wk", r.get("gameweek", "")))), 100),
             })
     return result
 
@@ -550,8 +567,39 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         logos = 0
         if payload.team_logos:
             logos = _update_team_logos(cur, league_id, payload.team_logos)
+
+        total_rows = fx + st + pl + sd + ha
+
+        # ── Empty-payload guard ────────────────────────────────────────────────
+        # When FBref rate-limits the extension (429) or the page loads without
+        # its stats tables (Bot-block / JS-only render), the scraper sends an
+        # empty tables list.  Previously this was silently committed as a
+        # "successful" sync with 0 rows, polluting the scrape_log and masking
+        # failed scrapes.  Now we abort the commit and return a distinct warning
+        # so the extension can flag the URL for retry.
+        if total_rows == 0:
+            conn.rollback()
+            logger.warning(
+                "sync_all: empty payload for league=%s season=%s — no data written. "
+                "Likely a rate-limited or failed scrape.",
+                payload.league, payload.season
+            )
+            return {
+                "success": False,
+                "warning": "empty_payload",
+                "detail": (
+                    "No rows were extracted from the scraped page. "
+                    "This is usually caused by FBref rate-limiting (429) or a "
+                    "page that loaded without its stats tables. "
+                    "Re-scrape this URL after a short delay."
+                ),
+                "fixtures_inserted": 0, "stats_inserted": 0,
+                "players_inserted": 0, "standings_inserted": 0,
+            }
+        # ── End empty-payload guard ────────────────────────────────────────────
+
         conn.commit()
-        log_scrape(cur, league_id, season_id, "sync_all", fx + st + pl + sd + ha, 0)
+        log_scrape(cur, league_id, season_id, "sync_all", total_rows, 0)
         conn.commit()
         # Auto-evaluate predictions whose matches just received scores
         evaluated = _auto_evaluate_predictions(conn)
@@ -560,6 +608,7 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
             threading.Thread(target=_auto_recalibrate_bg, daemon=True,
                              name="auto-recalibrate").start()
         return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "logos_updated": logos, "predictions_evaluated": evaluated, "recalibration_triggered": evaluated > 0}
+
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -679,16 +728,34 @@ def _insert_fixtures(cur, league_id, season_id, league_name, fixtures):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (home_team_id, away_team_id, match_date) DO UPDATE SET
                 -- Fix corrupt rows that had league_id/season_id=None from old imports
-                league_id=COALESCE(matches.league_id, EXCLUDED.league_id),
-                season_id=COALESCE(matches.season_id, EXCLUDED.season_id),
-                home_score=EXCLUDED.home_score,
-                away_score=EXCLUDED.away_score,
-                score_raw=EXCLUDED.score_raw,
-                attendance=EXCLUDED.attendance,
-                venue=EXCLUDED.venue,
-                referee=EXCLUDED.referee,
-                is_played=EXCLUDED.home_score IS NOT NULL,
-                updated_at=NOW()
+                league_id  = COALESCE(matches.league_id, EXCLUDED.league_id),
+                season_id  = COALESCE(matches.season_id, EXCLUDED.season_id),
+                -- ONLY overwrite score when the incoming row carries a real score.
+                -- A re-sync of a future-fixture page (score=NULL) must never erase
+                -- a previously stored result. This was the root cause of 3,121 0-0 rows.
+                home_score = CASE
+                               WHEN EXCLUDED.home_score IS NOT NULL THEN EXCLUDED.home_score
+                               ELSE matches.home_score
+                             END,
+                away_score = CASE
+                               WHEN EXCLUDED.away_score IS NOT NULL THEN EXCLUDED.away_score
+                               ELSE matches.away_score
+                             END,
+                score_raw  = CASE
+                               WHEN EXCLUDED.score_raw IS NOT NULL AND EXCLUDED.score_raw != ''
+                               THEN EXCLUDED.score_raw
+                               ELSE matches.score_raw
+                             END,
+                -- Only flip is_played to TRUE when we're providing a real score;
+                -- never flip it back to FALSE from a blank resync.
+                is_played  = CASE
+                               WHEN EXCLUDED.home_score IS NOT NULL THEN TRUE
+                               ELSE matches.is_played
+                             END,
+                attendance = EXCLUDED.attendance,
+                venue      = COALESCE(NULLIF(EXCLUDED.venue, ''), matches.venue),
+                referee    = COALESCE(NULLIF(EXCLUDED.referee, ''), matches.referee),
+                updated_at = NOW()
         """, (
             league_id, season_id, home_id, away_id,
             safe_num(f.get("gameweek")),    safe_num(f.get("dayofweek")),
