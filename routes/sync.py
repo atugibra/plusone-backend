@@ -114,7 +114,7 @@ def _auto_evaluate_predictions(conn) -> int:
             try: conn.rollback()
             except Exception: pass
             return 0
-
+_recalibrate_lock = threading.Lock()
 
 def _auto_recalibrate_bg():
     """
@@ -122,6 +122,9 @@ def _auto_recalibrate_bg():
     Runs in a background daemon thread so the sync response is not delayed.
     After calibration, also trigger DC live-calibration from dc_correct data.
     """
+    if not _recalibrate_lock.acquire(blocking=False):
+        _sync_log.debug("Auto-recalibrate already running. Skipping this trigger.")
+        return
     try:
         from ml.feedback_calibrator import recalibrate_with_feedback
         recalibrate_with_feedback()
@@ -143,6 +146,8 @@ def _auto_recalibrate_bg():
         _sync_log.info("Auto-recalibrate (markets) completed after sync.")
     except Exception as exc:
         _sync_log.warning("Auto-recalibrate (markets) failed: %s", exc)
+    finally:
+        _recalibrate_lock.release()
 
 class TableData(BaseModel):
     headers: List[str] = []
@@ -561,7 +566,7 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
                     stats_list.extend(tables_to_squad_stats([t]))
         fx  = _insert_fixtures(cur, league_id, season_id, payload.league, fixtures_list)
         st  = _insert_squad_stats(cur, league_id, season_id, stats_list)
-        pl  = _insert_player_stats(cur, season_id, payload.league, players_list)
+        pl  = _insert_player_stats(cur, league_id, season_id, players_list)
         sd  = _insert_standings(cur, league_id, season_id, standings_list)
         ha  = _insert_home_away_stats(cur, league_id, season_id, ha_split_list)
         logos = 0
@@ -669,11 +674,12 @@ def sync_player_stats(payload: SyncPayload, _admin: dict = Depends(require_admin
     conn = get_connection()
     cur = conn.cursor()
     try:
+        league_id = get_or_create_league(cur, payload.league)
         season_id = get_or_create_season(cur, payload.season)
         rows = payload.player_stats or payload.playerStats or []
         if payload.tables:
             rows.extend(tables_to_player_stats(payload.tables))
-        inserted = _insert_player_stats(cur, season_id, payload.league, rows)
+        inserted = _insert_player_stats(cur, league_id, season_id, rows)
         conn.commit()
         return {"success": True, "players_inserted": inserted}
     except Exception as e:
@@ -843,7 +849,7 @@ def _insert_home_away_stats(cur, league_id, season_id, rows):
     return count
 
 
-def _insert_player_stats(cur, season_id, league_name, players):
+def _insert_player_stats(cur, league_id, season_id, players):
     count = 0
     for p in players:
         name = str(p.get("player", "")).strip()
@@ -851,11 +857,8 @@ def _insert_player_stats(cur, season_id, league_name, players):
             continue
         team_name = str(p.get("team", "")).strip()
         team_id = None
-        if team_name:
-            cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (f"%{league_name}%",))
-            lg = cur.fetchone()
-            if lg:
-                team_id = get_or_create_team(cur, team_name, lg["id"])
+        if team_name and league_id:
+            team_id = get_or_create_team(cur, team_name, league_id)
         cur.execute("""
             INSERT INTO player_stats
                 (player_name, nationality, position, team_id, season_id,
