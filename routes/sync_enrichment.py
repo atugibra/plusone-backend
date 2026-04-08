@@ -357,6 +357,22 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict):
         logger.warning("Skipping suspect team name (too short): %r", raw)
         return None
 
+    # 4. Fuzzy match against existing teams in the league to prevent duplicates
+    import difflib
+    cur.execute("SELECT id, name FROM teams WHERE league_id = %s", (league_id,))
+    league_teams = cur.fetchall()
+    team_names = [t["name"] for t in league_teams]
+    
+    matches = difflib.get_close_matches(clean, team_names, n=1, cutoff=0.60)
+    if matches:
+        matched_name = matches[0]
+        # Find the ID for the matched name
+        for t in league_teams:
+            if t["name"] == matched_name:
+                team_cache[cache_key] = t["id"]
+                logger.debug("Fuzzy matched enrichment team %r to existing team %r", clean, matched_name)
+                return t["id"]
+
     cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (clean, league_id))
     new_id = cur.fetchone()["id"]
     team_cache[cache_key] = new_id
