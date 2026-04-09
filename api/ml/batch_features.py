@@ -325,35 +325,44 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None, n
     if not matches:
         return {"form_score": 0.5, "goals_scored_avg": 1.35,
                 "goals_conceded_avg": 1.35, "win_streak": 0,
-                "results": [], "last3_form_score": 0.5}
+                "results": [], "last3_form_score": 0.5,
+                "weighted_form_score": 0.5}
 
     pts_total = gf_total = ga_total = 0
     results, streak, streak_active = [], 0, True
     pts_last3 = 0
+    weighted_pts = 0.0
+    weighted_max = 0.0
+    _decay = 0.8  # exponential decay — most recent game = 1.0, each prior game -20%
     for i, r in enumerate(matches):
         is_home = r["home_team_id"] == team_id
         gf = _f(r["home_score"] if is_home else r["away_score"])
         ga = _f(r["away_score"] if is_home else r["home_score"])
         gf_total += gf; ga_total += ga
+        w = _decay ** i
+        weighted_max += 3.0 * w
         if gf > ga:
             pts_total += 3; results.append("W")
             if streak_active: streak += 1
             if i < 3: pts_last3 += 3
+            weighted_pts += 3.0 * w
         elif gf == ga:
             pts_total += 1; results.append("D"); streak_active = False
             if i < 3: pts_last3 += 1
+            weighted_pts += 1.0 * w
         else:
             results.append("L"); streak_active = False
 
     n_actual  = len(matches)
     n_last3   = min(n_actual, 3)
     return {
-        "form_score":         _safe_div(pts_total,  n_actual * 3, 0.5),
-        "last3_form_score":   _safe_div(pts_last3,  n_last3  * 3, 0.5),
-        "goals_scored_avg":   _safe_div(gf_total,  n_actual, 1.2),
-        "goals_conceded_avg": _safe_div(ga_total,  n_actual, 1.2),
-        "win_streak":         streak,
-        "results":            results,
+        "form_score":          _safe_div(pts_total,    n_actual * 3,  0.5),
+        "last3_form_score":    _safe_div(pts_last3,    n_last3  * 3,  0.5),
+        "weighted_form_score": _safe_div(weighted_pts, weighted_max,  0.5),
+        "goals_scored_avg":    _safe_div(gf_total,     n_actual,      1.2),
+        "goals_conceded_avg":  _safe_div(ga_total,     n_actual,      1.2),
+        "win_streak":          streak,
+        "results":             results,
     }
 
 
@@ -807,15 +816,34 @@ def _build_team_features(cache: DataCache, team_id: int,
     form_all  = _compute_form(cache, team_id, None,   5, before_date)
     form_home = _compute_form(cache, team_id, "home", 5, before_date)
     form_away = _compute_form(cache, team_id, "away", 5, before_date)
-    feats["form_score"]       = form_all["form_score"]
-    feats["last3_form_score"] = form_all["last3_form_score"]
-    # momentum: positive = improving, negative = fading
-    feats["form_momentum"]   = form_all["last3_form_score"] - form_all["form_score"]
-    feats["form_gf_avg"]     = form_all["goals_scored_avg"]
-    feats["form_ga_avg"]     = form_all["goals_conceded_avg"]
-    feats["win_streak"]      = _f(form_all["win_streak"])
-    feats["home_form_score"] = form_home["form_score"]
-    feats["away_form_score"] = form_away["form_score"]
+    feats["form_score"]           = form_all["form_score"]
+    feats["last3_form_score"]     = form_all["last3_form_score"]
+    feats["weighted_form_score"]  = form_all["weighted_form_score"]
+    # momentum: positive = improving form, negative = fading
+    feats["form_momentum"]        = form_all["last3_form_score"] - form_all["form_score"]
+    feats["form_gf_avg"]          = form_all["goals_scored_avg"]
+    feats["form_ga_avg"]          = form_all["goals_conceded_avg"]
+    feats["win_streak"]           = _f(form_all["win_streak"])
+    feats["home_form_score"]      = form_home["form_score"]
+    feats["away_form_score"]      = form_away["form_score"]
+
+    # Days since last completed match — rest/fatigue signal.
+    # Computed relative to before_date when building training data (avoids leakage),
+    # or relative to today when predicting upcoming matches.
+    try:
+        team_matches_all = cache.matches_by_team.get(team_id, [])
+        past_matches     = _filter_before(team_matches_all, before_date) if before_date else team_matches_all
+        if past_matches:
+            last_date = _to_date(past_matches[0].get("match_date"))
+            ref_date  = _to_date(before_date) if before_date else datetime.date.today()
+            if last_date and ref_date:
+                feats["days_since_last_match"] = float((ref_date - last_date).days)
+            else:
+                feats["days_since_last_match"] = 7.0
+        else:
+            feats["days_since_last_match"] = 7.0
+    except Exception:
+        feats["days_since_last_match"] = 7.0
 
     # ELO-style strength proxy: blend rank, form and points
     # Normalised to [0, 1] — higher = stronger team right now
