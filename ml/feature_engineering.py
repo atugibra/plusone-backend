@@ -10,6 +10,7 @@ Also captures Scoring/Conceding Patterns (streakiness, blanks, blowouts).
 """
 
 import math
+import datetime
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -185,7 +186,8 @@ def compute_form(cur, team_id, venue=None, n=5):
 
     if not rows:
         return {"form_score": 0.5, "goals_scored_avg": 1.35, "goals_conceded_avg": 1.35,
-                "win_streak": 0, "results": []}
+                "win_streak": 0, "results": [], "last3_form_score": 0.5,
+                "weighted_form_score": 0.5}
 
     pts_total = 0
     gf_total = 0
@@ -193,34 +195,47 @@ def compute_form(cur, team_id, venue=None, n=5):
     results = []
     streak = 0
     streak_active = True
+    pts_last3 = 0
+    weighted_pts = 0.0
+    weighted_max = 0.0
+    _decay = 0.8  # exponential decay per game going back in time
 
-    for r in rows:
+    for i, r in enumerate(rows):
         is_home = (r["home_team_id"] == team_id)
         gf = _f(r["home_score"] if is_home else r["away_score"])
         ga = _f(r["away_score"] if is_home else r["home_score"])
         gf_total += gf
         ga_total += ga
+        w = _decay ** i   # most recent game = 1.0, each prior game discounted by 20%
+        weighted_max += 3.0 * w
         if gf > ga:
             pts_total += 3
             results.append("W")
             if streak_active:
                 streak += 1
+            if i < 3: pts_last3 += 3
+            weighted_pts += 3.0 * w
         elif gf == ga:
             pts_total += 1
             results.append("D")
             streak_active = False
+            if i < 3: pts_last3 += 1
+            weighted_pts += 1.0 * w
         else:
             results.append("L")
             streak_active = False
 
     n_actual = len(rows)
-    max_pts = n_actual * 3
+    n_last3  = min(n_actual, 3)
+    max_pts  = n_actual * 3
     return {
-        "form_score":        _safe_div(pts_total, max_pts, 0.5),
-        "goals_scored_avg":  _safe_div(gf_total, n_actual, 1.2),
-        "goals_conceded_avg":_safe_div(ga_total, n_actual, 1.2),
-        "win_streak":        streak,
-        "results":           results,
+        "form_score":         _safe_div(pts_total,    max_pts,       0.5),
+        "last3_form_score":   _safe_div(pts_last3,    n_last3 * 3,   0.5),
+        "weighted_form_score":_safe_div(weighted_pts, weighted_max,  0.5),
+        "goals_scored_avg":   _safe_div(gf_total,     n_actual,      1.2),
+        "goals_conceded_avg": _safe_div(ga_total,     n_actual,      1.2),
+        "win_streak":         streak,
+        "results":            results,
     }
 
 
@@ -708,12 +723,38 @@ def build_team_features(cur, team_id, league_id, season_id, league_avgs=None):
     form_home = compute_form(cur, team_id, venue="home", n=5)
     form_away = compute_form(cur, team_id, venue="away", n=5)
 
-    feats["form_score"]          = form_all["form_score"]
-    feats["form_gf_avg"]         = form_all["goals_scored_avg"]
-    feats["form_ga_avg"]         = form_all["goals_conceded_avg"]
-    feats["win_streak"]          = _f(form_all["win_streak"])
-    feats["home_form_score"]     = form_home["form_score"]
-    feats["away_form_score"]     = form_away["form_score"]
+    feats["form_score"]           = form_all["form_score"]
+    feats["last3_form_score"]     = form_all["last3_form_score"]
+    feats["weighted_form_score"]  = form_all["weighted_form_score"]
+    # momentum: positive = improving form, negative = fading
+    feats["form_momentum"]        = form_all["last3_form_score"] - form_all["form_score"]
+    feats["form_gf_avg"]          = form_all["goals_scored_avg"]
+    feats["form_ga_avg"]          = form_all["goals_conceded_avg"]
+    feats["win_streak"]           = _f(form_all["win_streak"])
+    feats["home_form_score"]      = form_home["form_score"]
+    feats["away_form_score"]      = form_away["form_score"]
+
+    # Days since last completed match — captures fatigue and rest advantage.
+    # Teams with more rest tend to perform better; mid-week fixtures hurt performance.
+    try:
+        cur.execute("""
+            SELECT match_date FROM matches
+            WHERE (home_team_id = %s OR away_team_id = %s)
+              AND home_score IS NOT NULL
+            ORDER BY match_date DESC LIMIT 1
+        """, (team_id, team_id))
+        last_row = cur.fetchone()
+        if last_row and last_row["match_date"]:
+            last_date = last_row["match_date"]
+            if hasattr(last_date, "date"):
+                last_date = last_date.date()
+            elif isinstance(last_date, str):
+                last_date = datetime.date.fromisoformat(str(last_date)[:10])
+            feats["days_since_last_match"] = float((datetime.date.today() - last_date).days)
+        else:
+            feats["days_since_last_match"] = 7.0
+    except Exception:
+        feats["days_since_last_match"] = 7.0
 
     # Derived: expected goals estimate from current-season shooting
     feats["xg_estimate"] = (
