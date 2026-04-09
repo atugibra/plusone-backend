@@ -41,7 +41,8 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-MIN_SAMPLES = 15  # minimum evaluated predictions needed before calibrating
+MIN_SAMPLES = 50  # minimum evaluated predictions needed before calibrating
+                  # isotonic regression overfits badly on fewer than ~50 samples
 
 OUTCOME_MAP = {
     "Home Win": 2, "Away Win": 0, "Draw": 1,
@@ -98,11 +99,12 @@ class FeedbackCalibrator:
         self._cal: Optional[_IsotonicCalibrator] = None
         self.n_samples = 0
         self.pre_accuracy  = None
-        self.post_accuracy = None
+        self.post_accuracy = None   # holdout accuracy (out-of-sample)
+        self.is_improvement = False  # True only when holdout acc >= pre_accuracy
 
     @property
     def is_fitted(self) -> bool:
-        return self._cal is not None and self._cal.is_fitted
+        return self._cal is not None and self._cal.is_fitted and self.is_improvement
 
     # ── Fit ───────────────────────────────────────────────────────────────────
 
@@ -160,23 +162,36 @@ class FeedbackCalibrator:
         pre_preds = np.argmax(probs, axis=1)
         self.pre_accuracy = float((pre_preds == outcomes).mean())
 
-        # Fit
+        # ── Holdout evaluation (80/20 split) ──────────────────────────────────
+        # We measure post_accuracy on a held-out 20% so the reported accuracy
+        # is out-of-sample. Without this, isotonic regression trivially scores
+        # well on its own training data and the metric is meaningless.
+        split = max(10, int(len(probs) * 0.8))
+        probs_train,    probs_holdout    = probs[:split],    probs[split:]
+        outcomes_train, outcomes_holdout = outcomes[:split], outcomes[split:]
+
+        cal_eval = _IsotonicCalibrator()
+        cal_eval.fit(probs_train, outcomes_train)
+        calibrated_holdout = cal_eval.predict(probs_holdout)
+        post_preds_holdout = np.argmax(calibrated_holdout, axis=1)
+        self.post_accuracy  = float((post_preds_holdout == outcomes_holdout).mean())
+        self.is_improvement = self.post_accuracy >= self.pre_accuracy
+
+        # ── Refit on ALL data for production use ──────────────────────────────
+        # Now that we've validated it helps on holdout, fit the final calibrator
+        # on the full dataset for maximum coverage.
         cal = _IsotonicCalibrator()
         cal.fit(probs, outcomes)
-
-        # Post-calibration accuracy
-        calibrated = cal.predict(probs)
-        post_preds = np.argmax(calibrated, axis=1)
-        self.post_accuracy = float((post_preds == outcomes).mean())
 
         self._cal = cal
         self.n_samples = len(probs)
 
         log.info(
-            "FeedbackCalibrator fitted on %d samples — accuracy %.1f%% → %.1f%%",
+            "FeedbackCalibrator fitted on %d samples — pre %.1f%% → holdout %.1f%% (%s)",
             self.n_samples,
-            self.pre_accuracy * 100,
+            self.pre_accuracy  * 100,
             self.post_accuracy * 100,
+            "IMPROVEMENT" if self.is_improvement else "NO IMPROVEMENT — will not apply",
         )
 
         return {
@@ -185,6 +200,11 @@ class FeedbackCalibrator:
             "pre_accuracy_pct":  round(self.pre_accuracy  * 100, 2),
             "post_accuracy_pct": round(self.post_accuracy * 100, 2),
             "improvement_pct":   round((self.post_accuracy - self.pre_accuracy) * 100, 2),
+            "is_improvement":    self.is_improvement,
+            "note": ("Calibrator will be applied to future predictions."
+                     if self.is_improvement else
+                     "Calibrator fitted but will NOT be applied — holdout accuracy "
+                     "did not improve over raw model. Recalibrate when more data is available."),
         }
 
     # ── Apply ─────────────────────────────────────────────────────────────────
@@ -214,14 +234,16 @@ class FeedbackCalibrator:
 
     def save(self):
         """Persist calibrator to ml_models table in the DB."""
-        if not self.is_fitted:
+        if not self._cal or not self._cal.is_fitted:
             return
         try:
             from database import get_connection
-            import base64
             byte_data = pickle.dumps(self._cal)
             conn = get_connection()
             cur  = conn.cursor()
+            # Store post_accuracy as positive when improvement, negative when not.
+            # This lets load() reconstruct is_improvement without a schema change.
+            stored_acc = self.post_accuracy if self.is_improvement else -(self.post_accuracy or 0)
             cur.execute("""
                 INSERT INTO ml_models (name, model_bytes, n_samples, cv_accuracy, created_at)
                 VALUES (%s, %s, %s, %s, NOW())
@@ -230,10 +252,10 @@ class FeedbackCalibrator:
                       n_samples   = EXCLUDED.n_samples,
                       cv_accuracy = EXCLUDED.cv_accuracy,
                       created_at  = NOW()
-            """, (self.DB_KEY, byte_data, self.n_samples, self.post_accuracy))
+            """, (self.DB_KEY, byte_data, self.n_samples, stored_acc))
             conn.commit()
             conn.close()
-            log.info("FeedbackCalibrator saved to DB.")
+            log.info("FeedbackCalibrator saved to DB (improvement=%s).", self.is_improvement)
         except Exception as exc:
             log.warning("FeedbackCalibrator.save() failed: %s", exc)
 
@@ -251,11 +273,14 @@ class FeedbackCalibrator:
             conn.close()
             if not row or not row["model_bytes"]:
                 return False
-            self._cal       = pickle.loads(row["model_bytes"])
-            self.n_samples  = int(row["n_samples"] or 0)
-            self.post_accuracy = float(row["cv_accuracy"] or 0)
-            log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%)",
-                     self.n_samples, self.post_accuracy * 100)
+            self._cal          = pickle.loads(row["model_bytes"])
+            self.n_samples     = int(row["n_samples"] or 0)
+            stored_acc         = float(row["cv_accuracy"] or 0)
+            # Negative stored value means calibrator was saved but did not improve accuracy
+            self.is_improvement = stored_acc >= 0
+            self.post_accuracy  = abs(stored_acc)
+            log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%, improvement=%s)",
+                     self.n_samples, self.post_accuracy * 100, self.is_improvement)
             return True
         except Exception as exc:
             # Silently skip on fresh deployments where ml_models table doesn't exist yet

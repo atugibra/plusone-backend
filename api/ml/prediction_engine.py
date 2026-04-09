@@ -58,12 +58,14 @@ def _get_engine() -> EnsemblePredictor:
 def _apply_calibration(probs: dict) -> dict:
     """
     Apply feedback calibrator to raw model probabilities.
-    Currently DISABLED because FeedbackCalibrator was accidentally
-    training on consensus probabilities instead of pure ML probabilities,
-    warping the ML outputs and destroying its accuracy.
-    The ML models are already natively calibrated via CalibratedClassifierCV.
+    Only activates when the calibrator has been fitted, has at least MIN_SAMPLES
+    evaluated predictions, and demonstrated holdout accuracy >= pre-calibration
+    accuracy. Falls through unchanged otherwise.
     """
-    return probs
+    cal = get_calibrator()
+    if not cal.is_fitted:
+        return probs
+    return cal.apply(probs)
 
 
 # ─── Training ─────────────────────────────────────────────────────────────────
