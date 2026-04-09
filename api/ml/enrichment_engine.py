@@ -32,10 +32,30 @@ _engine = None
 
 class EnrichmentPredictor:
     def __init__(self):
-        # We use a blend of RF (low variance) and XGB (high accuracy)
-        self.rf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-        self.xgb = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, 
-                                 eval_metric='mlogloss', random_state=42)
+        # We use a blend of RF (low variance) and XGB (high accuracy).
+        # Hyperparameters are kept consistent with the main EnsemblePredictor
+        # to avoid one model being significantly more regularised than the other.
+        self.rf = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=6,            # matches main ensemble
+            min_samples_leaf=20,    # increased from default — larger leaves generalise better
+            max_features=0.35,      # ~35% of features per split — mirrors main ensemble
+            random_state=42,
+        )
+        self.xgb = XGBClassifier(
+            n_estimators=100,
+            max_depth=4,            # matches main ensemble
+            learning_rate=0.05,
+            subsample=0.75,         # mirrors main ensemble
+            colsample_bytree=0.45,  # mirrors main ensemble — key anti-overfit param
+            colsample_bylevel=0.7,  # mirrors main ensemble
+            min_child_weight=20,    # mirrors main ensemble
+            gamma=0.2,              # mirrors main ensemble
+            reg_alpha=0.3,          # mirrors main ensemble
+            reg_lambda=2.0,         # mirrors main ensemble
+            eval_metric='mlogloss',
+            random_state=42,
+        )
         self.scaler = StandardScaler()
         self.is_trained = False
         self.feature_names_ = []

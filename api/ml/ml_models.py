@@ -44,14 +44,15 @@ class EnsemblePredictor:
         # We calibrate it isotonically so its raw logits become true probs.
         xgb_base = XGBClassifier(
             n_estimators=400,           # more trees → smoother decision surface
-            max_depth=5,
+            max_depth=4,                # reduced from 5 — shallower trees generalise better
             learning_rate=0.04,         # slightly lower lr to pair with more trees
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=3,         # prevents splits on tiny leaf nodes
-            gamma=0.1,                  # minimum gain required to make a split
-            reg_alpha=0.1,              # L1 regularization (feature sparsity)
-            reg_lambda=1.5,             # L2 regularization (weight decay)
+            subsample=0.75,             # reduced from 0.8 — more row-level randomness
+            colsample_bytree=0.45,      # reduced from 0.8 — ~150 of 336 features per tree
+            colsample_bylevel=0.7,      # added — extra feature randomness per split level
+            min_child_weight=20,        # increased from 3 — forces larger, more robust leaves
+            gamma=0.2,                  # increased from 0.1 — stricter split threshold
+            reg_alpha=0.3,              # increased from 0.1 — stronger L1 (feature sparsity)
+            reg_lambda=2.0,             # increased from 1.5 — stronger L2 (weight decay)
             eval_metric="mlogloss",
             random_state=42,
             n_jobs=-1,
@@ -62,8 +63,9 @@ class EnsemblePredictor:
         # class_weight='balanced' already handles the HW/Draw/AW imbalance.
         rf = RandomForestClassifier(
             n_estimators=200,
-            max_depth=8,
-            min_samples_leaf=5,
+            max_depth=6,            # reduced from 8 — prevents deep memorisation
+            min_samples_leaf=20,    # increased from 5 — each leaf needs 20+ samples
+            max_features=0.35,      # added — ~120 of 336 features per split
             class_weight="balanced",
             random_state=42,
             n_jobs=1,
@@ -85,8 +87,8 @@ class EnsemblePredictor:
         feature_names: optional list of feature name strings
         match_dates: optional list of date objects/strings — used to apply
                      exponential recency decay so recent matches matter more.
-                     Formula: weight *= exp(-days_ago / 365)
-                     A match from 1yr ago gets 37% weight vs a recent match.
+                     Formula: weight *= exp(-days_ago / 730)
+                     A match from 2yrs ago gets 37% weight vs a recent match.
         """
         import datetime
         X = np.array(X, dtype=float)
@@ -109,7 +111,9 @@ class EnsemblePredictor:
         sample_weights = compute_sample_weight(class_weight="balanced", y=y)
 
         # Apply exponential recency decay if match_dates provided.
-        # Recent matches are 3x more influential than 3-year-old data.
+        # Recent matches are ~2x more influential than 2-year-old data.
+        # Half-life is 730 days (2 years) — softened from 365 to avoid
+        # shrinking the effective training set and worsening overfitting.
         if match_dates is not None and len(match_dates) == len(y):
             today = datetime.date.today()
             for i, d in enumerate(match_dates):
@@ -119,7 +123,7 @@ class EnsemblePredictor:
                     elif hasattr(d, "date"):
                         d = d.date()
                     days_ago = max((today - d).days, 0)
-                    recency = float(np.exp(-days_ago / 365.0))
+                    recency = float(np.exp(-days_ago / 730.0))  # 2yr half-life (was 365)
                     sample_weights[i] *= recency
                 except Exception:
                     pass  # silently keep original weight if date is malformed
