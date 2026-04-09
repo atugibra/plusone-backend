@@ -877,6 +877,25 @@ def _build_team_features(cache: DataCache, team_id: int,
 
 # ─── Match feature vector (in-memory) ─────────────────────────────────────────
 
+def _get_domestic_league_id(cache: DataCache, team_id: int) -> Optional[int]:
+    """
+    Return the league_id of the team's primary domestic competition.
+    Determined by which league has the most standing entries for this team
+    (most games played = most likely their domestic league).
+    Returns None if the team has no standings data at all.
+    """
+    best_lid   = None
+    best_games = -1
+    for (tid, lid, sid), row in cache.standings.items():
+        if tid != team_id:
+            continue
+        g = int(_f(row.get("games"), 0))
+        if g > best_games:
+            best_games = g
+            best_lid   = lid
+    return best_lid
+
+
 def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int,
                            league_id: int, season_id: int,
                            match_id: Optional[int] = None, match_date = None):
@@ -927,6 +946,51 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
     
     # ── Inject Enrichment Data (Odds & ClubElo) ──────────────────────────
     vector.update(enrichment)
+
+    # ── Cross-league context features ────────────────────────────────────
+    # Detects when teams are playing outside their domestic competition
+    # (e.g. Europa League, Champions League, cross-border cup).
+    # These features tell the model:
+    #   - Whether this is a cross-league fixture at all
+    #   - How strong each team's domestic league is relative to the other
+    #   - Whether each team's domestic stats are from the same competition
+    # Without these, the model naively compares e.g. Primeira Liga stats
+    # directly against Premier League stats with no adjustment signal.
+    home_domestic_lid = _get_domestic_league_id(cache, home_team_id)
+    away_domestic_lid = _get_domestic_league_id(cache, away_team_id)
+
+    home_is_cross = (home_domestic_lid is not None and home_domestic_lid != league_id)
+    away_is_cross = (away_domestic_lid is not None and away_domestic_lid != league_id)
+    is_cross_league = home_is_cross or away_is_cross
+
+    vector["is_cross_league"]       = 1.0 if is_cross_league  else 0.0
+    vector["home_is_cross_league"]  = 1.0 if home_is_cross    else 0.0
+    vector["away_is_cross_league"]  = 1.0 if away_is_cross    else 0.0
+
+    # Domestic league strength proxy: avg goals/game in each team's home league.
+    # Higher = more open/attacking league. Helps compare teams from different leagues.
+    home_dom_style = cache.league_style.get(home_domestic_lid, dict(_LEAGUE_STYLE_DEFAULTS)) if home_domestic_lid else dict(_LEAGUE_STYLE_DEFAULTS)
+    away_dom_style = cache.league_style.get(away_domestic_lid, dict(_LEAGUE_STYLE_DEFAULTS)) if away_domestic_lid else dict(_LEAGUE_STYLE_DEFAULTS)
+
+    vector["home_domestic_league_goals_pg"]      = _f(home_dom_style.get("league_goals_pg", 2.70))
+    vector["away_domestic_league_goals_pg"]      = _f(away_dom_style.get("league_goals_pg", 2.70))
+    vector["home_domestic_league_home_win_rate"] = _f(home_dom_style.get("league_home_win_rate", 0.44))
+    vector["away_domestic_league_home_win_rate"] = _f(away_dom_style.get("league_home_win_rate", 0.44))
+
+    # Difference in domestic league quality: positive = home team plays in stronger league
+    vector["diff_domestic_league_goals_pg"] = (
+        vector["home_domestic_league_goals_pg"] - vector["away_domestic_league_goals_pg"]
+    )
+
+    # When cross-league: re-normalise each team's attack strength to their OWN domestic league.
+    # This replaces the single shared league_goals_pg baseline with per-team baselines,
+    # correcting the distortion that caused Porto (weak league) to show 100% better stats.
+    home_dom_half = (vector["home_domestic_league_goals_pg"] / 2) or 1.35
+    away_dom_half = (vector["away_domestic_league_goals_pg"] / 2) or 1.35
+    vector["home_attack_rel_domestic"]  = _safe_div(home_feats.get("goals_for_pg",     0.0), home_dom_half, 1.0)
+    vector["away_attack_rel_domestic"]  = _safe_div(away_feats.get("goals_for_pg",     0.0), away_dom_half, 1.0)
+    vector["home_defence_rel_domestic"] = _safe_div(home_dom_half, home_feats.get("goals_against_pg", home_dom_half) or home_dom_half, 1.0)
+    vector["away_defence_rel_domestic"] = _safe_div(away_dom_half, away_feats.get("goals_against_pg", away_dom_half) or away_dom_half, 1.0)
 
     feature_names  = sorted(vector.keys())
     feature_values = [vector[k] for k in feature_names]

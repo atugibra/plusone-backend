@@ -843,6 +843,55 @@ def build_match_features(cur, home_team_id, away_team_id, league_id, season_id):
     # Match-level constant: home advantage exists in all football data
     vector["home_advantage"] = 1.0
 
+    # ── Cross-league context features ──────────────────────────────────────
+    # Detect when teams play outside their domestic competition and provide
+    # per-team domestic league baselines so cross-league stats are comparable.
+    def _get_domestic_league_id_fe(cur, team_id):
+        """Domestic league = league where team has most games in standings."""
+        try:
+            cur.execute("""
+                SELECT league_id, games FROM league_standings
+                WHERE team_id = %s AND games IS NOT NULL
+                ORDER BY games DESC LIMIT 1
+            """, (team_id,))
+            row = cur.fetchone()
+            return row["league_id"] if row else None
+        except Exception:
+            return None
+
+    def _get_league_style_fe(cur, league_id_val):
+        if league_id_val is None:
+            return {"league_goals_pg": 2.70, "league_home_win_rate": 0.44}
+        return compute_league_style(cur, league_id_val)
+
+    home_domestic_lid = _get_domestic_league_id_fe(cur, home_team_id)
+    away_domestic_lid = _get_domestic_league_id_fe(cur, away_team_id)
+
+    home_is_cross = (home_domestic_lid is not None and home_domestic_lid != league_id)
+    away_is_cross = (away_domestic_lid is not None and away_domestic_lid != league_id)
+
+    vector["is_cross_league"]      = 1.0 if (home_is_cross or away_is_cross) else 0.0
+    vector["home_is_cross_league"] = 1.0 if home_is_cross else 0.0
+    vector["away_is_cross_league"] = 1.0 if away_is_cross else 0.0
+
+    home_dom_style = _get_league_style_fe(cur, home_domestic_lid)
+    away_dom_style = _get_league_style_fe(cur, away_domestic_lid)
+
+    vector["home_domestic_league_goals_pg"]      = _f(home_dom_style.get("league_goals_pg",      2.70))
+    vector["away_domestic_league_goals_pg"]      = _f(away_dom_style.get("league_goals_pg",      2.70))
+    vector["home_domestic_league_home_win_rate"] = _f(home_dom_style.get("league_home_win_rate", 0.44))
+    vector["away_domestic_league_home_win_rate"] = _f(away_dom_style.get("league_home_win_rate", 0.44))
+    vector["diff_domestic_league_goals_pg"] = (
+        vector["home_domestic_league_goals_pg"] - vector["away_domestic_league_goals_pg"]
+    )
+
+    home_dom_half = (vector["home_domestic_league_goals_pg"] / 2) or 1.35
+    away_dom_half = (vector["away_domestic_league_goals_pg"] / 2) or 1.35
+    vector["home_attack_rel_domestic"]  = _safe_div(home_feats.get("goals_for_pg",     0.0), home_dom_half, 1.0)
+    vector["away_attack_rel_domestic"]  = _safe_div(away_feats.get("goals_for_pg",     0.0), away_dom_half, 1.0)
+    vector["home_defence_rel_domestic"] = _safe_div(home_dom_half, home_feats.get("goals_against_pg", home_dom_half) or home_dom_half, 1.0)
+    vector["away_defence_rel_domestic"] = _safe_div(away_dom_half, away_feats.get("goals_against_pg", away_dom_half) or away_dom_half, 1.0)
+
     # Sort for consistent column ordering
     feature_names = sorted(vector.keys())
     feature_values = [vector[k] for k in feature_names]
