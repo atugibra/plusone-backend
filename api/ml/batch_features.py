@@ -177,19 +177,17 @@ class DataCache:
                                      reverse=True)[:5]
 
         # 4. Completed matches — rolling 3-year window by DATE (not season_id)
-        # Using a wide date window ensures training has a representative mix of
-        # all outcome types (Home Win ~44%, Away Win ~30%, Draw ~26%) from the
-        # full 15k+ match database. The previous 6-month / 1500-row cap was too
-        # narrow and caused the model to see a skewed outcome distribution.
-        # 6000 rows × ~400 bytes ≈ 2.4 MB — still well within memory budget.
+        # Load all completed matches within a 4-year window.
+        # With 41k+ matches available, removing the 6000-row cap gives the model
+        # 7x more training data — the single biggest lever for CV accuracy improvement.
+        # Memory budget: 41k rows × ~400 bytes ≈ 16 MB — well within Railway limits.
         cur.execute("""
             SELECT id, home_team_id, away_team_id, season_id, league_id,
                    home_score, away_score, match_date
             FROM matches
             WHERE home_score IS NOT NULL AND away_score IS NOT NULL
-              AND match_date >= CURRENT_DATE - INTERVAL '3 years'
+              AND match_date >= CURRENT_DATE - INTERVAL '4 years'
             ORDER BY match_date DESC
-            LIMIT 6000
         """)
         self.all_matches: List[dict] = [dict(r) for r in cur.fetchall()]
 
