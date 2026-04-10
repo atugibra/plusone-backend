@@ -1003,8 +1003,9 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
 
     1. Bulk-loads all tables into a DataCache (~6 queries total).
     2. Iterates over completed matches and builds features in-memory.
-    3. Returns X, y, match_ids, match_dates, errors — match_dates is a list
-       of datetime.date objects used for recency weighting during training.
+    3. Returns X, y, match_ids, match_dates, league_ids, errors.
+       match_dates is used for recency weighting.
+       league_ids is used for league-tier weighting during training.
 
     Expected speed-up: 50–100× vs the original (seconds not minutes).
     """
@@ -1018,7 +1019,7 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
     ]
     log.info("Building features for %d completed matches…", len(completed))
 
-    X, y, match_ids, match_dates = [], [], [], []
+    X, y, match_ids, match_dates, league_ids = [], [], [], [], []
     errors = 0
 
     for m in completed:
@@ -1032,11 +1033,12 @@ def build_training_dataset_fast(cur, skip_errors: bool = True):
             hs = _f(m["home_score"]); as_ = _f(m["away_score"])
             label = 0 if hs > as_ else (1 if hs == as_ else 2)
             X.append(fv); y.append(label); match_ids.append(m["id"])
-            match_dates.append(m.get("match_date"))  # datetime.date or None
+            match_dates.append(m.get("match_date"))
+            league_ids.append(m.get("league_id"))
         except Exception:
             errors += 1
             if not skip_errors:
                 raise
 
     log.info("Dataset built: %d samples, %d errors skipped.", len(X), errors)
-    return X, y, match_ids, match_dates, errors
+    return X, y, match_ids, match_dates, league_ids, errors
