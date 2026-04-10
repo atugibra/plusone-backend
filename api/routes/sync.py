@@ -389,47 +389,120 @@ def get_or_create_season(cur, name):
 
 def _normalize_fbref_team_name(name: str) -> str:
     """
-    FBref prefixes UEFA team names with a 2-3 char country code:
-      'eng Arsenal'    -> 'Arsenal'  (own-stats row)
-      'eng vs Arsenal' -> 'Arsenal'  (opponent-stats row)
-    Also strips plain 'vs Arsenal' domestic prefix.
+    FBref decorates team names with 2-3 char ISO country codes in two ways:
+
+    PREFIX (own-stats rows on UEFA pages):
+      'eng Arsenal'      -> 'Arsenal'
+      'gr  AEK Athens'   -> 'AEK Athens'
+
+    SUFFIX (opponent rows / some UEFA fixture pages):
+      'AEK Athens gr'    -> 'AEK Athens'
+      'APOEL FC cy'      -> 'APOEL FC'
+      'Aberdeen sct'     -> 'Aberdeen'
+      'Ararat-Armenia am'-> 'Ararat-Armenia'
+
+    Also handles 'cc vs TeamName' and plain 'vs TeamName' patterns.
+
+    We deliberately avoid stripping suffix tokens that are part of the
+    canonical team name (e.g. "Athletic Club", "Real Madrid", "AC Milan")
+    by only removing a trailing token when it is a known 2-3 letter
+    lowercase-only ISO country/region code AND the remaining name is
+    at least 2 characters long.
     """
     s = name.strip()
+
     # "cc vs TeamName"
     m = re.match(r'^[a-z]{2,3}\s+vs\s+(.+)$', s)
     if m:
         return m.group(1).strip()
-    # "cc TeamName"
-    m = re.match(r'^[a-z]{2,3}\s+(.+)$', s)
-    if m:
-        s = m.group(1).strip()
 
-    # Strip away game and against identifiers
+    # PREFIX: "cc TeamName" where cc is 2-3 lowercase letters
+    m = re.match(r'^([a-z]{2,3})\s+(.+)$', s)
+    if m:
+        s = m.group(2).strip()
+
+    # Strip leading vs/at
     s = re.sub(r'^(?:vs\s+|at\s+)', '', s, flags=re.IGNORECASE)
     s = re.sub(r'(?:\s+at|\s+vs)$', '', s, flags=re.IGNORECASE)
     s = s.strip()
+
+    # SUFFIX: "TeamName cc" where cc is 2-3 lowercase letters only
+    # e.g. "AEK Athens gr", "APOEL FC cy", "Aberdeen sct"
+    # Guard: remaining name must be >= 2 chars so we don't over-strip
+    m = re.match(r'^(.+?)\s+([a-z]{2,3})$', s)
+    if m:
+        remainder = m.group(1).strip()
+        suffix    = m.group(2)
+        # Only strip if the suffix is all-lowercase (country code),
+        # not a legitimate capitalised abbreviation like "FC", "AC", "SC"
+        if suffix == suffix.lower() and len(remainder) >= 2:
+            s = remainder
+
     return s
 
 
 def get_or_create_team(cur, name, league_id):
-    raw = safe_text(name) or name.strip()
+    """
+    Always stores teams with CLEAN names (no FBref country suffixes).
+    Lookup order:
+      1. Exact clean name match in this league
+      2. Exact clean name match in any league (UEFA cross-league teams)
+      3. Dirty suffix variant already in DB → rename it, return its id
+      4. Insert brand-new clean record
+    Any dirty record found in step 3 is renamed on the spot so the DB
+    self-heals on every scrape, even without running the migration SQL.
+    """
+    raw   = safe_text(name) or name.strip()
     clean = _normalize_fbref_team_name(raw)
     if not clean:
         return None
-    # 1. Preferred: exact match within this league
-    cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (clean, league_id))
+
+    # 1. Exact clean match within this league (fastest path)
+    cur.execute(
+        "SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1",
+        (clean, league_id)
+    )
     row = cur.fetchone()
     if row:
         return row["id"]
-    # 2. Cross-league fallback: UEFA teams live under their domestic league_id
+
+    # 2. Exact clean match across all leagues (UEFA teams stored under domestic league)
     cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (clean,))
     row = cur.fetchone()
     if row:
         return row["id"]
-    # 3. Brand-new team — insert with clean name
+
+    # 3. Dirty suffix variant exists in DB — rename it and return its id.
+    #    Covers cases like DB has "AEK Athens gr" but we're looking up "AEK Athens".
+    #    Also covers the reverse: we received "AEK Athens gr" and DB has "AEK Athens".
+    #    We match on: name starts with clean AND the remainder is a known suffix pattern.
+    cur.execute(
+        "SELECT id, name FROM teams WHERE name ILIKE %s LIMIT 1",
+        (f"{clean} %",)   # "AEK Athens %" matches "AEK Athens gr"
+    )
+    row = cur.fetchone()
+    if row:
+        if row["name"] != clean:
+            # Self-heal: rename dirty record to clean name
+            cur.execute("UPDATE teams SET name = %s WHERE id = %s", (clean, row["id"]))
+        return row["id"]
+
+    # Also check if the name we received was clean but DB has dirty version
+    # e.g. we received "Aberdeen" but DB has "Aberdeen sct"
+    cur.execute(
+        "SELECT id, name FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1",
+        (f"{clean} %", league_id)
+    )
+    row = cur.fetchone()
+    if row:
+        if row["name"] != clean:
+            cur.execute("UPDATE teams SET name = %s WHERE id = %s", (clean, row["id"]))
+        return row["id"]
+
+    # 4. Brand-new team — insert with clean name only
     cur.execute("""
         INSERT INTO teams (name, league_id) VALUES (%s, %s)
-        ON CONFLICT (name, league_id) DO UPDATE SET name=EXCLUDED.name
+        ON CONFLICT (name, league_id) DO UPDATE SET name = EXCLUDED.name
         RETURNING id
     """, (clean, league_id))
     return cur.fetchone()["id"]
