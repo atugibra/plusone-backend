@@ -941,7 +941,46 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
     # ── ELO differential (1 strong feature) ──────────────────────────────
     # elo_diff > 0  → home team stronger, < 0 → away team stronger
     vector["elo_diff"] = home_feats.get("elo_proxy", 0.5) - away_feats.get("elo_proxy", 0.5)
-    
+
+    # ── Interaction features (6 derived, zero extra DB queries) ───────────
+    # The model sees home_attack_strength and away_defence_strength as separate
+    # inputs but not their product — the Dixon-Coles lambda proxy. These 6
+    # interactions expose the multiplicative relationships the linear feature
+    # space misses, without adding any new data source.
+
+    # 1 & 2: Attack × opponent defence (DC lambda proxy — best single predictor)
+    vector["home_attack_x_away_def"] = (
+        home_feats.get("attack_strength", 1.0) * away_feats.get("defence_strength", 1.0)
+    )
+    vector["away_attack_x_home_def"] = (
+        away_feats.get("attack_strength", 1.0) * home_feats.get("defence_strength", 1.0)
+    )
+
+    # 3: Form momentum differential — who is trending up right now
+    vector["form_momentum_diff"] = (
+        home_feats.get("form_momentum", 0.0) - away_feats.get("form_momentum", 0.0)
+    )
+
+    # 4: Points average differential — current season table quality gap
+    vector["points_avg_diff"] = (
+        home_feats.get("points_avg", 0.0) - away_feats.get("points_avg", 0.0)
+    )
+
+    # 5: Rest advantage — positive means away team had more days to recover
+    vector["rest_advantage"] = (
+        away_feats.get("days_since_last_match", 7.0)
+        - home_feats.get("days_since_last_match", 7.0)
+    )
+
+    # 6: H2H recency-weighted home win rate (uses already-computed h2h dict)
+    # Weight by number of H2H games so fixture-count uncertainty is reflected.
+    h2h_n = h2h.get("h2h_home_wins", 0) + h2h.get("h2h_draws", 0) + h2h.get("h2h_away_wins", 0)
+    h2h_weight = min(1.0, h2h_n / 5.0)   # fully trusted at 5+ H2H games
+    vector["h2h_weighted_hw_pct"] = (
+        h2h.get("h2h_home_win_pct", 0.44) * h2h_weight
+        + 0.44 * (1.0 - h2h_weight)        # blend toward league-average prior
+    )
+
     # ── Inject Enrichment Data (Odds & ClubElo) ──────────────────────────
     vector.update(enrichment)
 

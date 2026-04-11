@@ -41,8 +41,8 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-MIN_SAMPLES = 50  # minimum evaluated predictions needed before calibrating
-                  # isotonic regression overfits badly on fewer than ~50 samples
+MIN_SAMPLES = 30  # minimum evaluated predictions needed before calibrating
+                  # lowered from 50: holdout accuracy guard prevents bad fits
 
 OUTCOME_MAP = {
     "Home Win": 2, "Away Win": 0, "Draw": 1,
