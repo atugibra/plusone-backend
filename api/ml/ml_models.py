@@ -29,14 +29,14 @@ from xgboost import XGBClassifier
 try:
     from lightgbm import LGBMClassifier
     _LGBM_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     _LGBM_AVAILABLE = False
 
 # StratifiedGroupKFold — available in sklearn >= 1.1
 try:
     from sklearn.model_selection import StratifiedGroupKFold
     _SGKF_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     _SGKF_AVAILABLE = False
 
 
