@@ -121,7 +121,11 @@ def train_model():
         finally:
             conn3.close()
 
-        model.train(X, y, feature_names=feat_names or None, match_dates=match_dates, league_ids=league_ids)
+        try:
+            model.train(X, y, feature_names=feat_names or None, match_dates=match_dates, league_ids=league_ids)
+        except TypeError:
+            # Fallback for older ml_models.py that doesn't accept league_ids yet
+            model.train(X, y, feature_names=feat_names or None, match_dates=match_dates)
         model.save()
         save_to_db(model)
 
