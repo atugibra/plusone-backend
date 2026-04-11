@@ -5,14 +5,12 @@ EnsemblePredictor: XGBoost + LightGBM + CalibratedClassifier(RandomForest)
 soft-vote ensemble producing calibrated probabilities for
 Home Win (0) / Draw (1) / Away Win (2).
 
-Improvements vs previous version:
+Improvements vs original:
   1. LightGBM added as a 3rd diverse estimator (leaf-wise, different inductive bias)
   2. CV now uses StratifiedGroupKFold on league_ids to prevent league-distribution
      mismatch across folds (more honest + slightly higher CV accuracy)
-  3. XGBoost importance-based feature selection pre-pass before RF training
-     (RF overfits on noise columns far more than XGB; bottom-third dropped for RF only)
-  4. league_ids parameter added to train() — all features and existing behaviour
-     fully preserved.
+  3. league_ids parameter added to train() — fully backward compatible
+  All features, output keys, and save/load behaviour unchanged.
 """
 
 import os
@@ -25,10 +23,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
-from sklearn.feature_selection import SelectFromModel
 from xgboost import XGBClassifier
 
-# LightGBM import — graceful fallback if not installed
+# LightGBM — graceful fallback if not installed
 try:
     from lightgbm import LGBMClassifier
     _LGBM_AVAILABLE = True
@@ -61,9 +58,8 @@ class EnsemblePredictor:
         self.cv_accuracy = None
         self.n_samples = 0
         self.feature_importances_ = {}
-        self._feature_selector = None
 
-        # XGBoost — handles imbalanced classes well, fast, interpretable.
+        # XGBoost
         xgb_base = XGBClassifier(
             n_estimators=400,
             max_depth=4,
@@ -80,9 +76,8 @@ class EnsemblePredictor:
             n_jobs=-1,
         )
         xgb_cal = CalibratedClassifierCV(xgb_base, cv=3, method="isotonic")
-        self._xgb_base = xgb_base
 
-        # RandomForest — diverse learner, good at irregular boundaries.
+        # RandomForest
         rf = RandomForestClassifier(
             n_estimators=200,
             max_depth=6,
@@ -149,7 +144,6 @@ class EnsemblePredictor:
         self.feature_names_ = feature_names or [f"f{i}" for i in range(X.shape[1])]
         self.n_samples = len(y)
 
-        # Scale features
         X_scaled = self.scaler_.fit_transform(X)
 
         # Balanced sample weights
@@ -170,9 +164,8 @@ class EnsemblePredictor:
                 except Exception:
                     pass
 
-        # League-stratified CV — prevents league distribution mismatch across folds.
-        # When league_ids provided, StratifiedGroupKFold ensures each fold has all
-        # leagues, giving a more honest and typically higher CV accuracy estimate.
+        # League-stratified CV — each fold contains all leagues, preventing
+        # the situation where test data is dominated by an unseen league.
         if _SGKF_AVAILABLE and league_ids is not None and len(league_ids) == len(y):
             cv_splitter = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True,
                                                random_state=42)
@@ -206,38 +199,13 @@ class EnsemblePredictor:
                 break
             except (TypeError, ValueError):
                 if params_key is None:
-                    cv_scores = np.array([0.45])  # absolute fallback
+                    cv_scores = np.array([0.45])
                     break
 
         self.cv_accuracy = float(np.mean(cv_scores))
 
-        # XGBoost importance-based feature selection for RF.
-        # XGB handles noisy features via regularisation; RF does not.
-        # Fit XGB first, select features with importance >= median, pass reduced
-        # matrix to RF only. XGB in the VotingClassifier still uses all features.
-        try:
-            self._xgb_base.fit(X_scaled, y, sample_weight=sample_weights)
-            selector = SelectFromModel(
-                self._xgb_base, prefit=True, threshold="median"
-            )
-            X_rf = selector.transform(X_scaled)
-            self._feature_selector = selector
-        except Exception:
-            X_rf = X_scaled
-            self._feature_selector = None
-
-        # Final fit on all data
+        # Final fit on all data — all estimators receive the full feature matrix
         self.model.fit(X_scaled, y, sample_weight=sample_weights)
-
-        # Refit RF on importance-selected features
-        if self._feature_selector is not None:
-            try:
-                for name, est in self.model.named_estimators_.items():
-                    if name == "rf":
-                        est.fit(X_rf, y, sample_weight=sample_weights)
-                        break
-            except Exception:
-                pass  # Keep full-feature RF fit as fallback
 
         y_pred = self.model.predict(X_scaled)
         self.train_accuracy = float(accuracy_score(y, y_pred))
