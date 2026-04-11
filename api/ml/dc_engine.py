@@ -441,7 +441,6 @@ class DCPredictor:
               AND m.away_score IS NOT NULL
               AND m.match_date >= CURRENT_DATE - (%(months)s || ' months')::INTERVAL
             ORDER BY m.match_date DESC
-            LIMIT 5000
         """, {"months": months})
         rows = cur.fetchall()
         if not rows:
@@ -696,6 +695,21 @@ class DCPredictor:
 
         probs = np.array(probs_list)
         labels = np.array(labels_list)
+
+        # Sanity check: reject obviously corrupted data where one class dominates
+        # >85% of outcomes. Real football data is never this skewed — it means
+        # the prediction_log was bulk-imported with fake outcomes (e.g. all
+        # "Home Win"). Training a calibrator on such data inverts probabilities.
+        for cls in range(3):
+            cls_rate = float((labels == cls).mean())
+            if cls_rate > 0.85:
+                log.warning(
+                    "DC fit_calibrator_from_log: class %d = %.1f%% of samples — "
+                    "data looks corrupted (bulk import?). Skipping calibration.",
+                    cls, cls_rate * 100,
+                )
+                return 0
+
         self.calibrator.fit(probs, labels)
         log.info("DC calibrator refitted from %d live prediction outcomes.", len(probs_list))
         return len(probs_list)
