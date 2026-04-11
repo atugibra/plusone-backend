@@ -164,6 +164,48 @@ class EnsemblePredictor:
                 except Exception:
                     pass
 
+        # League-tier weights — top leagues contribute 3× more signal than
+        # lower divisions. Prevents 41k matches of League Two/J1 from
+        # drowning out Premier League / La Liga / Champions League signal.
+        _TIER1_NAMES = {
+            'premier league', 'la liga', 'bundesliga', 'serie a', 'ligue 1',
+            'eredivisie', 'primeira liga', 'super lig', 'belgian pro league',
+            'scottish premiership', 'swiss super league', 'austrian bundesliga',
+        }
+        _TIER2_NAMES = {
+            'uefa champions league', 'uefa europa league', 'uefa conference league',
+            'segunda division', '2. bundesliga', 'serie b', 'ligue 2',
+            'brasileirao serie a', 'argentine primera division',
+        }
+        if league_ids is not None and len(league_ids) == len(y):
+            _league_weights: dict = {}
+            try:
+                from database import get_connection
+                _conn = get_connection()
+                _cur  = _conn.cursor()
+                unique_lids = list(set(lid for lid in league_ids if lid is not None))
+                if unique_lids:
+                    placeholders = ','.join('%s' for _ in unique_lids)
+                    _cur.execute(
+                        f"SELECT id, name FROM leagues WHERE id IN ({placeholders})",
+                        unique_lids
+                    )
+                    for row in _cur.fetchall():
+                        lname = row['name'].lower() if row['name'] else ''
+                        if lname in _TIER1_NAMES:
+                            _league_weights[row['id']] = 3.0
+                        elif lname in _TIER2_NAMES:
+                            _league_weights[row['id']] = 2.0
+                        else:
+                            _league_weights[row['id']] = 1.0
+                _conn.close()
+            except Exception:
+                pass  # silently fall back to equal weights if DB unavailable
+            if _league_weights:
+                for i, lid in enumerate(league_ids):
+                    if lid is not None:
+                        sample_weights[i] *= _league_weights.get(lid, 1.0)
+
         # League-stratified CV — each fold contains all leagues, preventing
         # the situation where test data is dominated by an unseen league.
         if _SGKF_AVAILABLE and league_ids is not None and len(league_ids) == len(y):
