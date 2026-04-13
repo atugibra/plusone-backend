@@ -165,18 +165,53 @@ class DixonColesModel:
                        for i, t in enumerate(self.teams)}
         self.params["_home_adv"] = gamma
         self.params["_rho"]      = rho
+
+        # ── Per-league home advantage (data-driven, no hardcoding) ──────────
+        # After fitting the global gamma, compute a league-level offset by
+        # measuring the actual home win rate in each league vs the global rate.
+        # offset = log(league_hw_rate / global_hw_rate)
+        # This is purely learned from the fixtures data — no fixed constants.
+        if "league_id" in fixtures.columns:
+            global_hw_rate = (fixtures["home_goals"] > fixtures["away_goals"]).mean()
+            global_hw_rate = max(global_hw_rate, 0.30)  # safety floor
+            league_adv = {}
+            for lid, grp in fixtures.groupby("league_id"):
+                if len(grp) < 20:
+                    continue
+                league_hw = (grp["home_goals"] > grp["away_goals"]).mean()
+                league_hw = max(league_hw, 0.15)  # avoid log(0)
+                # offset: positive = stronger home advantage than global avg
+                league_adv[int(lid)] = float(np.log(league_hw / global_hw_rate))
+            self.params["_league_home_adv"] = league_adv
+            log.info(
+                "DC per-league home adv computed for %d leagues (global_hw=%.1f%%)",
+                len(league_adv), global_hw_rate * 100
+            )
+        else:
+            self.params["_league_home_adv"] = {}
+
         self.fitted = True
         return self
 
     def score_matrix(self, home: str, away: str,
-                     max_goals: int = CFG["dc_max_goals"]):
+                     max_goals: int = CFG["dc_max_goals"], **kwargs):
         if not self.fitted or home not in self.params or away not in self.params:
             return None, LEAGUE_AVG_GOALS * HOME_ADVANTAGE, LEAGUE_AVG_GOALS
         hp = self.params[home]
         ap = self.params[away]
         gamma = self.params["_home_adv"]
         rho   = self.params["_rho"]
-        lam_h = np.exp(hp["attack"] - ap["defence"] + gamma)
+
+        # Apply per-league home advantage offset if available.
+        # league_id is passed through kwargs; falls back to global gamma if not.
+        league_id = kwargs.get("league_id")
+        league_adv = self.params.get("_league_home_adv", {})
+        if league_id is not None and int(league_id) in league_adv:
+            gamma_eff = gamma + league_adv[int(league_id)]
+        else:
+            gamma_eff = gamma
+
+        lam_h = np.exp(hp["attack"] - ap["defence"] + gamma_eff)
         lam_a = np.exp(ap["attack"] - hp["defence"])
         mat = np.zeros((max_goals + 1, max_goals + 1))
         for hg in range(max_goals + 1):
@@ -188,8 +223,8 @@ class DixonColesModel:
             mat /= s
         return mat, lam_h, lam_a
 
-    def predict(self, home: str, away: str) -> dict:
-        mat, lam_h, lam_a = self.score_matrix(home, away)
+    def predict(self, home: str, away: str, league_id=None) -> dict:
+        mat, lam_h, lam_a = self.score_matrix(home, away, league_id=league_id)
         if mat is None:
             lam_h = LEAGUE_AVG_GOALS * HOME_ADVANTAGE
             lam_a = LEAGUE_AVG_GOALS
@@ -555,7 +590,7 @@ class DCPredictor:
         self.team_names[away_team_id] = away
         # ────────────────────────────────────────────────────────────────────────
 
-        dc_pred  = self.dc.predict(home, away)
+        dc_pred  = self.dc.predict(home, away, league_id=league_id)
         elo_pred = self.elo.predict(home, away)
         xg_pred  = self.xg.predict(home, away)
         blended  = self.blender.blend(dc_pred, elo_pred, xg_pred)
