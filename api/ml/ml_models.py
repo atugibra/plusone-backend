@@ -78,12 +78,15 @@ class EnsemblePredictor:
         xgb_cal = CalibratedClassifierCV(xgb_base, cv=3, method="isotonic")
 
         # RandomForest
+        # Note: class_weight removed — balancing is already applied via
+        # compute_sample_weight in train(). Double-applying balanced weights
+        # over-corrects toward minority classes (Draws, Away Wins) and
+        # severely degrades Home Win accuracy (45% vs DC's 88%).
         rf = RandomForestClassifier(
             n_estimators=200,
             max_depth=6,
             min_samples_leaf=20,
             max_features=0.35,
-            class_weight="balanced",
             random_state=42,
             n_jobs=1,
         )
@@ -103,7 +106,7 @@ class EnsemblePredictor:
                 min_child_samples=20,
                 reg_alpha=0.2,
                 reg_lambda=1.5,
-                class_weight="balanced",
+                # class_weight removed — balancing via compute_sample_weight in train()
                 random_state=42,
                 n_jobs=1,
                 verbose=-1,

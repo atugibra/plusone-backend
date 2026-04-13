@@ -178,26 +178,35 @@ def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
 
 def _fetch_dynamic_weights(cur) -> dict:
     """
-    Query prediction_log for each engine's trailing accuracy over the last
-    ACCURACY_WINDOW_DAYS days.
+    Compute per-engine consensus weights using SKILL-ADJUSTED accuracy.
 
-    Returns normalised weight dict: {"dc": w1, "ml": w2, "legacy": w3}.
+    Raw accuracy rewards DC for guessing Home Win 85% of the time (since
+    Home Wins happen ~44% of the time anyway). Instead we measure:
+      skill  = accuracy - naive_baseline (always-Home-Win score)
+      diversity = fraction of predictions that are NOT Home Win
+
+    Weight = 70% skill + 30% diversity.
+    This penalises engines that only guess Home Win and rewards engines
+    that correctly identify Away Wins and Draws.
     Falls back to DEFAULT_WEIGHTS if not enough graded rows exist.
     """
     try:
         cur.execute(f"""
             SELECT
-                COUNT(*)                                                 AS total,
-                SUM(CASE WHEN dc_correct         THEN 1 ELSE 0 END)::float AS dc_correct,
-                SUM(CASE WHEN ml_correct         THEN 1 ELSE 0 END)::float AS ml_correct,
-                SUM(CASE WHEN enrichment_correct THEN 1 ELSE 0 END)::float AS enrichment_correct,
-                SUM(CASE WHEN legacy_correct     THEN 1 ELSE 0 END)::float AS legacy_correct
+                COUNT(*)                                                     AS total,
+                SUM(CASE WHEN dc_correct         THEN 1 ELSE 0 END)::float  AS dc_correct,
+                SUM(CASE WHEN ml_correct         THEN 1 ELSE 0 END)::float  AS ml_correct,
+                SUM(CASE WHEN enrichment_correct THEN 1 ELSE 0 END)::float  AS enrichment_correct,
+                SUM(CASE WHEN legacy_correct     THEN 1 ELSE 0 END)::float  AS legacy_correct,
+                SUM(CASE WHEN actual = 'Home Win' THEN 1 ELSE 0 END)::float AS actual_hw_count,
+                SUM(CASE WHEN dc_predicted_outcome     != 'Home Win' THEN 1 ELSE 0 END)::float AS dc_non_hw,
+                SUM(CASE WHEN ml_predicted_outcome     != 'Home Win' THEN 1 ELSE 0 END)::float AS ml_non_hw,
+                SUM(CASE WHEN legacy_predicted_outcome != 'Home Win' THEN 1 ELSE 0 END)::float AS leg_non_hw
             FROM prediction_log
             WHERE correct IS NOT NULL
               AND evaluated_at >= NOW() - INTERVAL '{ACCURACY_WINDOW_DAYS} days'
               AND dc_predicted_outcome         IS NOT NULL
               AND ml_predicted_outcome         IS NOT NULL
-              AND enrichment_predicted_outcome IS NOT NULL
               AND legacy_predicted_outcome     IS NOT NULL
         """)
         row = cur.fetchone()
@@ -209,25 +218,46 @@ def _fetch_dynamic_weights(cur) -> dict:
             log.info("Consensus: only %d graded rows → using default weights", total)
             return DEFAULT_WEIGHTS.copy()
 
-        dc_acc     = float(row["dc_correct"]         or 0) / total
-        ml_acc     = float(row["ml_correct"]         or 0) / total
+        dc_acc     = float(row["dc_correct"]     or 0) / total
+        ml_acc     = float(row["ml_correct"]     or 0) / total
         enr_acc    = 0.0
-        legacy_acc = float(row["legacy_correct"]     or 0) / total
+        legacy_acc = float(row["legacy_correct"] or 0) / total
+        naive      = float(row["actual_hw_count"] or 0) / total
 
-        # Accuracy directly becomes the unnormalised weight
-        weight_sum = dc_acc + ml_acc + enr_acc + legacy_acc
+        # Skill = accuracy above the naive always-Home-Win baseline
+        MIN_SKILL = 0.05
+        dc_skill     = max(dc_acc     - naive, MIN_SKILL)
+        ml_skill     = max(ml_acc     - naive, MIN_SKILL)
+        enr_skill    = max(enr_acc    - naive, MIN_SKILL)
+        legacy_skill = max(legacy_acc - naive, MIN_SKILL)
+
+        # Diversity = fraction of non-Home-Win predictions
+        dc_div     = float(row["dc_non_hw"]  or 0) / total
+        ml_div     = float(row["ml_non_hw"]  or 0) / total
+        leg_div    = float(row["leg_non_hw"] or 0) / total
+        enr_div    = 0.20  # enrichment: assumed moderate diversity
+
+        SKILL_W, DIV_W = 0.70, 0.30
+        dc_score     = SKILL_W * dc_skill     + DIV_W * dc_div
+        ml_score     = SKILL_W * ml_skill     + DIV_W * ml_div
+        enr_score    = SKILL_W * enr_skill    + DIV_W * enr_div
+        legacy_score = SKILL_W * legacy_skill + DIV_W * leg_div
+
+        weight_sum = dc_score + ml_score + enr_score + legacy_score
         if weight_sum < 0.01:
             return DEFAULT_WEIGHTS.copy()
 
         weights = {
-            "dc":         round(dc_acc     / weight_sum, 4),
-            "ml":         round(ml_acc     / weight_sum, 4),
-            "enrichment": round(enr_acc    / weight_sum, 4),
-            "legacy":     round(legacy_acc / weight_sum, 4),
+            "dc":         round(dc_score     / weight_sum, 4),
+            "ml":         round(ml_score     / weight_sum, 4),
+            "enrichment": round(enr_score    / weight_sum, 4),
+            "legacy":     round(legacy_score / weight_sum, 4),
         }
         log.info(
-            "Consensus: dynamic weights from %d rows — DC=%.1f%% ML=%.1f%% ENR=%.1f%% Legacy=%.1f%%",
-            total, weights["dc"]*100, weights["ml"]*100, weights["enrichment"]*100, weights["legacy"]*100,
+            "Consensus: skill-adjusted weights from %d rows — "
+            "DC=%.1f%% ML=%.1f%% ENR=%.1f%% Legacy=%.1f%% (naive=%.1f%%)",
+            total, weights["dc"]*100, weights["ml"]*100,
+            weights["enrichment"]*100, weights["legacy"]*100, naive*100,
         )
         return weights
 
