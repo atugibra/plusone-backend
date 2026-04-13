@@ -476,6 +476,7 @@ def match_preview(
 def get_markets(
     home_team_id: int = Query(..., description="Home team ID"),
     away_team_id: int = Query(..., description="Away team ID"),
+    league_id:    Optional[int] = Query(None, description="League ID for per-league home advantage"),
     n_sim: int        = Query(100_000, ge=10_000, le=500_000,
                               description="Monte Carlo simulations"),
 ):
@@ -492,7 +493,7 @@ def get_markets(
             detail="DC model not trained. POST /api/markets/dc/train first.",
         )
 
-    result = predict_dc_match(home_team_id, away_team_id)
+    result = predict_dc_match(home_team_id, away_team_id, league_id=league_id)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
 
@@ -618,6 +619,7 @@ def train_dc():
 def dc_predict(
     home_team_id: int = Query(...),
     away_team_id: int = Query(...),
+    league_id:    Optional[int] = Query(None),
 ):
     """
     Full DC ensemble prediction for a fixture.
@@ -628,7 +630,7 @@ def dc_predict(
     if dc is None or not dc.fitted:
         raise HTTPException(status_code=503,
                             detail="DC model not trained. POST /api/markets/dc/train first.")
-    result = predict_dc_match(home_team_id, away_team_id)
+    result = predict_dc_match(home_team_id, away_team_id, league_id=league_id)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
     return result
