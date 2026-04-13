@@ -1,405 +1,648 @@
 """
-Professional Betting Markets Engine
-=====================================
-Full market pricing from expected goals (λ_h, λ_a).
-No database dependency — feed it λ values from DC engine or xG model.
-
-Markets covered:
-  1X2, Asian Handicap, Over/Under (0.5–5.5), BTTS, Correct Score (top 12),
-  Double Chance, Draw No Bet, Win to Nil, Team Goals, Half-Time/Full-Time
-
-Also includes:
-  - MarginRemover  (normalise / power / Shin margin stripping)
-  - ValueDetector  (model edge vs bookmaker odds, Kelly sizing)
-  - ArbitrageScanner (best price across multiple books)
-  - CLVTracker      (closing line value tracker)
+Betting Markets API Routes
+===========================
+GET  /api/markets              — Full market sheet for a fixture (needs DC model trained)
+POST /api/markets/value        — Find value bets given bookmaker odds
+GET  /api/markets/arb          — Scan for arb across multiple bookmakers
+GET  /api/markets/dc/status    — DC model status
+POST /api/markets/dc/train     — Train (or retrain) DC model
+GET  /api/markets/dc/leaderboard — Elo leaderboard
 """
 
-import math
-import warnings
-import numpy as np
-import pandas as pd
-from collections import defaultdict
-from scipy.stats import poisson
-from scipy.optimize import brentq
 
-warnings.filterwarnings("ignore")
-np.random.seed(42)
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query
+from pydantic import BaseModel
+from typing import Optional
+import logging
+import threading
+import time
+
+from database import get_connection
+from ml.dc_engine  import (predict_dc_match, train_dc_model,
+                            dc_status, get_dc_predictor)
+from ml.markets    import MarketPricer, ValueDetector, ArbitrageScanner
+
+router = APIRouter()
+log = logging.getLogger(__name__)
+
+# ─── Training state (persistent thread, survives navigation) ──────────────────
+_dc_training_state: dict = {}
+
+def _run_dc_training():
+    global _dc_training_state, _upcoming_cache
+    _dc_training_state = {"status": "running", "started_at": time.time()}
+    try:
+        result = train_dc_model()
+        _dc_training_state = {"status": "done", "result": result}
+        # Bust the upcoming cache so Free Picks reflects the new model immediately
+        _upcoming_cache = {"data": None, "expires_at": 0.0}
+        if result.get("trained"):
+            log.info("DC retrain complete: %d matches", result.get("n_matches", 0))
+        else:
+            log.error("DC retrain failed: %s", result.get("error"))
+    except Exception as e:
+        _dc_training_state = {"status": "error", "error": str(e)}
+        log.error("DC training exception: %s", e)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1 — MARGIN REMOVER
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Helper: log DC prediction to prediction_log ──────────────────────────────
 
-class MarginRemover:
-    """Strip bookmaker vig from decimal odds using three methods."""
-
-    @staticmethod
-    def raw_implied(decimal_odds: float) -> float:
-        return 1.0 / decimal_odds if decimal_odds > 0 else 0.0
-
-    @staticmethod
-    def overround(odds_list: list) -> float:
-        return sum(1 / o for o in odds_list if o > 0) - 1.0
-
-    @staticmethod
-    def normalise(odds_list: list) -> list:
-        raw   = [1/o for o in odds_list if o > 0]
-        total = sum(raw) or 1
-        return [r / total for r in raw]
-
-    @staticmethod
-    def power_method(odds_list: list, iterations: int = 50) -> list:
-        raw = np.array([1/o for o in odds_list if o > 0])
-        lo, hi = 0.5, 3.0
-        for _ in range(iterations):
-            k = (lo + hi) / 2
-            s = np.sum(raw ** (1/k))
-            if s > 1: lo = k
-            else:     hi = k
-        k = (lo + hi) / 2
-        result = list(raw ** (1 / k))
-        s = sum(result) or 1
-        return [r / s for r in result]
-
-    @staticmethod
-    def shin_method(odds_list: list) -> list:
-        raw = np.array([1/o for o in odds_list if o > 0])
-        n   = len(raw)
-        S   = raw.sum()
-
-        def shin_z(z, raw, S, n):
-            num = np.sqrt(z**2 + 4*(1-z)*raw**2/S) - z
-            return sum(num / (2*(1-z))) - 1
-
+def _log_prediction_bg(match_id: int, home_team: str, away_team: str,
+                       league: str, match_date, predicted_outcome: str,
+                       confidence: str, confidence_score: float,
+                       home_win_prob: float, draw_prob: float,
+                       away_win_prob: float):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
         try:
-            z = brentq(shin_z, 1e-6, 1 - 1e-6, args=(raw, S, n))
-        except Exception:
-            z = 0.02
-        probs = (np.sqrt(z**2 + 4*(1-z)*raw**2/S) - z) / (2*(1-z))
-        s = probs.sum() or 1
-        return list(probs / s)
+            cur.execute("""
+                INSERT INTO prediction_log
+                    (match_id, home_team, away_team, league, match_date,
+                     predicted, confidence, confidence_score,
+                     home_win_prob, draw_prob, away_win_prob)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (
+                int(match_id),
+                str(home_team), str(away_team), str(league), match_date,
+                str(predicted_outcome), str(confidence),
+                float(confidence_score),
+                float(home_win_prob), float(draw_prob), float(away_win_prob),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.exception("prediction_log insert failed")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2 — MARKET PRICER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class MarketPricer:
+def _log_markets_prediction_bg(
+    match_id: int, home_team: str, away_team: str,
+    league: str, match_date, markets: dict,
+    predicted_outcome: str, confidence_score: float,
+    home_xg: float, away_xg: float,
+):
     """
-    Price ALL betting markets from expected goals λ_h and λ_a.
-    Results are probabilities — convert to fair decimal odds via 1/p.
+    Log market-level probabilities to prediction_markets_log.
+    Called in a background thread after every /upcoming consensus hit.
     """
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        try:
+            # Extract the key market probabilities from the MarketPricer sheet
+            over_2_5   = markets.get("over_under", {}).get("over_2_5")   if isinstance(markets.get("over_under"), dict) else markets.get("over_2_5")
+            btts       = markets.get("btts", {}).get("yes")              if isinstance(markets.get("btts"), dict)      else markets.get("btts")
+            home_win   = markets.get("one_x_two", {}).get("home_win")   if isinstance(markets.get("one_x_two"), dict)  else markets.get("home_win")
+            draw       = markets.get("one_x_two", {}).get("draw")       if isinstance(markets.get("one_x_two"), dict)  else markets.get("draw")
+            away_win   = markets.get("one_x_two", {}).get("away_win")   if isinstance(markets.get("one_x_two"), dict)  else markets.get("away_win")
 
-    def __init__(self, lam_h: float, lam_a: float,
-                 n_sim: int = 100_000, max_goals: int = 12):
-        self.lam_h   = max(float(lam_h), 0.05)
-        self.lam_a   = max(float(lam_a), 0.05)
-        self.n_sim   = int(n_sim)
-        self.max_g   = max_goals
-        self._build_score_matrix()
-        self._run_simulations()
+            cur.execute("""
+                INSERT INTO prediction_markets_log
+                    (match_id, home_team, away_team, league, match_date,
+                     predicted_outcome, confidence_score,
+                     home_win_prob, draw_prob, away_win_prob,
+                     over_2_5_prob, btts_prob,
+                     home_xg, away_xg)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (
+                int(match_id) if match_id else None,
+                str(home_team), str(away_team), str(league), match_date,
+                str(predicted_outcome), float(confidence_score),
+                float(home_win)  if home_win  is not None else None,
+                float(draw)      if draw      is not None else None,
+                float(away_win)  if away_win  is not None else None,
+                float(over_2_5)  if over_2_5  is not None else None,
+                float(btts)      if btts       is not None else None,
+                float(home_xg), float(away_xg),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.exception("prediction_markets_log insert failed")
 
-    def _build_score_matrix(self):
-        mat = np.zeros((self.max_g + 1, self.max_g + 1))
-        for hg in range(self.max_g + 1):
-            for ag in range(self.max_g + 1):
-                mat[hg, ag] = poisson.pmf(hg, self.lam_h) * poisson.pmf(ag, self.lam_a)
-        s = mat.sum()
-        self.score_mat = mat / s if s > 0 else mat
 
-    def _run_simulations(self):
-        self.hg_sim = np.random.poisson(self.lam_h, self.n_sim)
-        self.ag_sim = np.random.poisson(self.lam_a, self.n_sim)
-        self.tg_sim = self.hg_sim + self.ag_sim
+# ─── 15-min cache for /upcoming (makes Free Picks near-instant after first hit) 
+_upcoming_cache: dict = {"data": None, "expires_at": 0.0}
+_UPCOMING_TTL = 15 * 60   # seconds
 
-    # helpers
-    def _fair(self, p: float) -> float:
-        return round(1/p, 2) if p > 0 else 999.0
 
-    def market_1x2(self) -> dict:
-        hw = float(np.sum(np.tril(self.score_mat, -1)))
-        d  = float(np.sum(np.diag(self.score_mat)))
-        aw = float(np.sum(np.triu(self.score_mat, 1)))
-        return {"home_win": hw, "draw": d, "away_win": aw}
+# ─── GET /api/markets/upcoming ────────────────────────────────────────────────
 
-    def market_asian_handicap(self,
-                               handicaps: list = None) -> dict:
-        if handicaps is None:
-            handicaps = [-1.5, -1.0, -0.75, -0.5, -0.25,
-                          0.0,  0.25,  0.5,  0.75,  1.0,  1.5]
-        results = {}
-        for h in handicaps:
-            hg_adj = self.hg_sim - self.ag_sim + h
-            if h % 0.5 == 0 and h % 1.0 != 0:
-                home_cover = float((hg_adj > 0).mean())
-                away_cover = float((hg_adj < 0).mean())
-                push = 0.0
-            elif h % 0.25 == 0 and h % 0.5 != 0:
-                h_lo = h - 0.25; h_hi = h + 0.25
-                hg_lo = self.hg_sim - self.ag_sim + h_lo
-                hg_hi = self.hg_sim - self.ag_sim + h_hi
-                home_cover = float(((hg_lo > 0).mean() + (hg_hi > 0).mean()) / 2)
-                away_cover = float(((hg_lo < 0).mean() + (hg_hi < 0).mean()) / 2)
-                push = 1 - home_cover - away_cover
+def _best_engine_bet_recommendations(engine_name: str, probs: dict, xg_h: float, xg_a: float) -> list:
+    """Derive precise bet recommendations explicitly from the most historically accurate champion engine."""
+    hw = probs.get("home_win", 0.33)
+    dr = probs.get("draw", 0.33)
+    aw = probs.get("away_win", 0.34)
+    lead = max(hw, dr, aw)
+    if lead == hw:
+        outcome, outcome_label = "home_win", "Home Win"
+    elif lead == aw:
+        outcome, outcome_label = "away_win", "Away Win"
+    else:
+        outcome, outcome_label = "draw", "Draw"
+
+    bets = []
+    display_name = "XGBoost ML" if engine_name == "ml" else engine_name.title()
+    
+    if lead >= 0.55:
+        bets.append({"bet": f"✅ Strong Pick — {outcome_label} (Powered by {display_name})", "prob": round(lead * 100), "tier": "high"})
+    elif lead >= 0.47:
+        bets.append({"bet": f"💡 Value Bet — {outcome_label} (Powered by {display_name})", "prob": round(lead * 100), "tier": "medium"})
+    if xg_h >= 1.1 and xg_a >= 1.0:
+        bets.append({"bet": "⚽ Both Teams to Score (recommended)", "prob": None, "tier": "btts"})
+    if dr >= 0.33 and outcome != "draw":
+        bets.append({"bet": f"⚠️ Draw value — {round(dr * 100)}% probability", "prob": round(dr * 100), "tier": "draw_value"})
+    return bets
+
+
+@router.get("/upcoming")
+def upcoming_dc_predictions(
+    league_id: Optional[int] = Query(None, description="Filter by league ID"),
+    limit: int               = Query(30,   description="Max fixtures"),
+):
+    """
+    Bulk Consensus predictions for all upcoming fixtures.
+    Results are cached for 15 minutes to keep the Free Picks page near-instant.
+    """
+    global _upcoming_cache
+
+    from ml.consensus_engine import upcoming_consensus_fast
+
+    # Return from cache if still fresh
+    cache_key = (league_id, limit)
+    now = time.time()
+    if (
+        _upcoming_cache.get("data") is not None
+        and _upcoming_cache.get("expires_at", 0) > now
+        and _upcoming_cache.get("key") == cache_key
+    ):
+        log.debug("Returning /upcoming from cache (%.0fs remaining)",
+                  _upcoming_cache["expires_at"] - now)
+        return _upcoming_cache["data"]
+
+    # ── Bulk Generate Consensus Pipeline ──
+    raw_results = upcoming_consensus_fast(league_id, limit)
+    
+    results = []
+    import threading
+    from routes.predictions import _log_prediction_to_db as _log_db
+
+    for pred in raw_results:
+        try:
+            fx = pred["match"]
+            fx_id = pred["fixture_id"]
+            consensus = pred["consensus"]
+            engines   = pred["engines"]
+
+            hw   = consensus.get("home_win", 0.33)
+            dr   = consensus.get("draw",     0.33)
+            aw   = consensus.get("away_win", 0.34)
+            lead = max(hw, dr, aw)
+            outcome = consensus.get("predicted_outcome", "Home Win")
+            confidence = consensus.get("confidence", "Medium")
+
+            markets = pred.get("markets", {})
+            xg_h = float(markets.get("home_xg", 0))
+            xg_a = float(markets.get("away_xg", 0))
+            pred_h = max(0, round(xg_h))
+            pred_a = max(0, round(xg_a))
+            weight_map = pred.get("weights_used", {})
+
+            # ── Pluck the Champion Engine dynamically ──
+            valid_engines = {k: v for k, v in weight_map.items() if k in ["dc", "ml", "legacy", "enrichment"]}
+            champion_engine_name = "ml" # safe fallback
+            if valid_engines:
+                champion_engine_name = max(valid_engines, key=valid_engines.get)
+            
+            champion_probs = engines.get(champion_engine_name, {"home_win": hw, "draw": dr, "away_win": aw})
+
+            result_entry = {
+                "predicted_outcome": outcome,
+                "confidence":        confidence,
+                "confidence_score":  round(lead, 4),
+                "probabilities": {
+                    "home_win": round(hw, 4),
+                    "draw":     round(dr, 4),
+                    "away_win": round(aw, 4),
+                },
+                "expected_goals": {
+                    "home_xg":       round(xg_h, 2),
+                    "away_xg":       round(xg_a, 2),
+                    "predicted_score": f"{pred_h}-{pred_a}",
+                },
+                "match": {
+                    "match_id":      fx_id,
+                    "home_team":     fx["home_team"],
+                    "away_team":     fx["away_team"],
+                    "home_team_id":  fx["home_team_id"],
+                    "away_team_id":  fx["away_team_id"],
+                    "home_logo":     fx.get("home_logo"),
+                    "away_logo":     fx.get("away_logo"),
+                    "league":        fx.get("league", ""),
+                    "league_id":     fx.get("league_id", 0),
+                    "date":          pred["match_date"],
+                    "gameweek":      pred["gameweek"],
+                    "season":        fx.get("season", ""),
+                },
+                # MAP consensus engines payload to the frontend's expected breakdown
+                "model_breakdown": engines,
+                "weights": weight_map,
+                "bet_recommendations": _best_engine_bet_recommendations(champion_engine_name, champion_probs, xg_h, xg_a),
+                "engine": "consensus",
+            }
+            results.append(result_entry)
+            
+            dc_out  = engines.get("dc", {}).get("predicted_outcome")
+            ml_out  = engines.get("ml", {}).get("predicted_outcome")
+            leg_out = engines.get("legacy", {}).get("predicted_outcome")
+            enr_out = engines.get("enrichment", {}).get("predicted_outcome")
+            
+            # Auto-log prediction_log — background thread
+            threading.Thread(
+                target=_log_db,
+                args=(result_entry, int(fx_id), dc_out, ml_out, enr_out, leg_out, f"{pred_h}-{pred_a}"),
+                daemon=True,
+            ).start()
+
+            # Auto-log prediction_markets_log — background thread
+            threading.Thread(
+                target=_log_markets_prediction_bg,
+                args=(
+                    int(fx_id),
+                    fx["home_team"], fx["away_team"],
+                    fx.get("league", ""), pred["match_date"],
+                    markets,               # raw markets dict from consensus engine
+                    outcome, round(lead, 4),
+                    xg_h, xg_a,
+                ),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            log.debug("Formatting skip fixture %s vs %s: %s", pred.get("match", {}).get("home_team"), pred.get("match", {}).get("away_team"), exc)
+            continue
+
+    response = {"count": len(results), "predictions": results, "engine": "consensus"}
+    _upcoming_cache = {"data": response, "expires_at": time.time() + _UPCOMING_TTL, "key": cache_key}
+    log.info("Built /upcoming cache: %d consensus predictions, TTL %ds", len(results), _UPCOMING_TTL)
+    return response
+
+
+
+# ─── GET /api/markets/match-preview ──────────────────────────────────────────
+
+@router.get("/match-preview")
+def match_preview(
+    home_team_id: int  = Query(..., description="Home team ID"),
+    away_team_id: int  = Query(..., description="Away team ID"),
+):
+    """
+    Rich pre-match data for the Free Picks card expand view.
+    Returns: last-5 results per team (with scores), season stats,
+             H2H last-8 with scores, next-3 upcoming per team.
+    """
+    conn = get_connection()
+    cur  = conn.cursor()
+
+    try:
+        # ── Helper: last N played results for one team ──────────────────
+        def recent_results(tid: int, n: int = 5):
+            cur.execute("""
+                SELECT
+                    m.match_date, m.gameweek,
+                    CASE WHEN m.home_team_id = %(t)s THEN at2.name ELSE ht2.name END AS opponent,
+                    CASE WHEN m.home_team_id = %(t)s THEN 'H' ELSE 'A'           END AS venue,
+                    CASE WHEN m.home_team_id = %(t)s THEN m.home_score ELSE m.away_score END AS ts,
+                    CASE WHEN m.home_team_id = %(t)s THEN m.away_score ELSE m.home_score END AS os,
+                    l.name AS league
+                FROM matches m
+                JOIN teams  ht2 ON ht2.id = m.home_team_id
+                JOIN teams  at2 ON at2.id = m.away_team_id
+                JOIN leagues l  ON l.id   = m.league_id
+                WHERE (m.home_team_id = %(t)s OR m.away_team_id = %(t)s)
+                  AND m.home_score IS NOT NULL
+                ORDER BY m.match_date DESC
+                LIMIT %(n)s
+            """, {"t": tid, "n": n})
+            out = []
+            for r in cur.fetchall():
+                ts = r["ts"] or 0;  os = r["os"] or 0
+                out.append({
+                    "date":     str(r["match_date"]) if r["match_date"] else None,
+                    "gameweek": r["gameweek"],
+                    "opponent": r["opponent"],
+                    "venue":    r["venue"],
+                    "score":    f"{ts}-{os}",
+                    "result":   "W" if ts > os else ("L" if ts < os else "D"),
+                    "league":   r["league"],
+                })
+            return out
+
+        # ── Helper: season aggregate stats ─────────────────────────────
+        def season_stats(tid: int):
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS played,
+                    SUM(CASE WHEN (home_team_id=%(t)s AND home_score>away_score)
+                              OR  (away_team_id=%(t)s AND away_score>home_score) THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN home_score=away_score THEN 1 ELSE 0 END) AS draws,
+                    SUM(CASE WHEN (home_team_id=%(t)s AND home_score<away_score)
+                              OR  (away_team_id=%(t)s AND away_score<home_score) THEN 1 ELSE 0 END) AS losses,
+                    SUM(CASE WHEN home_team_id=%(t)s THEN home_score ELSE away_score END) AS gf,
+                    SUM(CASE WHEN home_team_id=%(t)s THEN away_score ELSE home_score END) AS ga,
+                    SUM(CASE WHEN (home_team_id=%(t)s AND away_score=0)
+                              OR  (away_team_id=%(t)s AND home_score=0) THEN 1 ELSE 0 END) AS cs
+                FROM matches
+                WHERE (home_team_id=%(t)s OR away_team_id=%(t)s)
+                  AND home_score IS NOT NULL
+            """, {"t": tid})
+            r = cur.fetchone()
+            if not r or not r["played"]: return {}
+            p = r["played"]
+            return {
+                "played":             p,
+                "wins":               r["wins"]  or 0,
+                "draws":              r["draws"] or 0,
+                "losses":             r["losses"] or 0,
+                "goals_for":          r["gf"] or 0,
+                "goals_against":      r["ga"] or 0,
+                "avg_goals_for":      round((r["gf"] or 0) / p, 2),
+                "avg_goals_against":  round((r["ga"] or 0) / p, 2),
+                "clean_sheets":       r["cs"] or 0,
+                "clean_sheet_pct":    round((r["cs"] or 0) / p * 100),
+            }
+
+        # ── Helper: next N upcoming for one team (excluding the H2H match) ──
+        def upcoming_fixtures(tid: int, excl_opp: int, n: int = 3):
+            cur.execute("""
+                SELECT
+                    m.match_date, m.gameweek,
+                    CASE WHEN m.home_team_id=%(t)s THEN at3.name ELSE ht3.name END AS opponent,
+                    CASE WHEN m.home_team_id=%(t)s THEN 'H' ELSE 'A'           END AS venue,
+                    l.name AS league
+                FROM matches m
+                JOIN teams  ht3 ON ht3.id = m.home_team_id
+                JOIN teams  at3 ON at3.id = m.away_team_id
+                JOIN leagues l  ON l.id   = m.league_id
+                WHERE (m.home_team_id=%(t)s OR m.away_team_id=%(t)s)
+                  AND m.home_score IS NULL
+                  AND m.match_date >= CURRENT_DATE
+                  AND NOT ((m.home_team_id=%(t)s AND m.away_team_id=%(e)s)
+                        OR (m.away_team_id=%(t)s AND m.home_team_id=%(e)s))
+                ORDER BY m.match_date ASC
+                LIMIT %(n)s
+            """, {"t": tid, "e": excl_opp, "n": n})
+            return [
+                {"date":     str(r["match_date"]) if r["match_date"] else None,
+                 "gameweek": r["gameweek"],
+                 "opponent": r["opponent"],
+                 "venue":    r["venue"],
+                 "league":   r["league"]}
+                for r in cur.fetchall()
+            ]
+
+        # ── H2H ────────────────────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                m.match_date, m.gameweek,
+                ht4.name AS home_team,  at4.name AS away_team,
+                m.home_team_id,         m.away_team_id,
+                m.home_score,           m.away_score,
+                l.name AS league
+            FROM matches m
+            JOIN teams  ht4 ON ht4.id = m.home_team_id
+            JOIN teams  at4 ON at4.id = m.away_team_id
+            JOIN leagues l  ON l.id   = m.league_id
+            WHERE ((m.home_team_id=%(h)s AND m.away_team_id=%(a)s)
+                OR (m.home_team_id=%(a)s AND m.away_team_id=%(h)s))
+              AND m.home_score IS NOT NULL
+            ORDER BY m.match_date DESC
+            LIMIT 8
+        """, {"h": home_team_id, "a": away_team_id})
+        h2h_rows = cur.fetchall()
+
+        hw = dr = aw = 0
+        h2h_matches = []
+        for r in h2h_rows:
+            hs = r["home_score"] or 0
+            as_ = r["away_score"] or 0
+            if hs > as_:
+                result_code = "H"
+                if r["home_team_id"] == home_team_id: hw += 1
+                else: aw += 1
+            elif hs < as_:
+                result_code = "A"
+                if r["away_team_id"] == home_team_id: hw += 1
+                else: aw += 1
             else:
-                home_cover = float((hg_adj > 0).mean())
-                away_cover = float((hg_adj < 0).mean())
-                push = float((hg_adj == 0).mean())
-            label = f"AH {h:+.2f}"
-            results[label] = {
-                "home": round(home_cover, 4),
-                "push": round(push, 4),
-                "away": round(away_cover, 4),
-                "fair_home": self._fair(home_cover),
-                "fair_away": self._fair(away_cover),
-            }
-        return results
+                result_code = "D"
+                dr += 1
+            h2h_matches.append({
+                "date":      str(r["match_date"]) if r["match_date"] else None,
+                "gameweek":  r["gameweek"],
+                "home_team": r["home_team"],
+                "away_team": r["away_team"],
+                "score":     f"{hs}-{as_}",
+                "result":    result_code,
+                "league":    r["league"],
+            })
 
-    def market_over_under(self, lines: list = None) -> dict:
-        if lines is None:
-            lines = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
-        results = {}
-        for line in lines:
-            over  = float((self.tg_sim > line).mean())
-            under = float((self.tg_sim < line).mean())
-            push  = float((self.tg_sim == line).mean())
-            results[f"O/U {line}"] = {
-                "over": round(over, 4), "under": round(under, 4),
-                "push": round(push, 4),
-                "fair_over": self._fair(over), "fair_under": self._fair(under),
-            }
-        return results
-
-    def market_btts(self) -> dict:
-        yes = float(((self.hg_sim > 0) & (self.ag_sim > 0)).mean())
-        return {"btts_yes": round(yes, 4), "btts_no": round(1 - yes, 4),
-                "fair_yes": self._fair(yes), "fair_no": self._fair(1 - yes)}
-
-    def market_correct_score(self, top_n: int = 12) -> list:
-        scores = {}
-        for hg in range(self.max_g + 1):
-            for ag in range(self.max_g + 1):
-                p = float(self.score_mat[hg, ag])
-                scores[f"{hg}-{ag}"] = p
-        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-        return [{"score": s, "probability": round(p, 5),
-                 "fair_odds": self._fair(p)}
-                for s, p in sorted_scores[:top_n]]
-
-    def market_double_chance(self) -> dict:
-        m = self.market_1x2()
         return {
-            "1X": round(m["home_win"] + m["draw"], 4),
-            "X2": round(m["draw"] + m["away_win"], 4),
-            "12": round(m["home_win"] + m["away_win"], 4),
-        }
-
-    def market_draw_no_bet(self) -> dict:
-        m  = self.market_1x2()
-        nd = (m["home_win"] + m["away_win"]) or 1
-        return {
-            "home_dnb": round(m["home_win"] / nd, 4),
-            "away_dnb": round(m["away_win"] / nd, 4),
-        }
-
-    def market_win_to_nil(self) -> dict:
-        hwtn = float(((self.hg_sim > self.ag_sim) & (self.ag_sim == 0)).mean())
-        awtn = float(((self.ag_sim > self.hg_sim) & (self.hg_sim == 0)).mean())
-        return {
-            "home_win_to_nil": round(hwtn, 4),
-            "away_win_to_nil": round(awtn, 4),
-            "fair_home": self._fair(hwtn),
-            "fair_away": self._fair(awtn),
-        }
-
-    def market_team_goals(self) -> dict:
-        return {
-            "home_over_0.5":  round(float((self.hg_sim > 0).mean()), 4),
-            "home_over_1.5":  round(float((self.hg_sim > 1).mean()), 4),
-            "home_over_2.5":  round(float((self.hg_sim > 2).mean()), 4),
-            "away_over_0.5":  round(float((self.ag_sim > 0).mean()), 4),
-            "away_over_1.5":  round(float((self.ag_sim > 1).mean()), 4),
-            "away_over_2.5":  round(float((self.ag_sim > 2).mean()), 4),
-        }
-
-    def full_sheet(self) -> dict:
-        return {
-            "1x2":             self.market_1x2(),
-            "asian_handicap":  self.market_asian_handicap(),
-            "over_under":      self.market_over_under(),
-            "btts":            self.market_btts(),
-            "correct_score":   self.market_correct_score(),
-            "double_chance":   self.market_double_chance(),
-            "draw_no_bet":     self.market_draw_no_bet(),
-            "win_to_nil":      self.market_win_to_nil(),
-            "team_goals":      self.market_team_goals(),
-            "expected_goals":  {
-                "home": round(self.lam_h, 3),
-                "away": round(self.lam_a, 3),
+            "home": {
+                "team_id":  home_team_id,
+                "form":     recent_results(home_team_id),
+                "stats":    season_stats(home_team_id),
+                "upcoming": upcoming_fixtures(home_team_id, away_team_id),
+            },
+            "away": {
+                "team_id":  away_team_id,
+                "form":     recent_results(away_team_id),
+                "stats":    season_stats(away_team_id),
+                "upcoming": upcoming_fixtures(away_team_id, home_team_id),
+            },
+            "h2h": {
+                "summary": {"home_wins": hw, "draws": dr, "away_wins": aw, "total": hw + dr + aw},
+                "matches":  h2h_matches,
             },
         }
+    finally:
+        conn.close()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3 — VALUE DETECTOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ValueDetector:
-    """Compare model probs vs bookmaker odds to find value bets."""
-
-    def __init__(self, min_edge: float = 0.03, min_odds: float = 1.20,
-                 max_odds: float = 15.0):
-        self.min_edge = min_edge
-        self.min_odds = min_odds
-        self.max_odds = max_odds
-        self.remover  = MarginRemover()
-
-    def edge(self, model_prob: float, market_odds: float) -> float:
-        return model_prob - (1.0 / market_odds)
-
-    def ev(self, model_prob: float, market_odds: float) -> float:
-        return model_prob * (market_odds - 1) - (1 - model_prob)
-
-    def kelly(self, model_prob: float, market_odds: float,
-              fraction: float = 0.25) -> float:
-        b = market_odds - 1
-        q = 1 - model_prob
-        full_kelly = max(0.0, (b * model_prob - q) / b)
-        return round(full_kelly * fraction, 5)
-
-    def _grade(self, edge: float, ev: float) -> str:
-        if edge > 0.10 and ev > 0.15: return "A+"
-        if edge > 0.07 and ev > 0.10: return "A"
-        if edge > 0.05: return "B+"
-        if edge > 0.03: return "B"
-        return "C"
-
-    def scan(self, model_probs: dict, market_odds: dict,
-             market_name: str = "1x2") -> list:
-        """
-        model_probs: {outcome: probability}
-        market_odds: {outcome: decimal_odds}
-        Both dicts must use the same keys.
-        """
-        odds_vals = [v for v in market_odds.values()
-                     if isinstance(v, (int, float)) and v > 0]
-        if not odds_vals:
-            return []
-        fair_probs = self.remover.power_method(odds_vals)
-        keys = [k for k, v in market_odds.items()
-                if isinstance(v, (int, float)) and v > 0]
-        fair_map = dict(zip(keys, fair_probs))
-
-        bets = []
-        for outcome, mkt_odds in market_odds.items():
-            if not isinstance(mkt_odds, (int, float)) or mkt_odds <= 0:
-                continue
-            if mkt_odds < self.min_odds or mkt_odds > self.max_odds:
-                continue
-            mdl_prob = model_probs.get(outcome)
-            if mdl_prob is None:
-                continue
-            edge_val = self.edge(mdl_prob, mkt_odds)
-            ev_val   = self.ev(mdl_prob, mkt_odds)
-            if edge_val >= self.min_edge:
-                bets.append({
-                    "market":        market_name,
-                    "outcome":       outcome,
-                    "model_prob":    round(mdl_prob, 4),
-                    "fair_prob":     round(fair_map.get(outcome, 1/mkt_odds), 4),
-                    "market_odds":   mkt_odds,
-                    "fair_odds":     round(1 / mdl_prob, 2) if mdl_prob > 0 else 999,
-                    "edge_pct":      round(edge_val * 100, 2),
-                    "ev_per_unit":   round(ev_val, 4),
-                    "kelly_25pct":   self.kelly(mdl_prob, mkt_odds, 0.25),
-                    "kelly_full":    self.kelly(mdl_prob, mkt_odds, 1.0),
-                    "grade":         self._grade(edge_val, ev_val),
-                })
-        return sorted(bets, key=lambda x: -x["edge_pct"])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4 — ARBITRAGE SCANNER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ArbitrageScanner:
-    """Find risk-free arb opportunities across multiple bookmakers."""
-
-    @staticmethod
-    def find_arb(books_odds: dict) -> dict:
-        """
-        books_odds: {outcome: {bookmaker: decimal_odds}}
-        Returns arb info (with stakes for £100 target) if exists.
-        """
-        best = {}
-        for outcome, book_map in books_odds.items():
-            best_odds = max(book_map.values())
-            best_book = max(book_map, key=book_map.get)
-            best[outcome] = {"odds": best_odds, "book": best_book}
-
-        implied_sum = sum(1 / v["odds"] for v in best.values() if v["odds"] > 0)
-        margin = implied_sum - 1.0
-
-        if margin < 0:
-            total_return = 100.0
-            stakes = {o: round(total_return / v["odds"], 2)
-                      for o, v in best.items()}
-            total_stake = sum(stakes.values())
-            return {
-                "arb_exists":   True,
-                "margin_pct":   round(margin * 100, 3),
-                "profit_pct":   round(-margin * 100, 3),
-                "best_odds":    best,
-                "stakes_for_100_return": stakes,
-                "total_stake":  round(total_stake, 2),
-                "guaranteed_profit": round(100.0 - total_stake, 2),
-            }
-        return {
-            "arb_exists":     False,
-            "margin_pct":     round(margin * 100, 3),
-            "best_available": best,
-        }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 5 — CLOSING LINE VALUE TRACKER
-# ══════════════════════════════════════════════════════════════════════════════
-
-class CLVTracker:
+@router.get("")
+def get_markets(
+    home_team_id: int = Query(..., description="Home team ID"),
+    away_team_id: int = Query(..., description="Away team ID"),
+    league_id:    Optional[int] = Query(None, description="League ID for per-league home advantage"),
+    n_sim: int        = Query(100_000, ge=10_000, le=500_000,
+                              description="Monte Carlo simulations"),
+):
     """
-    Track closing line value — the #1 indicator of long-term profitability.
-    Positive average CLV = genuine edge. Recommended threshold: > 0%.
+    Full betting market sheet for a fixture.
+    Expected goals come from the DC ensemble model.
+    Includes: 1X2, Asian Handicap, O/U, BTTS, Correct Score,
+              Double Chance, Draw No Bet, Win to Nil, Team Goals.
     """
+    dc = get_dc_predictor()
+    if dc is None or not dc.fitted:
+        raise HTTPException(
+            status_code=503,
+            detail="DC model not trained. POST /api/markets/dc/train first.",
+        )
 
-    def __init__(self):
-        self.records: list = []
+    result = predict_dc_match(home_team_id, away_team_id, league_id=league_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
 
-    def log(self, outcome: str, your_odds: float, closing_odds: float,
-            stake: float, won: bool):
-        clv = (closing_odds / your_odds - 1) * 100 if your_odds > 0 else 0
-        self.records.append({
-            "outcome":      outcome,
-            "your_odds":    your_odds,
-            "closing_odds": closing_odds,
-            "clv_pct":      round(clv, 3),
-            "stake":        stake,
-            "profit":       round(stake * (your_odds - 1) if won else -stake, 2),
-            "won":          won,
-        })
+    lam_h = result.get("exp_home_goals", 1.35)
+    lam_a = result.get("exp_away_goals", 1.10)
 
-    def summary(self) -> dict:
-        if not self.records:
-            return {}
-        clvs    = [r["clv_pct"] for r in self.records]
-        profits = [r["profit"]  for r in self.records]
-        stakes  = [r["stake"]   for r in self.records]
-        avg_clv = float(np.mean(clvs))
-        return {
-            "bets":              len(self.records),
-            "avg_clv_pct":       round(avg_clv, 3),
-            "clv_positive_rate": round(sum(c > 0 for c in clvs) / len(clvs) * 100, 2),
-            "total_profit":      round(sum(profits), 2),
-            "roi_pct":           round(sum(profits) / max(sum(stakes), 0.01) * 100, 2),
-            "positive_edge":     avg_clv > 0,
-        }
+    pricer = MarketPricer(lam_h, lam_a, n_sim=n_sim)
+    sheet  = pricer.full_sheet()
+
+    return {
+        "fixture": {
+            "home_team":    result["home_team"],
+            "away_team":    result["away_team"],
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
+        },
+        "ensemble_prediction": {
+            "calibrated":   result["calibrated"],
+            "prediction":   result["prediction"],
+            "confidence":   result["confidence"],
+            "models":       result["models"],
+        },
+        "markets": sheet,
+        "model_info": result.get("model_info", {}),
+    }
+
+
+# ─── POST /api/markets/value ──────────────────────────────────────────────────
+
+class ValueRequest(BaseModel):
+    home_team_id: int
+    away_team_id: int
+    market_odds: dict        # {"home_win": 2.45, "draw": 3.40, "away_win": 2.95}
+    min_edge_pct: float = 3.0
+
+
+@router.post("/value")
+def get_value_bets(req: ValueRequest):
+    """
+    Find value bets by comparing DC model probabilities vs supplied bookmaker odds.
+    Returns all outcomes where model edge > min_edge_pct%.
+    """
+    dc = get_dc_predictor()
+    if dc is None or not dc.fitted:
+        raise HTTPException(status_code=503,
+                            detail="DC model not trained. POST /api/markets/dc/train first.")
+
+    result = predict_dc_match(req.home_team_id, req.away_team_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    cal = result["calibrated"]
+    model_probs = {
+        "home_win": cal["home_win"],
+        "draw":     cal["draw"],
+        "away_win": cal["away_win"],
+    }
+
+    detector = ValueDetector(min_edge=req.min_edge_pct / 100)
+    bets = detector.scan(model_probs, req.market_odds, market_name="1x2")
+
+    return {
+        "fixture": {
+            "home_team": result["home_team"],
+            "away_team": result["away_team"],
+        },
+        "model_probs":  model_probs,
+        "value_bets":   bets,
+        "n_value_bets": len(bets),
+    }
+
+
+# ─── GET /api/markets/arb ─────────────────────────────────────────────────────
+
+class ArbRequest(BaseModel):
+    books_odds: dict    # {"home_win": {"Pinnacle": 2.45, "Bet365": 2.40}, ...}
+
+
+@router.post("/arb")
+def scan_arbitrage(req: ArbRequest):
+    """
+    Scan for arbitrage opportunities across multiple bookmakers.
+    Pass {outcome: {bookmaker: decimal_odds}} and we'll find risk-free arbs.
+    """
+    result = ArbitrageScanner.find_arb(req.books_odds)
+    return result
+
+
+# ─── GET /api/markets/dc/status ──────────────────────────────────────────────
+
+@router.get("/dc/status")
+def get_dc_status():
+    """Current DC model status."""
+    st = dc_status()
+    # If the background thread is currently training, tell the frontend so polling continues
+    if _dc_training_state.get("status") == "running":
+        st["training_status"] = "running"
+    elif "status" in _dc_training_state:
+        st["training_status"] = _dc_training_state["status"]
+    return st
+
+
+# ─── POST /api/markets/dc/train ──────────────────────────────────────────────
+
+@router.post("/dc/train")
+def train_dc():
+    """
+    Train (or retrain) the DC + Elo + xG ensemble from DB data.
+    Runs asynchronously in a daemon thread so it survives frontend disconnects.
+    """
+    global _dc_training_state
+    if _dc_training_state.get("status") == "running":
+        return {"message": "DC model training is already running."}
+
+    thread = threading.Thread(target=_run_dc_training, daemon=True)
+    thread.start()
+    return {"message": "DC model training started in background thread."}
+
+
+# ─── GET /api/markets/dc/predict ─────────────────────────────────────────────
+
+@router.get("/dc/predict")
+def dc_predict(
+    home_team_id: int = Query(...),
+    away_team_id: int = Query(...),
+    league_id:    Optional[int] = Query(None),
+):
+    """
+    Full DC ensemble prediction for a fixture.
+    Returns per-model breakdown (Dixon-Coles, Elo, xG, Ensemble, Calibrated),
+    Monte Carlo markets, and confidence score.
+    """
+    dc = get_dc_predictor()
+    if dc is None or not dc.fitted:
+        raise HTTPException(status_code=503,
+                            detail="DC model not trained. POST /api/markets/dc/train first.")
+    result = predict_dc_match(home_team_id, away_team_id, league_id=league_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+# ─── GET /api/markets/dc/leaderboard ─────────────────────────────────────────
+
+@router.get("/dc/leaderboard")
+def elo_leaderboard():
+    """Elo rating leaderboard across all teams in the DC model."""
+    dc = get_dc_predictor()
+    if dc is None or not dc.fitted:
+        raise HTTPException(status_code=503,
+                            detail="DC model not trained. POST /api/markets/dc/train first.")
+    return {"leaderboard": dc.elo_leaderboard()}
