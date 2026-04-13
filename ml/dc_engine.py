@@ -535,7 +535,7 @@ class DCPredictor:
         return self
 
     # ── Single match prediction ───────────────────────────────────────────────
-    def predict(self, home_team_id: int, away_team_id: int) -> dict:
+    def predict(self, home_team_id: int, away_team_id: int, league_id: int = None) -> dict:
         home = self.team_names.get(home_team_id)
         away = self.team_names.get(away_team_id)
 
@@ -937,12 +937,12 @@ def train_dc_model() -> dict:
         conn.close()
 
 
-def predict_dc_match(home_team_id: int, away_team_id: int) -> dict:
+def predict_dc_match(home_team_id: int, away_team_id: int, league_id: int = None) -> dict:
     """Run DC prediction for a single match. Returns error dict if untrained."""
     eng = get_dc_predictor()
     if eng is None or not eng.fitted:
         return {"error": "DC model not trained yet. POST /api/dc/train first."}
-    return eng.predict(home_team_id, away_team_id)
+    return eng.predict(home_team_id, away_team_id, league_id=league_id)
 
 
 def dc_status() -> dict:
