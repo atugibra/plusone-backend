@@ -212,11 +212,10 @@ class DataCache:
         # 4. Completed matches — rolling 3-year window by DATE (not season_id)
         # Load completed matches within a 4-year window.
         # QUALITY FILTER: only include matches where BOTH teams have league_standings
-        # data for that season. Standings provide rank, points_avg, wins_pct,
-        # goals_for/against — the backbone predictive features. Without standings
-        # both teams produce identical zero-filled vectors that add pure noise.
-        # This filter drops ~52% of matches (those with no standings = no signal)
-        # but dramatically improves signal-to-noise ratio and CV accuracy.
+        # in ANY league for that season (not necessarily the match's own league).
+        # This allows cross-league teams (e.g. Aston Villa in Europa League) to be
+        # included — their PL standings are used as fallback via standings_fallback.
+        # Matches with NO standings at all (truly unknown teams) are still excluded.
         cur.execute("""
             SELECT m.id, m.home_team_id, m.away_team_id, m.season_id, m.league_id,
                    m.home_score, m.away_score, m.match_date
@@ -227,13 +226,11 @@ class DataCache:
                   SELECT 1 FROM league_standings ls
                   WHERE ls.team_id = m.home_team_id
                     AND ls.season_id = m.season_id
-                    AND ls.league_id = m.league_id
               )
               AND EXISTS (
                   SELECT 1 FROM league_standings ls
                   WHERE ls.team_id = m.away_team_id
                     AND ls.season_id = m.season_id
-                    AND ls.league_id = m.league_id
               )
             ORDER BY m.match_date DESC
         """)
