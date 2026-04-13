@@ -315,17 +315,38 @@ class XGModel:
                       list(am.get("home_xg", am.home_goals)))
             self.team_xg_att[team] = np.mean(xg_for) if xg_for else self.league_xg_avg
             self.team_xg_def[team] = np.mean(xg_ag)  if xg_ag  else self.league_xg_avg
+
+        # Store per-league xG ratings so cross-league predictions
+        # can use competition-specific attack/defence when available.
+        # e.g. Aston Villa's Europa League xG differs from their PL xG.
+        self._league_xg_att: dict = {}   # (team, league_id) → xg_att
+        self._league_xg_def: dict = {}   # (team, league_id) → xg_def
+        if "league_id" in fixtures.columns:
+            for lid, grp in fixtures.groupby("league_id"):
+                for team in set(grp.home_team) | set(grp.away_team):
+                    hm = grp[grp.home_team == team].tail(self.window)
+                    am = grp[grp.away_team == team].tail(self.window)
+                    if len(hm) + len(am) < 2:
+                        continue  # not enough data in this competition
+                    xf = list(hm.get("home_xg", hm.home_goals)) +                          list(am.get("away_xg", am.away_goals))
+                    xa = list(hm.get("away_xg", hm.away_goals)) +                          list(am.get("home_xg", am.home_goals))
+                    if xf: self._league_xg_att[(team, int(lid))] = float(np.mean(xf))
+                    if xa: self._league_xg_def[(team, int(lid))] = float(np.mean(xa))
+
         avg_att = np.mean(list(self.team_xg_att.values())) if self.team_xg_att else self.league_xg_avg
         avg_def = np.mean(list(self.team_xg_def.values())) if self.team_xg_def else self.league_xg_avg
         self.league_xg_avg = (avg_att + avg_def) / 2
         return self
 
-    def predict(self, home: str, away: str) -> dict:
+    def predict(self, home: str, away: str, league_id: int = None) -> dict:
         av = self.league_xg_avg or LEAGUE_AVG_GOALS
-        h_att = self.team_xg_att.get(home, av)
-        h_def = self.team_xg_def.get(home, av)
-        a_att = self.team_xg_att.get(away, av)
-        a_def = self.team_xg_def.get(away, av)
+        # Use competition-specific xG when available (2+ games in that competition)
+        # Falls back to all-competition xG automatically.
+        lid = int(league_id) if league_id is not None else None
+        h_att = (self._league_xg_att.get((home, lid)) if lid else None)                 or self.team_xg_att.get(home, av)
+        h_def = (self._league_xg_def.get((home, lid)) if lid else None)                 or self.team_xg_def.get(home, av)
+        a_att = (self._league_xg_att.get((away, lid)) if lid else None)                 or self.team_xg_att.get(away, av)
+        a_def = (self._league_xg_def.get((away, lid)) if lid else None)                 or self.team_xg_def.get(away, av)
         exp_h = (h_att / av) * (a_def / av) * av * HOME_ADVANTAGE
         exp_a = (a_att / av) * (h_def / av) * av
         max_g = CFG["dc_max_goals"]
@@ -592,7 +613,7 @@ class DCPredictor:
 
         dc_pred  = self.dc.predict(home, away, league_id=league_id)
         elo_pred = self.elo.predict(home, away)
-        xg_pred  = self.xg.predict(home, away)
+        xg_pred  = self.xg.predict(home, away, league_id=league_id)
         blended  = self.blender.blend(dc_pred, elo_pred, xg_pred)
 
         exp_h = (dc_pred["exp_home_goals"] * 0.5 + xg_pred["exp_home_xg"] * 0.5)
