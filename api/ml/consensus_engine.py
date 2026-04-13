@@ -462,7 +462,7 @@ def run_consensus(
         try:
             from ml.dc_engine import predict_dc_match  # lazy import
             import numpy as np
-            dc_raw = predict_dc_match(home_team_id, away_team_id)
+            dc_raw = predict_dc_match(home_team_id, away_team_id, league_id=league_id)
             if "error" in dc_raw:
                 raise RuntimeError(dc_raw["error"])
             dc_probs = {
@@ -784,7 +784,7 @@ def upcoming_consensus_fast(league_id: int = None, limit: int = 50) -> list:
             
             # --- DC
             try:
-                dc_raw = predict_dc_match(fx["home_team_id"], fx["away_team_id"])
+                dc_raw = predict_dc_match(fx["home_team_id"], fx["away_team_id"], league_id=fx.get("league_id"))
                 if "error" in dc_raw: raise RuntimeError(dc_raw["error"])
                 dc_probs = {
                     "home_win": float(dc_raw.get("calibrated", dc_raw.get("blended", {})).get("home_win", 0.35)),
