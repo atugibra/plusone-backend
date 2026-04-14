@@ -457,6 +457,19 @@ def get_or_create_team(cur, name, league_id):
     if not clean:
         return None
 
+    # Apply shared alias map — same canonical resolver used by sync_enrichment.py
+    # This ensures both FBref and Football-Data paths produce identical team names.
+    # e.g. FBref sends "Nott'ham Forest" → alias → "Nottingham Forest"
+    try:
+        from routes.sync_enrichment import TEAM_NAME_ALIASES
+        clean = TEAM_NAME_ALIASES.get(clean.strip().lower(), clean)
+    except ImportError:
+        try:
+            from api.routes.sync_enrichment import TEAM_NAME_ALIASES
+            clean = TEAM_NAME_ALIASES.get(clean.strip().lower(), clean)
+        except ImportError:
+            pass  # silently continue without alias map
+
     # 1. Exact clean match within this league (fastest path)
     cur.execute(
         "SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1",
