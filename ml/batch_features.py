@@ -186,28 +186,30 @@ class DataCache:
                 if sid > existing_sid:
                     self.squad_fallback[fb_key] = row
 
-        # 3. Player stats — top 5 scorers per team only (massive RAM saving) ──
+        # 3. Player stats — top 25 by minutes per team/season ──────────────
+        # Sorted by minutes played so all positions (GK, DF, MF, FW) are
+        # represented proportionally, not just top scorers.
         cur.execute(
             f"""
             SELECT DISTINCT ON (team_id, season_id, player_name)
-                   team_id, season_id, player_name, goals, assists,
+                   team_id, season_id, player_name, position, goals, assists,
                    minutes, minutes_90s, age, standard_stats
             FROM player_stats
-            WHERE goals IS NOT NULL
+            WHERE minutes IS NOT NULL
               AND season_id IN ({season_placeholder})
-            ORDER BY team_id, season_id, player_name, goals DESC
+            ORDER BY team_id, season_id, player_name, minutes DESC
             """,
             recent_season_ids,
         )
-        # Keep only top 5 scorers per (team, season) to cap memory
+        # Keep top 25 by minutes per (team, season) — covers full first-team
         _player_raw: Dict[Tuple, List] = defaultdict(list)
         for r in cur.fetchall():
             r = dict(r)
             _player_raw[(r["team_id"], r["season_id"])].append(r)
         self.players: Dict[Tuple, List] = defaultdict(list)
         for k, rows in _player_raw.items():
-            self.players[k] = sorted(rows, key=lambda x: _f(x.get("goals")),
-                                     reverse=True)[:5]
+            self.players[k] = sorted(rows, key=lambda x: _f(x.get("minutes")),
+                                     reverse=True)[:25]
 
         # 4. Completed matches — rolling 3-year window by DATE (not season_id)
         # Load completed matches within a 4-year window.
@@ -466,42 +468,186 @@ def _compute_h2h(cache: DataCache, home_team_id: int, away_team_id: int, n: int 
 
 # ─── Player features (in-memory) ─────────────────────────────────────────────
 
+def _pos_bucket(pos: str) -> str:
+    """Map FBref position string to GK / DF / MF / FW bucket."""
+    p = str(pos or "").upper().strip()
+    if not p:             return "UNK"
+    if p.startswith("GK"): return "GK"
+    # Primary position is first token before comma
+    primary = p.split(",")[0].strip()
+    if primary == "DF":   return "DF"
+    if primary == "MF":   return "MF"
+    if primary == "FW":   return "FW"
+    # Fallback: scan for known tokens
+    if "GK" in p:         return "GK"
+    if "FW" in p:         return "FW"
+    if "MF" in p:         return "MF"
+    if "DF" in p:         return "DF"
+    return "UNK"
+
+
 def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> dict:
+    """
+    Build positional player features from top-25-by-minutes squad.
+
+    Replaces the old top-5-scorers approach with four positional buckets:
+      ATTACK (FW):   goals, xG, attack depth, dependency
+      MIDFIELD (MF): assists, progressive passes, chance creation
+      DEFENCE (DF):  defensive solidity, squad continuity
+      GK:            goalkeeper consistency
+      SQUAD (all):   age profile, depth, minutes concentration
+    All original feature names preserved for backward compatibility.
+    New features added alongside — no deletions.
+    """
     players = cache.players.get((team_id, season_id), [])
-    zero = {k: 0.0 for k in ["top_scorer_goals", "goal_concentration", "n_scorers",
-                               "squad_depth_scorers", "top_assister_assists",
-                               "avg_goals_per_player", "scorer_avg_age",
-                               "top_scorer_goals_per90", "team_player_assists_pg",
-                               "attack_dependency"]}
+
+    # ── zero dict: all features (old + new) default to 0.0 ──────────────────
+    zero = {k: 0.0 for k in [
+        # ── original features (kept for backward compatibility) ───────────
+        "top_scorer_goals", "goal_concentration", "n_scorers",
+        "squad_depth_scorers", "top_assister_assists",
+        "avg_goals_per_player", "scorer_avg_age",
+        "top_scorer_goals_per90", "team_player_assists_pg",
+        "attack_dependency",
+        # ── new positional features ───────────────────────────────────────
+        # Attack
+        "avg_attack_goals_per90", "avg_attack_xg_per90",
+        "attack_depth",
+        # Midfield
+        "avg_mid_assists_per90", "avg_mid_progressive_passes",
+        "mid_depth",
+        # Defence / GK
+        "avg_def_minutes", "gk_games", "def_depth",
+        # Squad-wide
+        "squad_avg_age", "squad_depth",
+        "minutes_concentration",
+    ]}
     if not players:
         return zero
 
-    total_goals   = sum(_f(p.get("goals")) for p in players)
-    total_assists  = sum(_f(p.get("assists")) for p in players if p.get("assists"))
-    scorers        = [p for p in players if _f(p.get("goals")) > 0]
-    top            = players[0]
-    top_goals      = _f(top.get("goals"))
-    top_m90        = _f(top.get("minutes_90s")) or 1
+    # ── bucket players by position ──────────────────────────────────────────
+    buckets = {"GK": [], "DF": [], "MF": [], "FW": [], "UNK": []}
+    for p in players:
+        buckets[_pos_bucket(p.get("position", ""))].append(p)
+
+    # ── helper: safe standard_stats JSONB access ─────────────────────────────
+    def _ss(p, key, default=0.0):
+        ss = p.get("standard_stats")
+        if isinstance(ss, dict):
+            return _f(ss.get(key), default)
+        return default
+
+    # ── squad-wide metrics (all 25 players) ──────────────────────────────────
+    total_goals   = sum(_f(p.get("goals"))   for p in players)
+    total_assists = sum(_f(p.get("assists"))  for p in players)
+    total_minutes = sum(_f(p.get("minutes"))  for p in players) or 1
+    scorers       = [p for p in players if _f(p.get("goals")) > 0]
 
     n_games = sum(
         1 for m in cache.matches_by_team.get(team_id, [])
         if m["season_id"] == season_id
     ) or 1
 
-    ss = top.get("standard_stats") if isinstance(top.get("standard_stats"), dict) else {}
+    # Minutes concentration: do top 3 players carry the whole team?
+    top3_mins = sum(_f(p.get("minutes")) for p in players[:3])
+    minutes_concentration = _safe_div(top3_mins, total_minutes, 0.0)
+
+    # Squad depth: players who played 500+ minutes (meaningful contributors)
+    squad_depth = sum(1 for p in players if _f(p.get("minutes")) >= 500)
+
+    # Squad avg age (weighted by minutes — starters count more)
+    ages_w = [(_f(p.get("age"), 26.0), _f(p.get("minutes"), 0.0)) for p in players]
+    squad_avg_age = (_safe_div(sum(a*m for a,m in ages_w), total_minutes, 26.0))
+
+    # ── original features (backward-compatible) ───────────────────────────────
+    # Use all players sorted by minutes (not just attackers)
+    top = players[0]  # highest-minutes player
+    top_goals = _f(top.get("goals"))
+    top_m90   = _f(top.get("minutes_90s")) or 1
     conc = _safe_div(top_goals, total_goals, 0.0)
+
+    # Best scoring player (by goals, for top_scorer_goals backward compat)
+    top_scorer = max(players, key=lambda p: _f(p.get("goals")))
+    top_scorer_goals = _f(top_scorer.get("goals"))
+    top_scorer_m90   = _f(top_scorer.get("minutes_90s")) or 1
+    top_scorer_ss    = top_scorer.get("standard_stats") if isinstance(
+                          top_scorer.get("standard_stats"), dict) else {}
+    goal_conc = _safe_div(top_scorer_goals, total_goals, 0.0)
+
+    # Best assisting player (by assists)
+    top_assister = max(players, key=lambda p: _f(p.get("assists")))
+
+    # ── ATTACK bucket features ────────────────────────────────────────────────
+    attackers = buckets["FW"] or buckets["UNK"][:4]  # fallback if no FW tagged
+    if attackers:
+        atk_top = sorted(attackers, key=lambda p: _f(p.get("minutes")), reverse=True)[:4]
+        avg_attack_goals_per90 = _safe_div(
+            sum(_ss(p, "goals_per90") for p in atk_top), len(atk_top))
+        avg_attack_xg_per90 = _safe_div(
+            sum(_ss(p, "xg") / max(_f(p.get("minutes_90s")), 0.1) for p in atk_top),
+            len(atk_top))
+        attack_depth = sum(1 for p in attackers if _f(p.get("minutes")) >= 500)
+    else:
+        avg_attack_goals_per90 = _safe_div(total_goals, n_games * 11)
+        avg_attack_xg_per90    = 0.0
+        attack_depth           = 0.0
+
+    # ── MIDFIELD bucket features ──────────────────────────────────────────────
+    mids = buckets["MF"]
+    if mids:
+        mid_top = sorted(mids, key=lambda p: _f(p.get("minutes")), reverse=True)[:5]
+        avg_mid_assists_per90 = _safe_div(
+            sum(_ss(p, "assists_per90") for p in mid_top), len(mid_top))
+        avg_mid_progressive_passes = _safe_div(
+            sum(_ss(p, "progressive_passes") for p in mid_top), len(mid_top))
+        mid_depth = sum(1 for p in mids if _f(p.get("minutes")) >= 500)
+    else:
+        avg_mid_assists_per90       = _safe_div(total_assists, n_games * 11)
+        avg_mid_progressive_passes  = 0.0
+        mid_depth                   = 0.0
+
+    # ── DEFENCE / GK bucket features ─────────────────────────────────────────
+    defenders = buckets["DF"]
+    gks       = buckets["GK"]
+    if defenders:
+        def_top = sorted(defenders, key=lambda p: _f(p.get("minutes")), reverse=True)[:5]
+        avg_def_minutes = _safe_div(
+            sum(_f(p.get("minutes")) for p in def_top), len(def_top))
+        def_depth = sum(1 for p in defenders if _f(p.get("minutes")) >= 500)
+    else:
+        avg_def_minutes = 0.0
+        def_depth       = 0.0
+
+    gk_games = _f(gks[0].get("games")) if gks else 0.0
+
+    # ── assemble result ───────────────────────────────────────────────────────
     return {
-        "top_scorer_goals":      top_goals,
-        "goal_concentration":    conc,
-        "n_scorers":             _f(len(scorers)),
-        "squad_depth_scorers":   _safe_div(len(scorers), len(players), 0.5),
-        "top_assister_assists":  _f(top.get("assists")),
-        "avg_goals_per_player":  _safe_div(total_goals, len(players)),
-        "scorer_avg_age":        (_safe_div(sum(_f(p.get("age")) for p in scorers),
-                                            len(scorers), 26.0) if scorers else 26.0),
-        "top_scorer_goals_per90": _j(ss, "goals_per90", _safe_div(top_goals, top_m90)),
+        # ── original features (unchanged names) ───────────────────────────
+        "top_scorer_goals":       top_scorer_goals,
+        "goal_concentration":     goal_conc,
+        "n_scorers":              _f(len(scorers)),
+        "squad_depth_scorers":    _safe_div(len(scorers), len(players), 0.5),
+        "top_assister_assists":   _f(top_assister.get("assists")),
+        "avg_goals_per_player":   _safe_div(total_goals, len(players)),
+        "scorer_avg_age":         (_safe_div(sum(_f(p.get("age")) for p in scorers),
+                                             len(scorers), 26.0) if scorers else 26.0),
+        "top_scorer_goals_per90": _j(top_scorer_ss, "goals_per90",
+                                     _safe_div(top_scorer_goals, top_scorer_m90)),
         "team_player_assists_pg": _safe_div(total_assists, n_games),
-        "attack_dependency":      1.0 if conc > 0.40 else 0.0,
+        "attack_dependency":      1.0 if goal_conc > 0.40 else 0.0,
+        # ── new positional features ───────────────────────────────────────
+        "avg_attack_goals_per90":      avg_attack_goals_per90,
+        "avg_attack_xg_per90":         avg_attack_xg_per90,
+        "attack_depth":                float(attack_depth),
+        "avg_mid_assists_per90":       avg_mid_assists_per90,
+        "avg_mid_progressive_passes":  avg_mid_progressive_passes,
+        "mid_depth":                   float(mid_depth),
+        "avg_def_minutes":             avg_def_minutes,
+        "gk_games":                    gk_games,
+        "def_depth":                   float(def_depth),
+        "squad_avg_age":               squad_avg_age,
+        "squad_depth":                 float(squad_depth),
+        "minutes_concentration":       minutes_concentration,
     }
 
 
