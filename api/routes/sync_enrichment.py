@@ -36,7 +36,7 @@ CLUBELO_LEAGUE_MAP = {
     "Fra": "Ligue 1",
     "Ger": "Bundesliga",
     "Esp": "La Liga",
-    "Gre": "Super League Greece",
+    "Gre": "Greek Super League",   # aligned with FBref canonical name
     "Hun": "Hungarian OTP Bank Liga",
     "Ita": "Serie A",
     "Ned": "Eredivisie",
@@ -45,7 +45,7 @@ CLUBELO_LEAGUE_MAP = {
     "Sco": "Scottish Premiership",
     "Srb": "Serbian SuperLiga",
     "Sui": "Swiss Super League",
-    "Tur": "\u00dcber Lig",
+    "Tur": "Super Lig",             # aligned with FBref canonical name (was "Über Lig")
     "Ukr": "Ukrainian Premier League",
     # Second divisions
     "Eng2": "Championship",
@@ -95,7 +95,7 @@ FOOTBALL_DATA_DIV_MAP = {
     "SC2": "Scottish League One",
     "SC3": "Scottish League Two",
     # Greece
-    "G1":  "Super League Greece",
+    "G1":  "Greek Super League",   # aligned with FBref canonical name
     # Portugal
     "P1":  "Primeira Liga",
     "P2":  "Liga Portugal 2",
@@ -122,16 +122,16 @@ TEAM_NAME_ALIASES: dict[str, str] = {
     # ── England ───────────────────────────────────────────────────────────────
     "man city":                   "Manchester City",
     "manchester city":            "Manchester City",
-    "man utd":                    "Manchester Utd",
-    "man united":                 "Manchester Utd",
-    "manchester united":          "Manchester Utd",
-    "nott'm forest":              "Nott'ham Forest",
-    "nottm forest":               "Nott'ham Forest",
-    "nottingham forest":          "Nott'ham Forest",
-    "wolverhampton wanderers":    "Wolves",
-    "wolverhampton":              "Wolves",
-    "sheffield utd":              "Sheffield Utd",
-    "sheffield united":           "Sheffield Utd",
+    "man utd":                    "Manchester United",
+    "man united":                 "Manchester United",
+    "manchester united":          "Manchester United",
+    "nott'm forest":              "Nottingham Forest",
+    "nottm forest":               "Nottingham Forest",
+    "nottingham forest":          "Nottingham Forest",
+    "wolverhampton wanderers":    "Wolverhampton Wanderers",
+    "wolverhampton":              "Wolverhampton Wanderers",
+    "sheffield utd":              "Sheffield United",
+    "sheffield united":           "Sheffield United",
     "luton town":                 "Luton",
     "west bromwich albion":       "West Brom",
     "west brom":                  "West Brom",
@@ -150,14 +150,14 @@ TEAM_NAME_ALIASES: dict[str, str] = {
     "bristol city":               "Bristol City",
     "birmingham city":            "Birmingham City",
     "leicester city":             "Leicester City",
-    "newcastle united":           "Newcastle Utd",
+    "newcastle united":           "Newcastle United",
     "norwich city":               "Norwich",
     "watford fc":                 "Watford",
     "crystal palace":             "Crystal Palace",
-    "west ham united":            "West Ham",
-    "west ham":                   "West Ham",
-    "tottenham hotspur":          "Tottenham",
-    "tottenham":                  "Tottenham",
+    "west ham united":            "West Ham United",
+    "west ham":                   "West Ham United",
+    "tottenham hotspur":          "Tottenham Hotspur",
+    "tottenham":                  "Tottenham Hotspur",
     "aston villa":                "Aston Villa",
     # ── Germany ───────────────────────────────────────────────────────────────
     "eintr frankfurt":            "Eintracht Frankfurt",
@@ -207,10 +207,10 @@ TEAM_NAME_ALIASES: dict[str, str] = {
     "getafe cf":                  "Getafe",
     "las palmas":                 "Las Palmas",
     # ── France ────────────────────────────────────────────────────────────────
-    "psg":                        "Paris S-G",
-    "paris sg":                   "Paris S-G",
-    "paris saint-germain":        "Paris S-G",
-    "paris saint germain":        "Paris S-G",
+    "psg":                        "Paris Saint-Germain",
+    "paris sg":                   "Paris Saint-Germain",
+    "paris saint-germain":        "Paris Saint-Germain",
+    "paris saint germain":        "Paris Saint-Germain",
     "st etienne":                 "Saint-Étienne",
     "saint-etienne":              "Saint-Étienne",
     "olympique marseille":        "Marseille",
@@ -226,8 +226,8 @@ TEAM_NAME_ALIASES: dict[str, str] = {
     "montpellier hsc":            "Montpellier",
     "nantes":                     "Nantes",
     # ── Italy ─────────────────────────────────────────────────────────────────
-    "milan":                      "AC Milan",
-    "ac milan":                   "AC Milan",
+    "milan":                      "Milan",
+    "ac milan":                   "Milan",
     "inter milan":                "Inter",
     "internazionale":             "Inter",
     "fc internazionale":          "Inter",
@@ -279,6 +279,24 @@ TEAM_NAME_ALIASES: dict[str, str] = {
     "rangers fc":                 "Rangers",
     "heart of midlothian":        "Hearts",
     "hibernian fc":               "Hibernian",
+    # ── FBref abbreviation reverse aliases ───────────────────────────────────
+    # These handle FBref's own abbreviations arriving from fixtures/stats pages
+    "nott'ham forest":            "Nottingham Forest",
+    "newcastle utd":              "Newcastle United",
+    "sheffield utd":              "Sheffield United",
+    "sheffield wed":              "Sheffield Wednesday",
+    "manchester utd":             "Manchester United",
+    "leeds utd":                  "Leeds United",
+    "wolves":                     "Wolverhampton Wanderers",
+    "oxford utd":                 "Oxford United",
+    "sunderland afc":             "Sunderland",
+    "norwich city":               "Norwich City",
+    "ipswich town":               "Ipswich Town",
+    "luton town":                 "Luton Town",
+    "swansea city":               "Swansea City",
+    "cardiff city":               "Cardiff City",
+    "stoke city":                 "Stoke City",
+    "huddersfield town":          "Huddersfield Town",
 }
 
 
@@ -363,7 +381,7 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict):
     league_teams = cur.fetchall()
     team_names = [t["name"] for t in league_teams]
     
-    matches = difflib.get_close_matches(clean, team_names, n=1, cutoff=0.60)
+    matches = difflib.get_close_matches(clean, team_names, n=1, cutoff=0.85)  # raised from 0.60 — reduces false-positive team merges
     if matches:
         matched_name = matches[0]
         # Find the ID for the matched name
