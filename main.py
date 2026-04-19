@@ -6,13 +6,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from dotenv import load_dotenv
 
 
-from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, sync_enrichment, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance, feedback, prediction_ask
+from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, sync_enrichment, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance, feedback, settings, prediction_ask
+
+try:
+    from routes import soccerdata_sync
+    _soccerdata_available = True
+except ImportError:
+    _soccerdata_available = False
 
 
 load_dotenv()
-
-# httpx is declared in requirements.txt — imported where needed (prediction_ask.py)
-
 
 # ─── Numpy → psycopg2 type adapters ──────────────────────────────────────────
 # Prevents "schema np does not exist" errors when numpy float64/int64 values
@@ -79,20 +82,19 @@ CORS_ORIGINS = [
 #   - Any *.vercel.app deployment (including previews)   (Vercel)
 #   - Any *.onrender.com service                         (Render)
 #   - Any *.railway.app service (including *.up.railway) (Railway)
-#   - Chrome extensions (needed for Authorization header from extension)
 CORS_ORIGIN_REGEX = (
     r"https?://localhost(:\d+)?"
     r"|https://[a-z0-9-]+(?:\.[a-z0-9-]+)*\.vercel\.app"
     r"|https://[a-z0-9-]+\.onrender\.com"
     r"|https://[a-z0-9-]+(?:\.up)?\.railway\.app"
-    r"|chrome-extension://[a-z0-9]+"
+    r"|chrome-extension://[a-z0-9]+"  # Browser extension support
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_origin_regex=CORS_ORIGIN_REGEX,
-    allow_credentials=True,   # Required so the Authorization header is forwarded from the extension
+    allow_credentials=True,   # needed so Authorization header is forwarded from extensions
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Length"],
@@ -110,7 +112,7 @@ app.include_router(squad_stats.router,  prefix="/api/squad-stats", tags=["Squad 
 app.include_router(venue_stats.router,  prefix="/api/venue-stats", tags=["Venue Stats"])
 app.include_router(player_stats.router, prefix="/api/players",     tags=["Players"])
 app.include_router(sync.router,         prefix="/api/sync",        tags=["Sync"])
-app.include_router(sync_enrichment.router, prefix="/api/sync",        tags=["Sync Validation"])
+app.include_router(sync_enrichment.router, prefix="/api/sync", tags=["Sync Validation"])
 app.include_router(cleanup.router,      prefix="/api/cleanup",     tags=["Cleanup"])
 app.include_router(auth.router,                                    tags=["Auth"])
 app.include_router(predictions.router,    prefix="/api/predictions",    tags=["Predictions"])
@@ -118,7 +120,11 @@ app.include_router(prediction_log.router, prefix="/api/prediction-log", tags=["P
 app.include_router(markets.router,        prefix="/api/markets",         tags=["Markets"])
 app.include_router(performance.router,    prefix="/api/performance",      tags=["Performance"])
 app.include_router(feedback.router,        prefix="/api/feedback",         tags=["Feedback"])
+app.include_router(settings.router,        prefix="/api/settings",          tags=["Settings"])
 app.include_router(prediction_ask.router,  prefix="/api/predict",          tags=["Prediction Ask"])
+
+if _soccerdata_available:
+    app.include_router(soccerdata_sync.router, prefix="/api/soccerdata", tags=["Soccerdata Sync"])
 
 
 if __name__ == "__main__":
