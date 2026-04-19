@@ -22,19 +22,25 @@ def list_teams(league_id: Optional[int] = None):
     conn = get_connection()
     cur  = conn.cursor()
     if league_id:
-        # Find every team that has played at least one match in this league,
-        # regardless of which domestic league they are registered under.
+        # Return teams from CURRENT SEASON only (avoids relegated/promoted teams).
+        # Also picks the SHORTER name variant to prefer "Arsenal" over "Arsenal FC".
         cur.execute("""
-            SELECT DISTINCT
+            WITH current_season AS (
+                SELECT id FROM seasons ORDER BY name DESC LIMIT 1
+            )
+            SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(t.name,
+                    '\\s*(FC|AFC|SC|FK|SK|CF|SV)\\s*$', '', 'i')))
                 t.id, t.name, t.logo_url,
-                t.league_id                     AS domestic_league_id,
-                dl.name                         AS league,
-                COUNT(m.id) OVER (PARTITION BY t.id) AS match_count
+                t.league_id AS domestic_league_id,
+                dl.name     AS league
             FROM teams t
             JOIN leagues dl ON dl.id = t.league_id
             JOIN matches m  ON (m.home_team_id = t.id OR m.away_team_id = t.id)
+            JOIN current_season cs ON m.season_id = cs.id
             WHERE m.league_id = %s
-            ORDER BY t.name
+            ORDER BY
+                LOWER(REGEXP_REPLACE(t.name, '\\s*(FC|AFC|SC|FK|SK|CF|SV)\\s*$', '', 'i')),
+                LENGTH(t.name) ASC
         """, (league_id,))
     else:
         cur.execute("""

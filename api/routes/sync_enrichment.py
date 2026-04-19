@@ -25,7 +25,7 @@ def safe_num(val):
 # ClubElo uses 2-4 char country/league codes; map each to the canonical full name
 # used by FBref so we don't create duplicate league rows.
 CLUBELO_LEAGUE_MAP = {
-    # Top divisions
+    # ── Top divisions ──────────────────────────────────────────────────────────
     "Aut": "Austrian Bundesliga",
     "Bel": "Belgian Pro League",
     "Bul": "Bulgarian First League",
@@ -36,30 +36,38 @@ CLUBELO_LEAGUE_MAP = {
     "Fra": "Ligue 1",
     "Ger": "Bundesliga",
     "Esp": "La Liga",
-    "Gre": "Greek Super League",   # aligned with FBref canonical name
+    "Gre": "Greek Super League",
     "Hun": "Hungarian OTP Bank Liga",
+    "Isr": "Israeli Premier League",      # added — ClubElo code confirmed
     "Ita": "Serie A",
     "Ned": "Eredivisie",
+    "Nor": "Norwegian Eliteserien",        # added — was missing, caused ghost rows
+    "Pol": "Polish Ekstraklasa",           # added — was missing, caused ghost rows
     "Por": "Primeira Liga",
+    "Rom": "Romanian Liga I",              # added — was missing, caused ghost rows
     "Rus": "Russian Premier League",
     "Sco": "Scottish Premiership",
     "Srb": "Serbian SuperLiga",
     "Sui": "Swiss Super League",
-    "Tur": "Super Lig",             # aligned with FBref canonical name (was "Über Lig")
+    "Svn": "Slovenian PrvaLiga",           # added — was missing, caused ghost rows
+    "Swe": "Swedish Allsvenskan",          # added — was missing, caused ghost rows
+    "Tur": "Super Lig",
     "Ukr": "Ukrainian Premier League",
-    # Second divisions
+    # ── Second / lower divisions ───────────────────────────────────────────────
     "Eng2": "Championship",
+    "Eng3": "League One",                  # added — was missing, caused ghost rows
+    "Eng4": "League Two",                  # added — was missing, caused ghost rows
     "Ger2": "2. Bundesliga",
-    "Esp2": "La Liga 2",
+    "Esp2": "Segunda Division",            # fixed — was "La Liga 2", canonical is "Segunda Division"
     "Ita2": "Serie B",
     "Fra2": "Ligue 2",
     "Ned2": "Eerste Divisie",
     "Por2": "Liga Portugal 2",
     "Sco2": "Scottish Championship",
-    # European / continental
+    # ── European / continental ─────────────────────────────────────────────────
     "UCL":  "UEFA Champions League",
     "UEL":  "UEFA Europa League",
-    "UECL": "UEFA Europa Conference League",
+    "UECL": "UEFA Conference League",      # fixed — canonical name matches soccerdata_sync.py
 }
 
 # Football-Data.co.uk uses Div codes in their CSVs (E0, D1, SP1, etc.)
@@ -110,7 +118,7 @@ FOOTBALL_DATA_DIV_MAP = {
     # Japan
     "J1":  "J1 League",
     # Catch-all codes seen in fixtures.csv
-    "CONF": "UEFA Europa Conference League",
+    "CONF": "UEFA Conference League",
     "UCL":  "UEFA Champions League",
     "UEL":  "UEFA Europa League",
 }
@@ -344,7 +352,29 @@ def _get_league(cur, name: str):
     return cur.fetchone()["id"]
 
 
-def _get_team(cur, name: str, league_id: int, team_cache: dict):
+def _get_team(cur, name: str, league_id: int, team_cache: dict, allow_create: bool = True):
+    """Resolve a team name to a teams.id.
+
+    Lookup order:
+      1. Exact name match within the given league              (fastest, most correct)
+      2. Exact name match across ALL leagues                   (handles UEFA cross-league teams
+                                                                and teams that moved divisions)
+      3. Short-name guard                                       (rejects garbage rows)
+      4. Fuzzy match within the given league                   (handles minor spelling variants)
+      5. Insert new team — ONLY when allow_create=True         (see below)
+
+    allow_create=False is used for ClubElo data.
+    ClubElo infers league from a 2-4 char country code (e.g. "ENG2" → Championship).
+    If a team is not already in the DB, we must NOT create it under that inferred
+    league — the team may not be in the Championship at all, or may later be scraped
+    by the extension under a different (correct) league.  Creating it here would
+    permanently anchor the team to the wrong league, corrupting all subsequent
+    cross-league lookups (step 2 always returns the first match it finds).
+
+    Callers that DO know the correct league (odds, injuries — which come from
+    Football-Data Div codes that map 1-to-1 to canonical leagues) keep the
+    default allow_create=True.
+    """
     raw   = name.strip()
     clean = _normalize_team_name(raw)   # map aliases → FBref canonical names
 
@@ -361,12 +391,22 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict):
         return res["id"]
 
     # 2. Cross-league fallback: team may be registered under a domestic league
-    #    but also appear in enrichment data for UCL / Europa etc.
+    #    but also appear in enrichment data for UCL / Europa / ClubElo etc.
     cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (clean,))
     res = cur.fetchone()
     if res:
         team_cache[cache_key] = res["id"]
         return res["id"]
+
+    # Team not found in DB at all from this point forward.
+    # If the caller is ClubElo (allow_create=False), stop here — do not create a
+    # ghost team under a ClubElo-inferred league that may be wrong.
+    if not allow_create:
+        logger.debug(
+            "Team %r not in DB; skipping creation (allow_create=False, league_id=%s)",
+            clean, league_id,
+        )
+        return None
 
     # 3. Genuinely new team — only create if name looks legitimate.
     #    Names shorter than 3 chars are almost certainly garbage from a
@@ -380,17 +420,17 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict):
     cur.execute("SELECT id, name FROM teams WHERE league_id = %s", (league_id,))
     league_teams = cur.fetchall()
     team_names = [t["name"] for t in league_teams]
-    
-    matches = difflib.get_close_matches(clean, team_names, n=1, cutoff=0.85)  # raised from 0.60 — reduces false-positive team merges
+
+    matches = difflib.get_close_matches(clean, team_names, n=1, cutoff=0.85)
     if matches:
         matched_name = matches[0]
-        # Find the ID for the matched name
         for t in league_teams:
             if t["name"] == matched_name:
                 team_cache[cache_key] = t["id"]
                 logger.debug("Fuzzy matched enrichment team %r to existing team %r", clean, matched_name)
                 return t["id"]
 
+    # 5. Insert brand-new team under the caller-supplied league
     cur.execute("INSERT INTO teams (name, league_id) VALUES (%s, %s) RETURNING id", (clean, league_id))
     new_id = cur.fetchone()["id"]
     team_cache[cache_key] = new_id
@@ -506,13 +546,20 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                 home = raw_data.get("Home") or raw_data.get("HomeTeam") or row.get("home")
                 away = raw_data.get("Away") or raw_data.get("AwayTeam") or row.get("away")
                 target_date = raw_data.get("Date") or row.get("date")
-                
+
                 l_id = _resolve_league(row)
-                
-                # We may not have exact Elo numbers from the Fixtures endpoint, but we save the predicted Probs!
+
+                # allow_create=False: if a team is not already in the DB we skip it
+                # rather than creating it under a ClubElo-inferred league (e.g. ENG2
+                # → Championship).  Creating ghost teams here would permanently anchor
+                # the team to the wrong league, corrupting all future cross-league
+                # lookups in both _get_team (step 2) and get_or_create_team (step 2).
                 for tm, elo_val in [(home, raw_data.get("Home_Elo")), (away, raw_data.get("Away_Elo"))]:
-                    if not tm or not target_date: continue
-                    t_id = _get_team(cur, tm, l_id, team_cache)
+                    if not tm or not target_date:
+                        continue
+                    t_id = _get_team(cur, tm, l_id, team_cache, allow_create=False)
+                    if not t_id:
+                        continue  # team not in DB — skip rather than create ghost record
                     cur.execute("""
                         INSERT INTO team_clubelo (team_id, elo_date, elo, raw_data)
                         VALUES (%s, %s, %s, %s)
