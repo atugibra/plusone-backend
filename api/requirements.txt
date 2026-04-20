@@ -16,4 +16,5 @@ passlib[bcrypt]>=1.7.4
 bcrypt==4.0.1
 python-multipart>=0.0.9
 httpx>=0.27.0
+soccerdata>=1.8
 colorama==0.4.6
