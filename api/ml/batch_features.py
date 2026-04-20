@@ -211,28 +211,41 @@ class DataCache:
             self.players[k] = sorted(rows, key=lambda x: _f(x.get("minutes")),
                                      reverse=True)[:25]
 
-        # 4. Completed matches — rolling 3-year window by DATE (not season_id)
-        # Load completed matches within a 4-year window.
-        # QUALITY FILTER: only include matches where BOTH teams have league_standings
-        # in ANY league for that season (not necessarily the match's own league).
-        # This allows cross-league teams (e.g. Aston Villa in Europa League) to be
-        # included — their PL standings are used as fallback via standings_fallback.
-        # Matches with NO standings at all (truly unknown teams) are still excluded.
+        # 4. Completed matches — rolling 4-year window.
+        # QUALITY FILTER: require squad stats for at least ONE team (92.6% coverage)
+        # OR standings for at least ONE team (broader coverage).
+        # This gives ~38-42k training samples vs ~13k with the strict standings filter.
+        # Matches where NEITHER team has any data are excluded (pure noise).
+        # The batch_features fallback logic handles missing standings/squad gracefully.
         cur.execute("""
             SELECT m.id, m.home_team_id, m.away_team_id, m.season_id, m.league_id,
                    m.home_score, m.away_score, m.match_date
             FROM matches m
             WHERE m.home_score IS NOT NULL AND m.away_score IS NOT NULL
               AND m.match_date >= CURRENT_DATE - INTERVAL '4 years'
-              AND EXISTS (
-                  SELECT 1 FROM league_standings ls
-                  WHERE ls.team_id = m.home_team_id
-                    AND ls.season_id = m.season_id
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM league_standings ls
+                      WHERE ls.team_id = m.home_team_id
+                        AND ls.season_id = m.season_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM team_squad_stats tss
+                      WHERE tss.team_id = m.home_team_id
+                        AND tss.season_id = m.season_id
+                  )
               )
-              AND EXISTS (
-                  SELECT 1 FROM league_standings ls
-                  WHERE ls.team_id = m.away_team_id
-                    AND ls.season_id = m.season_id
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM league_standings ls
+                      WHERE ls.team_id = m.away_team_id
+                        AND ls.season_id = m.season_id
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM team_squad_stats tss
+                      WHERE tss.team_id = m.away_team_id
+                        AND tss.season_id = m.season_id
+                  )
               )
             ORDER BY m.match_date DESC
         """)
