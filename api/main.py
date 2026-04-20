@@ -8,6 +8,12 @@ from dotenv import load_dotenv
 
 from routes import leagues, teams, matches, standings, squad_stats, player_stats, sync, sync_enrichment, health, auth, cleanup, predictions, venue_stats, prediction_log, markets, performance, feedback, settings, prediction_ask
 
+try:
+    from routes import soccerdata_sync
+    _soccerdata_available = True
+except ImportError:
+    _soccerdata_available = False
+
 
 load_dotenv()
 
@@ -116,6 +122,9 @@ app.include_router(performance.router,    prefix="/api/performance",      tags=[
 app.include_router(feedback.router,        prefix="/api/feedback",         tags=["Feedback"])
 app.include_router(settings.router,        prefix="/api/settings",          tags=["Settings"])
 app.include_router(prediction_ask.router,  prefix="/api/predict",          tags=["Prediction Ask"])
+
+if _soccerdata_available:
+    app.include_router(soccerdata_sync.router, prefix="/api/soccerdata", tags=["Soccerdata Sync"])
 
 
 if __name__ == "__main__":
