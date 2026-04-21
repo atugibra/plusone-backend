@@ -308,10 +308,55 @@ TEAM_NAME_ALIASES: dict[str, str] = {
 }
 
 
+import re
+
+# Common suffixes/prefixes added by different data sources that should be
+# stripped before matching. Longest/most specific first.
+_TEAM_SUFFIXES = [
+    r"\bfc$", r"\bafc$", r"\bsc$", r"\bfk$", r"\bsk$", r"\bjk$",
+    r"\bcf$", r"\bac$", r"\bbc$", r"\bif$", r"\bbk$", r"\bsv$",
+    r"\bvfl$", r"\bvfb$", r"\btsg$", r"\bfsv$",
+]
+_TEAM_PREFIXES = [
+    r"^fc\b", r"^ac\b", r"^as\b", r"^ss\b", r"^us\b", r"^rc\b",
+    r"^sc\b", r"^fk\b", r"^sk\b", r"^bk\b", r"^if\b", r"^rsc\b",
+    r"^sl\b", r"^kv\b", r"^sv\b", r"^vfl\b", r"^vfb\b", r"^tsg\b",
+    r"^ogc\b", r"^losc\b", r"^rb\b",
+]
+
+def _strip_affixes(name: str) -> str:
+    """Remove common FC/AFC/SC prefixes and suffixes so that
+    'Arsenal FC', 'FC Arsenal', and 'Arsenal' all reduce to 'arsenal'."""
+    s = name.strip().lower()
+    for pat in _TEAM_SUFFIXES:
+        s = re.sub(pat, "", s).strip()
+    for pat in _TEAM_PREFIXES:
+        s = re.sub(pat, "", s).strip()
+    return s.strip()
+
+
 def _normalize_team_name(raw: str) -> str:
     """Map external data source names → FBref canonical names.
-    Falls through unchanged if no alias is found."""
-    return TEAM_NAME_ALIASES.get(raw.strip().lower(), raw.strip())
+
+    Resolution order:
+      1. Exact alias match on raw lowercased name
+      2. Exact alias match on suffix/prefix-stripped name
+      3. Return original (DB ILIKE lookup handles the rest)
+    """
+    stripped_raw = raw.strip()
+    lower_raw    = stripped_raw.lower()
+
+    # 1. Direct alias hit
+    if lower_raw in TEAM_NAME_ALIASES:
+        return TEAM_NAME_ALIASES[lower_raw]
+
+    # 2. Alias hit after stripping suffixes/prefixes
+    stripped = _strip_affixes(stripped_raw)
+    if stripped in TEAM_NAME_ALIASES:
+        return TEAM_NAME_ALIASES[stripped]
+
+    # 3. No alias — return original so DB ILIKE can still find an exact match
+    return stripped_raw
 
 
 def _get_league(cur, name: str):
@@ -383,12 +428,25 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict, allow_create: bo
     if cache_key in team_cache:
         return team_cache[cache_key]
 
+    # Also prepare a suffix-stripped version for broader matching
+    # e.g. "Arsenal FC" → "arsenal", "FC Barcelona" → "barcelona"
+    clean_stripped = _strip_affixes(clean)
+
     # 1. Exact match within league
     cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (clean, league_id))
     res = cur.fetchone()
     if res:
         team_cache[cache_key] = res["id"]
         return res["id"]
+
+    # 1b. Suffix-stripped match within league
+    #     Catches "Arsenal FC" vs "Arsenal", "FC Porto" vs "Porto" etc.
+    if clean_stripped and clean_stripped != clean.lower():
+        cur.execute("SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1", (f"%{clean_stripped}%", league_id))
+        res = cur.fetchone()
+        if res:
+            team_cache[cache_key] = res["id"]
+            return res["id"]
 
     # 2. Cross-league fallback: team may be registered under a domestic league
     #    but also appear in enrichment data for UCL / Europa / ClubElo etc.
@@ -397,6 +455,14 @@ def _get_team(cur, name: str, league_id: int, team_cache: dict, allow_create: bo
     if res:
         team_cache[cache_key] = res["id"]
         return res["id"]
+
+    # 2b. Cross-league suffix-stripped fallback
+    if clean_stripped and clean_stripped != clean.lower():
+        cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (f"%{clean_stripped}%",))
+        res = cur.fetchone()
+        if res:
+            team_cache[cache_key] = res["id"]
+            return res["id"]
 
     # Team not found in DB at all from this point forward.
     # If the caller is ClubElo (allow_create=False), stop here — do not create a
@@ -542,24 +608,53 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
         # ── 3. Team ClubElo ─────────────────────────────────────────────────────────
         if payload.clubelo:
             for row in payload.clubelo:
+                # The extension wraps the original CSV row inside row["raw"].
+                # All team/date fields live there; ELO probabilities are in row["odds"].
                 raw_data = row.get("raw", row)
-                home = raw_data.get("Home") or raw_data.get("HomeTeam") or row.get("home")
-                away = raw_data.get("Away") or raw_data.get("AwayTeam") or row.get("away")
-                target_date = raw_data.get("Date") or row.get("date")
+                home = row.get("home") or raw_data.get("Home") or raw_data.get("HomeTeam")
+                away = row.get("away") or raw_data.get("Away") or raw_data.get("AwayTeam")
+                target_date = row.get("date") or raw_data.get("Date")
 
-                l_id = _resolve_league(row)
+                # ── ELO values ────────────────────────────────────────────────
+                # The extension sends win-probability odds, not raw ELO ratings.
+                # We store home-win probability as a proxy for relative strength.
+                odds_block = row.get("odds", {})
+                home_elo_val = safe_num(odds_block.get("home"))   # home win probability
+                away_elo_val = safe_num(odds_block.get("away"))   # away win probability
 
-                # allow_create=False: if a team is not already in the DB we skip it
-                # rather than creating it under a ClubElo-inferred league (e.g. ENG2
-                # → Championship).  Creating ghost teams here would permanently anchor
-                # the team to the wrong league, corrupting all future cross-league
-                # lookups in both _get_team (step 2) and get_or_create_team (step 2).
-                for tm, elo_val in [(home, raw_data.get("Home_Elo")), (away, raw_data.get("Away_Elo"))]:
-                    if not tm or not target_date:
+                if not home or not away or not target_date:
+                    continue
+
+                # ── League resolution ─────────────────────────────────────────
+                # ClubElo only sends "ENG" for ALL English divisions, so we CANNOT
+                # trust the league field from the extension (it maps ENG → "Premier
+                # League" for every English team regardless of actual division).
+                # Instead we resolve the league by looking up each team's ACTUAL
+                # league_id already stored in the teams table, which was populated
+                # correctly by FBref scraping.  This prevents Championship / League
+                # One / League Two teams from being misassigned to Premier League.
+                for tm, elo_val in [(home, home_elo_val), (away, away_elo_val)]:
+                    if not tm:
                         continue
-                    t_id = _get_team(cur, tm, l_id, team_cache, allow_create=False)
-                    if not t_id:
-                        continue  # team not in DB — skip rather than create ghost record
+                    clean_tm = _normalize_team_name(tm)
+
+                    # Look up team by name across ALL leagues — do NOT filter by
+                    # league_id here, because we don't know the correct league yet.
+                    cur.execute(
+                        "SELECT id, league_id FROM teams WHERE name ILIKE %s LIMIT 1",
+                        (clean_tm,)
+                    )
+                    team_row = cur.fetchone()
+
+                    if not team_row:
+                        # Team not in DB at all — skip, never create ghost records
+                        logger.debug("ClubElo: team %r not found in DB, skipping", clean_tm)
+                        continue
+
+                    t_id   = team_row["id"]
+                    # Use the team's REAL league_id from the DB, not ClubElo's guess
+                    real_league_id = team_row["league_id"]
+
                     cur.execute("""
                         INSERT INTO team_clubelo (team_id, elo_date, elo, raw_data)
                         VALUES (%s, %s, %s, %s)
@@ -567,7 +662,7 @@ def sync_enrichment(payload: SyncEnrichmentPayload, _admin: dict = Depends(requi
                             elo=EXCLUDED.elo,
                             raw_data=EXCLUDED.raw_data,
                             scraped_at=NOW()
-                    """, (t_id, target_date, safe_num(elo_val), json.dumps(row)))
+                    """, (t_id, target_date, elo_val, json.dumps(row)))
                     clubelo_count += 1
                 
         conn.commit()
