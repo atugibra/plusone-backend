@@ -467,10 +467,14 @@ def _fetch_clubelo_fixtures() -> list[dict]:
 def _insert_clubelo_rows(cur, rows: list[dict]) -> int:
     """
     Insert ClubElo fixture rows into team_clubelo.
-    Mirrors the logic inside sync_enrichment's sync_enrichment() endpoint
-    so we get identical behaviour without duplicating SQL.
+
+    Uses the same league-resolution strategy as sync_enrichment.py:
+    look up each team's REAL league from the teams table rather than
+    trusting ClubElo's country code (which uses ENG for ALL English
+    divisions, causing Premier League / Championship / League One /
+    League Two to be mixed).
     """
-    team_cache: dict = {}
+    from routes.sync_enrichment import _normalize_team_name, _strip_affixes
     count = 0
     for row in rows:
         raw = row.get("raw", row)
@@ -481,18 +485,39 @@ def _insert_clubelo_rows(cur, rows: list[dict]) -> int:
         if not home or not away or not target_date:
             continue
 
-        league_code = row.get("League") or raw.get("League", "")
-        try:
-            l_id = _get_league(cur, league_code)
-        except Exception:
-            continue
+        # ELO value: ClubElo Fixtures CSV stores home/away win probabilities
+        # in the "Home" and "Away" columns of the raw CSV row.
+        home_elo = safe_num(raw.get("Home_Elo") or raw.get("Home_Prob"))
+        away_elo = safe_num(raw.get("Away_Elo") or raw.get("Away_Prob"))
 
-        for team_name, elo_val in [(home, raw.get("Home_Elo")), (away, raw.get("Away_Elo"))]:
+        for team_name, elo_val in [(home, home_elo), (away, away_elo)]:
             if not team_name:
                 continue
-            t_id = _get_team(cur, team_name, l_id, team_cache)
-            if not t_id:
+
+            # Resolve team by name across ALL leagues — do NOT trust ClubElo's
+            # country code (ENG covers PL + Championship + L1 + L2).
+            clean = _normalize_team_name(team_name)
+            cur.execute(
+                "SELECT id FROM teams WHERE name ILIKE %s LIMIT 1",
+                (clean,)
+            )
+            team_row = cur.fetchone()
+
+            # Fallback: try suffix-stripped name (e.g. "Arsenal FC" → "Arsenal")
+            if not team_row:
+                stripped = _strip_affixes(clean)
+                if stripped and stripped != clean.lower():
+                    cur.execute(
+                        "SELECT id FROM teams WHERE name ILIKE %s LIMIT 1",
+                        (f"%{stripped}%",)
+                    )
+                    team_row = cur.fetchone()
+
+            if not team_row:
+                logger.debug("ClubElo: team %r not found in DB, skipping", clean)
                 continue
+
+            t_id = team_row["id"]
             cur.execute(
                 """
                 INSERT INTO team_clubelo (team_id, elo_date, elo, raw_data)
@@ -502,7 +527,7 @@ def _insert_clubelo_rows(cur, rows: list[dict]) -> int:
                     raw_data = EXCLUDED.raw_data,
                     scraped_at = NOW()
                 """,
-                (t_id, target_date, safe_num(elo_val), json.dumps(row)),
+                (t_id, target_date, elo_val, json.dumps(row)),
             )
             count += 1
     return count
