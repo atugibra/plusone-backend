@@ -20,7 +20,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_connection():
         p = urlparse(DATABASE_URL)
-        conn = psycopg2.connect(
+        return psycopg2.connect(
             host=p.hostname,
             port=p.port or 5432,
             dbname=p.path.lstrip("/"),
@@ -28,14 +28,8 @@ def get_connection():
             password=p.password,
             sslmode="require",
             connect_timeout=10,
-            # Prevent any single statement from holding the connection open
-            # indefinitely. 60 s is generous for even large upsert batches;
-            # runaway queries (deadlock retry loops, lock waits) are killed
-            # before Chrome's 6-connection-per-host stall window is reached.
-            options="-c statement_timeout=60000",
             cursor_factory=RealDictCursor,
         )
-        return conn
 
 
 def get_db():
