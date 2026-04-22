@@ -1,5 +1,5 @@
 """
-routes/auth.py — JWT authentication for PlusOne.
+api/routes/auth.py — JWT authentication for PlusOne (api/ mirror).
 
 Endpoints:
   POST /api/auth/register              — self-signup (open, 7-day trial)
@@ -14,10 +14,10 @@ Endpoints:
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status
+from pydantic import BaseModel
 from typing import Optional
-import os
 
-from auth_utils import hash_password, verify_password, create_access_token  # root-level, not api.auth_utils
+from auth_utils import hash_password, verify_password, create_access_token, ADMIN_TOKEN_EXPIRE_MINUTES  # root-level
 from routes.deps import get_current_user, require_admin
 from database import get_connection
 
@@ -38,8 +38,8 @@ class RegisterRequest(BaseModel):
 class PaymentRequest(BaseModel):
     payment_ref: str
     payment_amount: str
-    payment_method: str          # "MTN MoMo" | "Airtel Money" | "Bank Transfer" | etc.
-    plan: str                    # "basic" | "pro" | "elite"
+    payment_method: str
+    plan: str
 
 class CreateUserRequest(BaseModel):
     email: str
@@ -51,14 +51,13 @@ class ChangeRoleRequest(BaseModel):
     role: str
 
 class ActivateRequest(BaseModel):
-    plan: str                    # "basic" | "pro" | "elite" | "admin"
-    months: Optional[int] = 1   # how many months to activate
+    plan: str
+    months: Optional[int] = 1
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _user_row_to_dict(row: dict) -> dict:
-    """Convert a DB user row to the standard API user dict."""
     def iso(v):
         return v.isoformat() if v else None
     return {
@@ -81,10 +80,7 @@ def _user_row_to_dict(row: dict) -> dict:
 
 @router.post("/api/auth/register", status_code=201)
 def register(payload: RegisterRequest):
-    """
-    Public self-signup. Creates account with a 7-day free trial.
-    No admin involvement needed.
-    """
+    """Public self-signup. Creates account with a 7-day free trial."""
     email = payload.email.lower().strip()
     if not email:
         raise HTTPException(status_code=422, detail="Email is required.")
@@ -96,15 +92,11 @@ def register(payload: RegisterRequest):
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            INSERT INTO users (email, password_hash, role, phone, plan, is_active,
-                               trial_expires_at)
-            VALUES (%s, %s, 'user', %s, 'trial', false,
-                    NOW() + INTERVAL '7 days')
-            RETURNING id, email, role, phone, plan, is_active,
-                      trial_expires_at, subscription_expires_at,
-                      payment_ref, payment_method, payment_amount, created_at
-            """,
+            """INSERT INTO users (email, password_hash, role, phone, plan, is_active, trial_expires_at)
+               VALUES (%s, %s, 'user', %s, 'trial', false, NOW() + INTERVAL '7 days')
+               RETURNING id, email, role, phone, plan, is_active,
+                         trial_expires_at, subscription_expires_at,
+                         payment_ref, payment_method, payment_amount, created_at""",
             (email, hashed, payload.phone),
         )
         new_user = cur.fetchone()
@@ -120,7 +112,7 @@ def register(payload: RegisterRequest):
     token = create_access_token({"sub": new_user["email"], "role": new_user["role"]})
     return {
         "success": True,
-        "message": "Account created! Your 7-day free trial is now active. Submit a payment reference to subscribe after the trial.",
+        "message": "Account created! Your 7-day free trial is now active.",
         "token": token,
         "token_type": "bearer",
         "user": _user_row_to_dict(new_user),
@@ -147,19 +139,24 @@ def login(payload: LoginRequest):
     if user is None or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    token = create_access_token({"sub": user["email"], "role": user["role"]})
+    token = create_access_token(
+        {"sub": user["email"], "role": user["role"]},
+        expires_minutes=ADMIN_TOKEN_EXPIRE_MINUTES if user["role"] == "admin" else None
+    )
     
-    # [ADMIN BYPASS FIX] If the user is an admin, securely push the Permanent Master Key to them
-    # so their browser extension can bypass 30-day JWT timeouts on huge scraping uploads.
-    api_key = os.getenv("ADMIN_API_KEY") if user["role"] == "admin" else None
-    
-    return {
+    response_data = {
         "success": True,
         "token": token,
         "token_type": "bearer",
-        "api_key": api_key,
         "user": _user_row_to_dict(user),
     }
+
+    # IMPORTANT: Option A Architecture. Hand out a perpetual API Key to real admins so scraping extensions never expire
+    if user["role"] == "admin":
+        import os
+        response_data["api_key"] = os.getenv("ADMIN_API_KEY", "plusone-admin-master-key-xyz")
+
+    return response_data
 
 
 @router.post("/api/auth/payment")
@@ -167,10 +164,7 @@ def submit_payment(
     payload: PaymentRequest,
     user: dict = Depends(get_current_user),
 ):
-    """
-    User submits their payment reference for admin review.
-    Saves the reference — admin will verify and activate the plan.
-    """
+    """User submits payment reference for admin review."""
     if payload.plan not in ("basic", "pro", "elite"):
         raise HTTPException(status_code=422, detail="plan must be 'basic', 'pro', or 'elite'.")
 
@@ -196,7 +190,7 @@ def submit_payment(
 
     return {
         "success": True,
-        "message": "Payment reference received! An admin will verify and activate your plan within 24 hours.",
+        "message": "Payment reference received! Admin will verify within 24 hours.",
         "user": _user_row_to_dict(updated),
     }
 
@@ -209,26 +203,21 @@ def create_user(
     """Admin-only: create a new user or admin account directly."""
     if payload.role not in ("user", "admin"):
         raise HTTPException(status_code=422, detail="role must be 'user' or 'admin'.")
-
     email = payload.email.lower().strip()
     if not email:
         raise HTTPException(status_code=422, detail="Email is required.")
     if len(payload.password) < 8:
         raise HTTPException(status_code=422, detail="Password must be at least 8 characters.")
 
-    # Admins get is_active=true and admin plan; users get trial
     plan = "admin" if payload.role == "admin" else "trial"
     is_active = payload.role == "admin"
-
     hashed = hash_password(payload.password)
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO users (email, password_hash, role, phone, plan, is_active,
-                                  trial_expires_at)
-               VALUES (%s, %s, %s, %s, %s, %s,
-                       NOW() + INTERVAL '7 days')
+            """INSERT INTO users (email, password_hash, role, phone, plan, is_active, trial_expires_at)
+               VALUES (%s, %s, %s, %s, %s, %s, NOW() + INTERVAL '7 days')
                RETURNING id, email, role, phone, plan, is_active,
                          trial_expires_at, subscription_expires_at,
                          payment_ref, payment_method, payment_amount, created_at""",
@@ -283,7 +272,6 @@ def list_users(_admin: dict = Depends(require_admin)):
         rows = cur.fetchall()
     finally:
         conn.close()
-
     return {"users": [_user_row_to_dict(r) for r in rows]}
 
 
@@ -293,7 +281,7 @@ def activate_user(
     payload: ActivateRequest,
     _admin: dict = Depends(require_admin),
 ):
-    """Admin only — set a user's plan and activate their subscription."""
+    """Admin only — activate a user's subscription plan."""
     if payload.plan not in ("basic", "pro", "elite", "admin"):
         raise HTTPException(status_code=422, detail="plan must be 'basic', 'pro', 'elite', or 'admin'.")
     if payload.months < 1 or payload.months > 12:
@@ -322,7 +310,6 @@ def activate_user(
 
     if updated is None:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
-
     return {"success": True, "user": _user_row_to_dict(updated)}
 
 
@@ -332,7 +319,7 @@ def change_role(
     payload: ChangeRoleRequest,
     _admin: dict = Depends(require_admin),
 ):
-    """Admin only — change a user's role between 'user' and 'admin'."""
+    """Admin only — change a user's role."""
     if payload.role not in ("user", "admin"):
         raise HTTPException(status_code=422, detail="role must be 'user' or 'admin'.")
     conn = get_connection()
@@ -349,7 +336,6 @@ def change_role(
         raise HTTPException(status_code=500, detail="Failed to update role.")
     finally:
         conn.close()
-
     if updated is None:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
     return {"success": True, "user": dict(updated)}
@@ -360,7 +346,7 @@ def delete_user(
     user_id: int,
     admin: dict = Depends(require_admin),
 ):
-    """Admin only — delete a user account. Cannot delete yourself."""
+    """Admin only — delete a user account."""
     if admin["id"] == user_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account.")
     conn = get_connection()
@@ -374,7 +360,6 @@ def delete_user(
         raise HTTPException(status_code=500, detail="Failed to delete user.")
     finally:
         conn.close()
-
     if deleted is None:
         raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
     return {"success": True, "deleted_id": user_id}
