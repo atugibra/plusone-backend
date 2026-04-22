@@ -25,6 +25,9 @@ from passlib.context import CryptContext
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production-use-a-long-random-string")
 ALGORITHM  = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+# Admin sessions get a much longer lifetime so overnight batch scrapes (which can
+# run for several hours) are never killed mid-run by token expiry.
+ADMIN_TOKEN_EXPIRE_MINUTES = int(os.getenv("ADMIN_TOKEN_EXPIRE_MINUTES", str(60 * 24)))
 
 # ── Password hashing ──────────────────────────────────────────────────────────
 
@@ -47,6 +50,7 @@ def create_access_token(data: dict, expires_minutes: Optional[int] = None) -> st
     """
     Sign and return a JWT containing `data`.
     The token expires in `expires_minutes` minutes (default: ACCESS_TOKEN_EXPIRE_MINUTES).
+    Pass ADMIN_TOKEN_EXPIRE_MINUTES for admin logins so long batch scrapes never expire.
     """
     payload = data.copy()
     expire  = datetime.now(timezone.utc) + timedelta(
