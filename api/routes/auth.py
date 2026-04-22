@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 from typing import Optional
 
-from auth_utils import hash_password, verify_password, create_access_token  # root-level
+from auth_utils import hash_password, verify_password, create_access_token, ADMIN_TOKEN_EXPIRE_MINUTES  # root-level
 from routes.deps import get_current_user, require_admin
 from database import get_connection
 
@@ -139,7 +139,10 @@ def login(payload: LoginRequest):
     if user is None or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    token = create_access_token({"sub": user["email"], "role": user["role"]})
+    token = create_access_token(
+        {"sub": user["email"], "role": user["role"]},
+        expires_minutes=ADMIN_TOKEN_EXPIRE_MINUTES if user["role"] == "admin" else None
+    )
     
     response_data = {
         "success": True,
