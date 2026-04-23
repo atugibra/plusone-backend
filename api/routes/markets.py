@@ -500,8 +500,10 @@ def get_markets(
     lam_h = result.get("exp_home_goals", 1.35)
     lam_a = result.get("exp_away_goals", 1.10)
 
+    from ml.market_calculator import _override_1x2
     pricer = MarketPricer(lam_h, lam_a, n_sim=n_sim)
     sheet  = pricer.full_sheet()
+    sheet["1x2"] = _override_1x2(sheet["1x2"], result["calibrated"])
 
     return {
         "fixture": {
