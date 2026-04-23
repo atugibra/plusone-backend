@@ -62,6 +62,11 @@ LEAGUE_AVG_GOALS = 1.35
 _dc_predictor = None
 _dc_meta: dict = {}
 
+# Shared training-state dict — written by both _auto_train (here) and
+# _run_dc_training (routes/markets.py) so the /dc/status endpoint always
+# reflects the true state regardless of which code path kicked off training.
+dc_training_state: dict = {}
+
 
 def _get_lookback_months() -> int:
     """
@@ -945,7 +950,14 @@ def train_dc_model() -> dict:
         except Exception as exc:
             log.warning("DC live calibration after train failed: %s", exc)
         # — Persist to Supabase so the model survives redeploys —
-        saved = save_to_db(predictor, name="dc_model")
+        saved = save_to_db(
+        predictor,
+        name="dc_model",
+        n_samples=predictor.n_matches,
+        n_features=len(predictor.team_names) * 2,
+        train_accuracy=float(_dc_meta.get("log_likelihood", 0) or 0),
+        cv_accuracy=float(_dc_meta.get("calibrator_samples", 0) or 0),
+    )
         if saved:
             log.info("DC model saved to Supabase ml_models table.")
         else:
@@ -979,6 +991,7 @@ def dc_status() -> dict:
 # Auto-load or auto-train on startup (non-blocking daemon thread)
 def _auto_train():
     global _dc_predictor, _dc_meta
+    import time as _time
     # 1️⃣  Try loading the saved model from Supabase first (fast cold-start)
     try:
         loaded = load_from_db(name="dc_model")
@@ -990,19 +1003,29 @@ def _auto_train():
                 "trained_at": "(loaded from Supabase)",
                 "elapsed_s":  0,
             }
+            dc_training_state.clear()
+            dc_training_state.update({"status": "done", "result": {"trained": True, "source": "supabase"}})
             log.info("DC model loaded from Supabase (%d teams).", len(loaded.team_names))
             return
     except Exception as e:
         log.warning("DC Supabase load failed, will train from scratch: %s", e)
 
     # 2️⃣  No saved model found — train from DB data
+    dc_training_state.clear()
+    dc_training_state.update({"status": "running", "started_at": _time.time()})
     try:
         result = train_dc_model()
         if result.get("trained"):
+            dc_training_state.clear()
+            dc_training_state.update({"status": "done", "result": result})
             log.info("DC auto-train complete: %d matches", result.get("n_matches", 0))
         else:
+            dc_training_state.clear()
+            dc_training_state.update({"status": "error", "error": result.get("error", "unknown")})
             log.warning("DC auto-train failed: %s", result.get("error"))
     except Exception as e:
+        dc_training_state.clear()
+        dc_training_state.update({"status": "error", "error": str(e)})
         log.warning("DC auto-train exception (will retry on next /train call): %s", e)
 
 import threading
