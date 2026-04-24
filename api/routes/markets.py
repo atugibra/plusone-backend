@@ -19,21 +19,25 @@ import time
 
 from database import get_connection
 from ml.dc_engine  import (predict_dc_match, train_dc_model,
-                            dc_status, get_dc_predictor)
+                            dc_status, get_dc_predictor,
+                            dc_training_state as _dc_training_state)
 from ml.markets    import MarketPricer, ValueDetector, ArbitrageScanner
 
 router = APIRouter()
 log = logging.getLogger(__name__)
 
 # ─── Training state (persistent thread, survives navigation) ──────────────────
-_dc_training_state: dict = {}
+# _dc_training_state is imported from ml.dc_engine so that both the manual
+# /dc/train route and the startup _auto_train thread write to the same object.
 
 def _run_dc_training():
-    global _dc_training_state, _upcoming_cache
-    _dc_training_state = {"status": "running", "started_at": time.time()}
+    global _upcoming_cache
+    _dc_training_state.clear()
+    _dc_training_state.update({"status": "running", "started_at": time.time()})
     try:
         result = train_dc_model()
-        _dc_training_state = {"status": "done", "result": result}
+        _dc_training_state.clear()
+        _dc_training_state.update({"status": "done", "result": result})
         # Bust the upcoming cache so Free Picks reflects the new model immediately
         _upcoming_cache = {"data": None, "expires_at": 0.0}
         if result.get("trained"):
@@ -41,7 +45,8 @@ def _run_dc_training():
         else:
             log.error("DC retrain failed: %s", result.get("error"))
     except Exception as e:
-        _dc_training_state = {"status": "error", "error": str(e)}
+        _dc_training_state.clear()
+        _dc_training_state.update({"status": "error", "error": str(e)})
         log.error("DC training exception: %s", e)
 
 
@@ -590,6 +595,22 @@ def scan_arbitrage(req: ArbRequest):
 def get_dc_status():
     """Current DC model status."""
     st = dc_status()
+
+    # If stuck "running" for more than 10 minutes, auto-reset (handles Railway
+    # cold-starts where the process was killed mid-train)
+    if _dc_training_state.get("status") == "running":
+        started = _dc_training_state.get("started_at", 0)
+        if time.time() - started > 600:  # 10 min timeout
+            _dc_training_state.clear()
+        else:
+            st["training_status"] = "running"
+    elif "status" in _dc_training_state:
+        st["training_status"] = _dc_training_state["status"]
+
+    return st
+def get_dc_status():
+    """Current DC model status."""
+    st = dc_status()
     # If the background thread is currently training, tell the frontend so polling continues
     if _dc_training_state.get("status") == "running":
         st["training_status"] = "running"
@@ -606,7 +627,6 @@ def train_dc():
     Train (or retrain) the DC + Elo + xG ensemble from DB data.
     Runs asynchronously in a daemon thread so it survives frontend disconnects.
     """
-    global _dc_training_state
     if _dc_training_state.get("status") == "running":
         return {"message": "DC model training is already running."}
 
