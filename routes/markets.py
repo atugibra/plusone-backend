@@ -596,43 +596,83 @@ def get_dc_status():
     """Current DC model status."""
     st = dc_status()
 
-    # If stuck "running" for more than 10 minutes, auto-reset (handles Railway
-    # cold-starts where the process was killed mid-train)
     if _dc_training_state.get("status") == "running":
         started = _dc_training_state.get("started_at", 0)
-        if time.time() - started > 600:  # 10 min timeout
+        # BUG FIX: old timeout was 600s (10 min). With 28k matches + 921 teams
+        # the Dixon-Coles optimizer legitimately takes 15-40 min. Increased to
+        # 2700s (45 min) so the status doesn't flip to empty mid-training and
+        # confuse the frontend into thinking training is done when it isn't.
+        if time.time() - started > 2700:  # 45 min hard timeout
             _dc_training_state.clear()
+            log.warning("DC training state auto-cleared after 45 min timeout.")
         else:
+            elapsed_min = round((time.time() - started) / 60, 1)
             st["training_status"] = "running"
+            st["training_elapsed_min"] = elapsed_min
     elif "status" in _dc_training_state:
         st["training_status"] = _dc_training_state["status"]
 
     return st
-def get_dc_status():
-    """Current DC model status."""
-    st = dc_status()
-    # If the background thread is currently training, tell the frontend so polling continues
-    if _dc_training_state.get("status") == "running":
-        st["training_status"] = "running"
-    elif "status" in _dc_training_state:
-        st["training_status"] = _dc_training_state["status"]
-    return st
 
 
-# ─── POST /api/markets/dc/train ──────────────────────────────────────────────
+# ─── POST /api/markets/dc/train ────────────────────────────────────────────────────
 
 @router.post("/dc/train")
-def train_dc():
+def train_dc(force: bool = False):
     """
     Train (or retrain) the DC + Elo + xG ensemble from DB data.
     Runs asynchronously in a daemon thread so it survives frontend disconnects.
+
+    ?force=true  — skip the 6-hour freshness guard and retrain unconditionally.
     """
     if _dc_training_state.get("status") == "running":
-        return {"message": "DC model training is already running."}
+        elapsed = round((time.time() - _dc_training_state.get("started_at", 0)) / 60, 1)
+        return {"message": f"DC model training is already running ({elapsed} min elapsed)."}
+
+    # Freshness guard: skip retrain if model was loaded/trained within the last 6 hours.
+    # The most common cause of the stuck-"running" bug is repeated /dc/train calls
+    # triggering 28k-match Dixon-Coles retrains that Railway kills before they finish.
+    # With ?force=true this guard is bypassed for explicit manual retrains.
+    if not force:
+        from ml.dc_engine import _dc_meta
+        trained_at = _dc_meta.get("trained_at", "")
+        if trained_at and trained_at != "(loaded from Supabase)":
+            # trained_at is an ISO timestamp from a fresh train run
+            try:
+                import datetime
+                trained_dt = datetime.datetime.fromisoformat(trained_at)
+                age_hours = (datetime.datetime.utcnow() - trained_dt).total_seconds() / 3600
+                if age_hours < 6:
+                    return {
+                        "message": f"DC model is fresh (trained {age_hours:.1f}h ago). "
+                                   f"Use ?force=true to retrain unconditionally.",
+                        "skipped": True,
+                    }
+            except Exception:
+                pass
 
     thread = threading.Thread(target=_run_dc_training, daemon=True)
     thread.start()
     return {"message": "DC model training started in background thread."}
+
+
+# ─── POST /api/markets/dc/reset-status ────────────────────────────────────────────
+
+@router.post("/dc/reset-status")
+def reset_dc_status():
+    """
+    Manually clear a stuck training_status (e.g. 'running' that never resolved).
+    Safe to call at any time — if training is genuinely in progress it will
+    simply lose its status tracking but the background thread keeps running.
+    Call GET /dc/status afterwards to confirm the state is cleared.
+    """
+    prev = dict(_dc_training_state)
+    _dc_training_state.clear()
+    log.info("DC training state manually reset. Previous state: %s", prev)
+    return {
+        "message": "Training status cleared.",
+        "previous_state": prev,
+    }
 
 
 # ─── GET /api/markets/dc/predict ─────────────────────────────────────────────
