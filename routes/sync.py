@@ -445,10 +445,15 @@ def get_or_create_team(cur, name, league_id):
     """
     Always stores teams with CLEAN names (no FBref country suffixes).
     Lookup order:
-      1. Exact clean name match in this league
-      2. Exact clean name match in any league (UEFA cross-league teams)
-      3. Dirty suffix variant already in DB → rename it, return its id
-      4. Insert brand-new clean record
+      1. Exact clean name match in THIS league (fastest path, no ambiguity)
+      2. Exact clean name match in ANY league (UEFA cross-league teams).
+         Prefer the record with the LOWEST league_id (domestic leagues are
+         inserted first and therefore have lower IDs), then shortest name
+         as a tiebreaker. This makes the lookup deterministic even when a
+         team exists in multiple league rows (e.g. Man City under PL AND UCL).
+      3. Dirty suffix variant in DB → rename it and return its id.
+         Same deterministic ordering applied.
+      4. Insert brand-new clean record.
     Any dirty record found in step 3 is renamed on the spot so the DB
     self-heals on every scrape, even without running the migration SQL.
     """
@@ -470,7 +475,7 @@ def get_or_create_team(cur, name, league_id):
         except ImportError:
             pass  # silently continue without alias map
 
-    # 1. Exact clean match within this league (fastest path)
+    # 1. Exact clean match within this league (fastest path, no ambiguity)
     cur.execute(
         "SELECT id FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1",
         (clean, league_id)
@@ -479,8 +484,16 @@ def get_or_create_team(cur, name, league_id):
     if row:
         return row["id"]
 
-    # 2. Exact clean match across all leagues (UEFA teams stored under domestic league)
-    cur.execute("SELECT id FROM teams WHERE name ILIKE %s LIMIT 1", (clean,))
+    # 2. Exact clean match across all leagues (UEFA teams stored under domestic league).
+    #    BUG FIX: was plain LIMIT 1 with no ORDER BY — PostgreSQL returns rows in
+    #    undefined physical order, causing non-deterministic resolution when a team
+    #    exists under multiple leagues (e.g. Man City under PL AND UCL).
+    #    Fix: ORDER BY league_id ASC (domestic leagues = lower IDs inserted first)
+    #    then LENGTH(name) ASC as a tiebreaker (prefer shorter canonical name).
+    cur.execute(
+        "SELECT id FROM teams WHERE name ILIKE %s ORDER BY league_id ASC, LENGTH(name) ASC LIMIT 1",
+        (clean,)
+    )
     row = cur.fetchone()
     if row:
         return row["id"]
@@ -489,8 +502,9 @@ def get_or_create_team(cur, name, league_id):
     #    Covers cases like DB has "AEK Athens gr" but we're looking up "AEK Athens".
     #    Also covers the reverse: we received "AEK Athens gr" and DB has "AEK Athens".
     #    We match on: name starts with clean AND the remainder is a known suffix pattern.
+    #    BUG FIX: same deterministic ordering as step 2.
     cur.execute(
-        "SELECT id, name FROM teams WHERE name ILIKE %s LIMIT 1",
+        "SELECT id, name FROM teams WHERE name ILIKE %s ORDER BY league_id ASC, LENGTH(name) ASC LIMIT 1",
         (f"{clean} %",)   # "AEK Athens %" matches "AEK Athens gr"
     )
     row = cur.fetchone()
@@ -501,9 +515,9 @@ def get_or_create_team(cur, name, league_id):
         return row["id"]
 
     # Also check if the name we received was clean but DB has dirty version
-    # e.g. we received "Aberdeen" but DB has "Aberdeen sct"
+    # e.g. we received "Aberdeen" but DB has "Aberdeen sct" — within this league
     cur.execute(
-        "SELECT id, name FROM teams WHERE name ILIKE %s AND league_id = %s LIMIT 1",
+        "SELECT id, name FROM teams WHERE name ILIKE %s AND league_id = %s ORDER BY LENGTH(name) ASC LIMIT 1",
         (f"{clean} %", league_id)
     )
     row = cur.fetchone()

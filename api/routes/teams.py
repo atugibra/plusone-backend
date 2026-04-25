@@ -10,37 +10,50 @@ def list_teams(league_id: Optional[int] = None):
     Return teams for the dropdown selector.
 
     When a league_id is provided we return ALL teams that have appeared in
-    matches for that competition — not just teams registered under that
-    league_id.  This is critical for cross-league competitions like UEFA
-    Europa League or Champions League where Bologna, Aston Villa etc. are
-    registered under their domestic league (Serie A / Premier League) but
-    need to appear in the Europa League dropdown.
+    ANY match for that competition across ALL seasons — not just the latest.
 
-    Without this fix, any European competition shows zero teams in the
-    selector because no team is *stored* under the UEFA league_id.
+    Rationale for removing the season filter:
+      - UEFA competitions use season labels like "2024-25" while domestic
+        leagues use "2024-2025". String-sorted LIMIT N windows are fragile
+        and cause UEFA teams to vanish whenever a new domestic season starts.
+      - The correct intent is: show every team that has ever played in this
+        competition. Relegated/promoted filtering makes sense for domestic
+        leagues but NOT for knock-out/group-stage UEFA competitions where
+        the participant list changes entirely each season.
+      - DISTINCT ON (normalised name) already collapses duplicate name
+        variants (e.g. "Arsenal" vs "Arsenal FC") to one row.
+
+    For European competitions like the Conference League this was the primary
+    cause of seeing only a subset of the ~36 participants: if a match was
+    stored under a season name not in the LIMIT 2 window it was invisible.
     """
     conn = get_connection()
     cur  = conn.cursor()
     if league_id:
-        # Return teams from CURRENT SEASON only (avoids relegated/promoted teams).
-        # Also picks the SHORTER name variant to prefer "Arsenal" over "Arsenal FC".
+        # Expanded suffix list covers common UEFA club name prefixes/suffixes
+        # that FBref inconsistently includes: BSC, GNK, NK, AS, AC, RC, RB,
+        # VfL, VfB, TSG, RCD, UD, SD.  Without stripping these, DISTINCT ON
+        # would treat "Young Boys" and "BSC Young Boys" as two different teams
+        # and keep both (or worse, drop the one the user expects to see).
         cur.execute("""
-            WITH current_season AS (
-                SELECT id FROM seasons ORDER BY name DESC LIMIT 1
-            )
             SELECT DISTINCT ON (LOWER(REGEXP_REPLACE(t.name,
-                    '\\s*(FC|AFC|SC|FK|SK|CF|SV)\\s*$', '', 'i')))
+                    '^\\s*(BSC|GNK|NK|AS|SS|AC|RC|RB|VfL|VfB|TSG|RCD|UD|SD)\\s+|'
+                    '\\s*(FC|AFC|SC|FK|SK|CF|SV|AC|RC|AS|NK|GNK|RB|SS)\\s*$',
+                    '', 'i')))
                 t.id, t.name, t.logo_url,
                 t.league_id AS domestic_league_id,
                 dl.name     AS league
             FROM teams t
             JOIN leagues dl ON dl.id = t.league_id
             JOIN matches m  ON (m.home_team_id = t.id OR m.away_team_id = t.id)
-            JOIN current_season cs ON m.season_id = cs.id
             WHERE m.league_id = %s
             ORDER BY
-                LOWER(REGEXP_REPLACE(t.name, '\\s*(FC|AFC|SC|FK|SK|CF|SV)\\s*$', '', 'i')),
-                LENGTH(t.name) ASC
+                LOWER(REGEXP_REPLACE(t.name,
+                    '^\\s*(BSC|GNK|NK|AS|SS|AC|RC|RB|VfL|VfB|TSG|RCD|UD|SD)\\s+|'
+                    '\\s*(FC|AFC|SC|FK|SK|CF|SV|AC|RC|AS|NK|GNK|RB|SS)\\s*$',
+                    '', 'i')),
+                LENGTH(t.name) ASC,
+                t.id ASC
         """, (league_id,))
     else:
         cur.execute("""
