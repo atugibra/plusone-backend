@@ -191,7 +191,8 @@ class DataCache:
             SELECT team_id, player_name, injury_type, return_date
             FROM player_injuries
             WHERE return_date IS NULL
-               OR return_date >= CURRENT_DATE - INTERVAL '7 days'
+               OR (return_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                   AND return_date::date >= CURRENT_DATE - INTERVAL '7 days')
         """)
         self.injuries: Dict[int, List] = defaultdict(list)
         for r in cur.fetchall():
