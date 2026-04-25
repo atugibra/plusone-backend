@@ -186,7 +186,18 @@ class DataCache:
                 if sid > existing_sid:
                     self.squad_fallback[fb_key] = row
 
-        # 3. Player stats — top 25 by minutes per team/season ──────────────
+        # 3. Player injuries — active injuries per team ────────────────────
+        cur.execute("""
+            SELECT team_id, player_name, injury_type, return_date
+            FROM player_injuries
+            WHERE return_date IS NULL
+               OR return_date >= CURRENT_DATE - INTERVAL '7 days'
+        """)
+        self.injuries: Dict[int, List] = defaultdict(list)
+        for r in cur.fetchall():
+            self.injuries[r["team_id"]].append(dict(r))
+
+        # 4. Player stats — top 25 by minutes per team/season ──────────────
         # Sorted by minutes played so all positions (GK, DF, MF, FW) are
         # represented proportionally, not just top scorers.
         cur.execute(
@@ -534,6 +545,9 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
         # Squad-wide
         "squad_avg_age", "squad_depth",
         "minutes_concentration",
+        # GK individual
+        "gk_save_pct_player", "gk_clean_sheet_rate_player",
+        "gk_goals_prevented", "gk_psxg_per90", "gk_mins",
     ]}
     if not players:
         return zero
@@ -633,6 +647,22 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
 
     gk_games = _f(gks[0].get("games")) if gks else 0.0
 
+    # ── Individual GK quality from player stats ─────────────────────────────
+    # These complement the team-level gk_save_pct from squad_stats.
+    # squad_stats gives aggregate; player stats gives primary keeper's individual stats.
+    if gks:
+        gk1 = sorted(gks, key=lambda p: _f(p.get("minutes")), reverse=True)[0]
+        gk1_ss = gk1.get("standard_stats") if isinstance(
+                     gk1.get("standard_stats"), dict) else {}
+        gk_save_pct_player   = _f(gk1_ss.get("gk_save_pct"),    0.0)
+        gk_clean_sheet_rate  = _f(gk1_ss.get("gk_clean_sheet_pct"), 0.0)
+        gk_goals_prevented   = _f(gk1_ss.get("gk_goals_prevented"), 0.0)  # PSxG-GA
+        gk_psxg_per90        = _f(gk1_ss.get("gk_psxg_per90"),    0.0)
+        gk_mins              = _f(gk1.get("minutes"),              0.0)
+    else:
+        gk_save_pct_player = gk_clean_sheet_rate = 0.0
+        gk_goals_prevented = gk_psxg_per90 = gk_mins = 0.0
+
     # ── assemble result ───────────────────────────────────────────────────────
     return {
         # ── original features (unchanged names) ───────────────────────────
@@ -661,6 +691,12 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
         "squad_avg_age":               squad_avg_age,
         "squad_depth":                 float(squad_depth),
         "minutes_concentration":       minutes_concentration,
+        # ── individual GK quality (primary keeper) ───────────────────────
+        "gk_save_pct_player":          gk_save_pct_player,
+        "gk_clean_sheet_rate_player":  gk_clean_sheet_rate,
+        "gk_goals_prevented":          gk_goals_prevented,
+        "gk_psxg_per90":               gk_psxg_per90,
+        "gk_mins":                     gk_mins,
     }
 
 
@@ -912,6 +948,86 @@ def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_
     return feats
 
 
+# ─── Injury features ─────────────────────────────────────────────────────────
+
+def _build_injury_features(cache: DataCache, team_id: int,
+                            player_rows: List[dict]) -> dict:
+    """
+    Build injury-impact features from player_injuries table.
+
+    Cross-references active injuries against the team's top-25 player list
+    to estimate squad availability and key-player absence risk.
+
+    Features:
+      n_injuries          — raw count of active injured players
+      injury_severity     — weighted count (muscle/ligament = 1.5, minor = 0.5)
+      squad_availability  — % of usual starters expected to be available
+      key_player_injured  — 1.0 if top-3-by-minutes player is injured
+      gk_injured          — 1.0 if the first-choice GK is injured
+      attack_injured      — count of injured FW/attackers
+      mid_injured         — count of injured MF/midfielders
+    """
+    zero = {
+        "n_injuries":         0.0,
+        "injury_severity":    0.0,
+        "squad_availability": 1.0,
+        "key_player_injured": 0.0,
+        "gk_injured":         0.0,
+        "attack_injured":     0.0,
+        "mid_injured":        0.0,
+    }
+    injuries = cache.injuries.get(team_id, [])
+    if not injuries:
+        return zero
+
+    # Severity weights by injury type keyword
+    def _severity(inj_type: str) -> float:
+        t = str(inj_type or "").lower()
+        if any(k in t for k in ("acl", "ligament", "fracture", "surgery", "torn")):
+            return 2.0   # long-term
+        if any(k in t for k in ("muscle", "hamstring", "thigh", "calf", "groin")):
+            return 1.5   # medium-term
+        if any(k in t for k in ("knock", "minor", "illness", "doubt", "fitness")):
+            return 0.5   # short-term
+        return 1.0       # unknown/other
+
+    injured_names = {str(i["player_name"]).lower().strip() for i in injuries}
+    n_inj = len(injuries)
+    severity = sum(_severity(i.get("injury_type")) for i in injuries)
+
+    # Cross-reference with squad (top 25 by minutes)
+    key_injured   = 0.0
+    gk_injured    = 0.0
+    atk_injured   = 0.0
+    mid_injured   = 0.0
+    injured_mins  = 0.0
+    total_mins    = sum(_f(p.get("minutes")) for p in player_rows) or 1
+
+    for i, p in enumerate(player_rows):
+        pname = str(p.get("player_name") or "").lower().strip()
+        if pname not in injured_names:
+            continue
+        pos = _pos_bucket(p.get("position", ""))
+        mins = _f(p.get("minutes"))
+        injured_mins += mins
+        if i < 3:              key_injured   = 1.0   # top-3 by minutes = key player
+        if pos == "GK":        gk_injured    = 1.0
+        if pos == "FW":        atk_injured  += 1.0
+        if pos == "MF":        mid_injured  += 1.0
+
+    squad_availability = max(0.0, 1.0 - _safe_div(injured_mins, total_mins))
+
+    return {
+        "n_injuries":         float(n_inj),
+        "injury_severity":    severity,
+        "squad_availability": squad_availability,
+        "key_player_injured": key_injured,
+        "gk_injured":         gk_injured,
+        "attack_injured":     atk_injured,
+        "mid_injured":        mid_injured,
+    }
+
+
 # ─── Full team feature builder (in-memory) ────────────────────────────────────
 
 def _build_team_features(cache: DataCache, team_id: int,
@@ -1104,7 +1220,9 @@ def _build_team_features(cache: DataCache, team_id: int,
     )
 
     # 5. Player features
+    player_rows = cache.players.get((team_id, season_id), [])
     feats.update(_build_player_features(cache, team_id, season_id))
+    feats.update(_build_injury_features(cache, team_id, player_rows))
 
     # 6. Previous season
     feats.update(_build_prev_season_features(cache, team_id, league_id))

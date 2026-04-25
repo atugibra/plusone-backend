@@ -19,7 +19,8 @@ import joblib
 
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
+from scipy.stats import mstats
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
@@ -52,7 +53,8 @@ class EnsemblePredictor:
 
     def __init__(self):
         self.feature_names_ = None
-        self.scaler_ = StandardScaler()
+        self.scaler_ = RobustScaler(quantile_range=(5.0, 95.0))  # robust to outliers vs StandardScaler
+        self._winsor_limits: dict = {}  # per-feature (low, high) clips
         self.is_trained = False
         self.train_accuracy = None
         self.cv_accuracy = None
@@ -146,6 +148,21 @@ class EnsemblePredictor:
 
         self.feature_names_ = feature_names or [f"f{i}" for i in range(X.shape[1])]
         self.n_samples = len(y)
+
+        # ── Winsorize at 1st / 99th percentile per feature ─────────────────
+        # Clips extreme values (e.g. a 7-0 blowout skewing goals_for_pg,
+        # or ELO=2100 after a hot streak) without removing the match.
+        # Limits are stored and applied identically at inference time.
+        self._winsor_limits = {}
+        for col_idx in range(X.shape[1]):
+            col = X[:, col_idx]
+            finite_vals = col[np.isfinite(col)]
+            if len(finite_vals) == 0:
+                continue
+            lo = float(np.percentile(finite_vals, 1))
+            hi = float(np.percentile(finite_vals, 99))
+            self._winsor_limits[col_idx] = (lo, hi)
+            X[:, col_idx] = np.clip(col, lo, hi)
 
         X_scaled = self.scaler_.fit_transform(X)
 
@@ -288,6 +305,10 @@ class EnsemblePredictor:
         inds = np.where(~np.isfinite(X))
         X[inds] = np.take(col_means, inds[1])
 
+        # Apply same winsorization thresholds learned during training
+        for col_idx, (lo, hi) in self._winsor_limits.items():
+            if col_idx < X.shape[1]:
+                X[:, col_idx] = np.clip(X[:, col_idx], lo, hi)
         X_scaled = self.scaler_.transform(X)
         proba = self.model.predict_proba(X_scaled)[0]
 

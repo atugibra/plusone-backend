@@ -74,14 +74,20 @@ def _safe_div(a, b, default=0.0):
 
 def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
     """
-    Lightweight heuristic prediction from league_standings + team_squad_stats.
-    Returns {home_win, draw, away_win, predicted_outcome}.
-    Falls back to equal probs on any error.
+    Lightweight heuristic prediction.
+    Inputs (all single SQL queries, no heavy feature engineering):
+      1. league_standings  — win rate, goals/game  (original signals)
+      2. team_squad_stats  — goals/game            (original signal)
+      3. matches (last 5) — recent form pts/game   (NEW)
+      4. matches (h2h 8)  — H2H win rate           (NEW)
+
+    Blending weights keep this heuristic — no ML, just a strength ratio.
     """
     import numpy as np  # lazy import
     FALLBACK = {"home_win": 0.35, "draw": 0.30, "away_win": 0.35,
                 "predicted_outcome": "Home Win"}
     try:
+        # ── 1. Standings ──────────────────────────────────────────────────────
         cur.execute("""
             SELECT ls.wins, ls.ties, ls.losses, ls.games,
                    ls.goals_for, ls.goals_against, ls.points
@@ -100,6 +106,7 @@ def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
         """, (away_team_id,))
         a_st = cur.fetchone()
 
+        # ── 2. Squad stats ────────────────────────────────────────────────────
         cur.execute("""
             SELECT ts.goals, ts.games, ts.possession
             FROM   team_squad_stats ts
@@ -116,6 +123,64 @@ def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
         """, (away_team_id,))
         a_sq = cur.fetchone()
 
+        # ── 3. Recent form — last 5 matches (NEW) ─────────────────────────────
+        # Points per game from last 5: win=3, draw=1, loss=0
+        # Gives a momentum signal the season standings can't capture.
+        def _form_ppg(team_id: int) -> float:
+            cur.execute("""
+                SELECT home_team_id, away_team_id, home_score, away_score
+                FROM   matches
+                WHERE  (home_team_id = %s OR away_team_id = %s)
+                  AND  home_score IS NOT NULL
+                ORDER  BY match_date DESC
+                LIMIT  5
+            """, (team_id, team_id))
+            rows = cur.fetchall()
+            if not rows:
+                return 1.2  # neutral default (40% win rate × 3pts)
+            pts = 0
+            for r in rows:
+                if r["home_team_id"] == team_id:
+                    gf, ga = r["home_score"], r["away_score"]
+                else:
+                    gf, ga = r["away_score"], r["home_score"]
+                pts += 3 if gf > ga else (1 if gf == ga else 0)
+            return pts / len(rows)  # 0–3 scale
+
+        h_form = _form_ppg(home_team_id)
+        a_form = _form_ppg(away_team_id)
+
+        # ── 4. Head-to-head — last 8 meetings (NEW) ───────────────────────────
+        # H2H home win rate as a nudge factor.
+        # Low weight (10%) to avoid overfitting on small samples.
+        cur.execute("""
+            SELECT home_team_id, away_team_id, home_score, away_score
+            FROM   matches
+            WHERE  ((home_team_id = %s AND away_team_id = %s)
+                 OR (home_team_id = %s AND away_team_id = %s))
+              AND  home_score IS NOT NULL
+            ORDER  BY match_date DESC
+            LIMIT  8
+        """, (home_team_id, away_team_id, away_team_id, home_team_id))
+        h2h_rows = cur.fetchall()
+
+        h2h_home_wins = h2h_draws = h2h_away_wins = 0
+        for r in h2h_rows:
+            # Normalise: always from the perspective of home_team_id
+            if r["home_team_id"] == home_team_id:
+                gf, ga = r["home_score"], r["away_score"]
+            else:
+                gf, ga = r["away_score"], r["home_score"]
+            if gf > ga:   h2h_home_wins += 1
+            elif gf == ga: h2h_draws    += 1
+            else:          h2h_away_wins += 1
+
+        h2h_total  = h2h_home_wins + h2h_draws + h2h_away_wins or 1
+        h2h_h_rate = h2h_home_wins / h2h_total   # 0–1
+        h2h_d_rate = h2h_draws     / h2h_total
+        h2h_a_rate = h2h_away_wins / h2h_total
+
+        # ── Base strength from original signals ───────────────────────────────
         h_gpg = _safe_div(h_sq["goals"] if h_sq else 0,
                            h_sq["games"] if h_sq else 1, 1.2)
         a_gpg = _safe_div(a_sq["goals"] if a_sq else 0,
@@ -125,47 +190,64 @@ def _run_legacy_engine(cur, home_team_id: int, away_team_id: int) -> dict:
         a_wr  = _safe_div(a_st["wins"] if a_st else 0,
                            a_st["games"] if a_st else 1, 0.35)
 
-        h_str = 0.6 * h_gpg + 0.4 * h_wr
-        a_str = 0.6 * a_gpg + 0.4 * a_wr
+        # Normalise form to 0–1 scale (max possible = 3.0 pts/game)
+        h_form_n = h_form / 3.0
+        a_form_n = a_form / 3.0
+
+        # ── Blended strength score ─────────────────────────────────────────────
+        # Original: 0.6 × gpg + 0.4 × wr
+        # New:      0.45 × gpg + 0.30 × wr + 0.25 × form  (form replaces some gpg weight)
+        # H2H applied as a separate nudge AFTER normalisation (keeps it lightweight)
+        h_str = 0.45 * h_gpg + 0.30 * h_wr + 0.25 * h_form_n
+        a_str = 0.45 * a_gpg + 0.30 * a_wr + 0.25 * a_form_n
         total = h_str + a_str + 0.001
 
+        # ── Draw rate ─────────────────────────────────────────────────────────
         h_ties = h_st["ties"] if h_st else 0
         a_ties = a_st["ties"] if a_st else 0
         h_g    = h_st["games"] if h_st else 1
         a_g    = a_st["games"] if a_st else 1
-        
+
         base_draw_rate = (h_ties + a_ties) / (h_g + a_g) if (h_g + a_g) > 0 else 0.25
+        # Blend with H2H draw rate when we have enough H2H data
+        if h2h_total >= 4:
+            base_draw_rate = 0.7 * base_draw_rate + 0.3 * h2h_d_rate
         base_draw_rate = max(0.15, min(0.35, base_draw_rate))
 
         strength_gap = abs(h_str - a_str) / total
         r_d = base_draw_rate * (1.0 - (strength_gap * 0.7))
 
-        r_h = (h_str / total) + 0.04
+        r_h = (h_str / total) + 0.04   # home advantage nudge
         r_a = (a_str / total) - 0.04
 
         scale = (1.0 - r_d) / (r_h + r_a) if (r_h + r_a) > 0 else 1.0
         r_h *= scale
         r_a *= scale
 
+        # ── H2H nudge (10% weight, only when 4+ meetings exist) ───────────────
+        if h2h_total >= 4:
+            r_h = 0.90 * r_h + 0.10 * h2h_h_rate
+            r_a = 0.90 * r_a + 0.10 * h2h_a_rate
+            r_d = 0.90 * r_d + 0.10 * h2h_d_rate
+
         r_h = max(0.05, r_h)
         r_a = max(0.05, r_a)
         r_d = max(0.05, r_d)
 
-        s   = r_h + r_a + r_d
+        s      = r_h + r_a + r_d
         home_p = round(r_h / s, 4)
         away_p = round(r_a / s, 4)
         draw_p = round(r_d / s, 4)
 
-        probs = [home_p, draw_p, away_p]
-        idx   = int(np.argmax(probs))
+        probs   = [home_p, draw_p, away_p]
+        idx     = int(np.argmax(probs))
         outcome = OUTCOME_LABELS[idx]
 
         return {
-            "home_win":        home_p,
-            "draw":            draw_p,
-            "away_win":        away_p,
+            "home_win":          home_p,
+            "draw":              draw_p,
+            "away_win":          away_p,
             "predicted_outcome": outcome,
-            # Expose simple xG proxies for market computation
             "home_xg": round(min(max(h_gpg * 1.05, 0.30), 4.0), 2),
             "away_xg": round(min(max(a_gpg * 0.95, 0.30), 4.0), 2),
         }
