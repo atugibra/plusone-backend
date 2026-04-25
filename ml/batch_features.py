@@ -75,56 +75,6 @@ def _filter_before(matches, before_date):
     return [m for m in matches if _to_date(m.get("match_date")) and _to_date(m.get("match_date")) < bd]
 
 
-def _compute_league_style_before(cache: "DataCache", league_id: int, before_date) -> dict:
-    """
-    Compute league-style features using only matches that completed BEFORE
-    `before_date`.  This is the temporally-correct version for training data:
-    when we build features for a match played on date D, we must only use
-    league history up to D-1, otherwise results from matches played after D
-    leak into the feature vector for that sample.
-
-    During inference (before_date is None) the pre-computed full-corpus
-    cache.league_style is returned directly — it is always safe at prediction
-    time because no label exists yet.
-    """
-    if not before_date:
-        # Inference path: no target date, use full corpus (no leakage risk)
-        return cache.league_style.get(league_id, dict(_LEAGUE_STYLE_DEFAULTS))
-
-    bd = _to_date(before_date)
-    if not bd:
-        return cache.league_style.get(league_id, dict(_LEAGUE_STYLE_DEFAULTS))
-
-    rows = cache._league_buckets.get(league_id, [])
-    n = hw = d = aw = btts = 0
-    total_goals = 0.0
-    for r in rows:
-        rd = _to_date(r.get("match_date"))
-        if rd and rd < bd:
-            n           += 1
-            hw          += r["hw"]
-            d           += r["d"]
-            aw          += r["aw"]
-            total_goals += r["goals"]
-            btts        += r["btts"]
-
-    if n < 10:
-        return dict(_LEAGUE_STYLE_DEFAULTS)
-
-    hw_r = hw / n
-    aw_r = aw / n
-    return {
-        "league_home_win_rate":        round(hw_r,            4),
-        "league_draw_rate":            round(d / n,           4),
-        "league_away_win_rate":        round(aw_r,            4),
-        "league_goals_pg":             round(total_goals / n, 4),
-        "league_btts_rate":            round(btts / n,        4),
-        "league_home_advantage_score": round(
-            _safe_div(hw_r, aw_r, _LEAGUE_STYLE_DEFAULTS["league_home_advantage_score"]), 4
-        ),
-    }
-
-
 # ─── Data Cache ────────────────────────────────────────────────────────────────
 
 class DataCache:
@@ -236,7 +186,18 @@ class DataCache:
                 if sid > existing_sid:
                     self.squad_fallback[fb_key] = row
 
-        # 3. Player stats — top 25 by minutes per team/season ──────────────
+        # 3. Player injuries — active injuries per team ────────────────────
+        cur.execute("""
+            SELECT team_id, player_name, injury_type, return_date
+            FROM player_injuries
+            WHERE return_date IS NULL
+               OR return_date >= CURRENT_DATE - INTERVAL '7 days'
+        """)
+        self.injuries: Dict[int, List] = defaultdict(list)
+        for r in cur.fetchall():
+            self.injuries[r["team_id"]].append(dict(r))
+
+        # 4. Player stats — top 25 by minutes per team/season ──────────────
         # Sorted by minutes played so all positions (GK, DF, MF, FW) are
         # represented proportionally, not just top scorers.
         cur.execute(
@@ -301,14 +262,9 @@ class DataCache:
         """)
         self.all_matches: List[dict] = [dict(r) for r in cur.fetchall()]
 
-        # Index by team — newest-first, cap at 50 per team to bound memory.
-        # ORDERING IS CRITICAL: all_matches arrives ORDER BY match_date DESC from
-        # the DB query above, so iterating in that order guarantees the 50-cap
-        # retains the most recent games (which _filter_before / form queries need).
-        # If the order were reversed the cap would silently drop recent games and
-        # _filter_before would produce empty results for recent training matches.
+        # Index by team — cap at 50 per team to bound memory
         self.matches_by_team: Dict[int, List] = defaultdict(list)
-        for m in self.all_matches:  # already DESC by match_date from SQL
+        for m in self.all_matches:
             if len(self.matches_by_team[m["home_team_id"]]) < 50:
                 self.matches_by_team[m["home_team_id"]].append(m)
             if len(self.matches_by_team[m["away_team_id"]]) < 50:
@@ -386,22 +342,9 @@ class DataCache:
         )
 
         # 7. Compute league-style statistics in-memory from already-loaded matches.
-        # ── League style ──────────────────────────────────────────────────────
-        # IMPORTANT — temporal integrity:
-        # self.league_style is computed from ALL matches in the 4-year window.
-        # During TRAINING this would leak future results into each sample's
-        # league-style features (e.g. a 2022 match would see 2023/24 league rates).
-        #
-        # To fix this we store the raw per-match aggregation buckets so that
-        # _build_match_features can call _compute_league_style_before(cache, lid, date)
-        # which only counts matches strictly before the target match date.
-        #
-        # During INFERENCE (match_date=None or a future date) the full corpus
-        # is safe to use because no label exists yet — we use self.league_style
-        # as a fast path in that case.
-        self.league_style: Dict[int, dict] = {}       # full-corpus version (inference)
-        self._league_buckets: Dict[int, List[dict]] = defaultdict(list)  # per-match rows
-
+        # This reuses self.all_matches — no additional DB query needed.
+        # Keyed by league_id → dict of 6 style features.
+        self.league_style: Dict[int, dict] = {}
         _by_league: Dict[int, dict] = defaultdict(lambda: {
             "n": 0, "hw": 0, "d": 0, "aw": 0, "total_goals": 0.0, "btts": 0
         })
@@ -413,19 +356,10 @@ class DataCache:
             bucket = _by_league[lid]
             bucket["n"] += 1
             bucket["total_goals"] += hs + as_
-            if hs > as_:    bucket["hw"] += 1
+            if hs > as_:   bucket["hw"] += 1
             elif hs == as_: bucket["d"]  += 1
             else:           bucket["aw"] += 1
             if hs > 0 and as_ > 0: bucket["btts"] += 1
-            # Store minimal per-match row for the time-filtered path
-            self._league_buckets[lid].append({
-                "match_date": m.get("match_date"),
-                "hw":   1 if hs > as_  else 0,
-                "d":    1 if hs == as_ else 0,
-                "aw":   1 if hs < as_  else 0,
-                "goals": hs + as_,
-                "btts": 1 if hs > 0 and as_ > 0 else 0,
-            })
 
         for lid, b in _by_league.items():
             n = b["n"]
@@ -611,6 +545,9 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
         # Squad-wide
         "squad_avg_age", "squad_depth",
         "minutes_concentration",
+        # GK individual
+        "gk_save_pct_player", "gk_clean_sheet_rate_player",
+        "gk_goals_prevented", "gk_psxg_per90", "gk_mins",
     ]}
     if not players:
         return zero
@@ -710,6 +647,22 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
 
     gk_games = _f(gks[0].get("games")) if gks else 0.0
 
+    # ── Individual GK quality from player stats ─────────────────────────────
+    # These complement the team-level gk_save_pct from squad_stats.
+    # squad_stats gives aggregate; player stats gives primary keeper's individual stats.
+    if gks:
+        gk1 = sorted(gks, key=lambda p: _f(p.get("minutes")), reverse=True)[0]
+        gk1_ss = gk1.get("standard_stats") if isinstance(
+                     gk1.get("standard_stats"), dict) else {}
+        gk_save_pct_player   = _f(gk1_ss.get("gk_save_pct"),    0.0)
+        gk_clean_sheet_rate  = _f(gk1_ss.get("gk_clean_sheet_pct"), 0.0)
+        gk_goals_prevented   = _f(gk1_ss.get("gk_goals_prevented"), 0.0)  # PSxG-GA
+        gk_psxg_per90        = _f(gk1_ss.get("gk_psxg_per90"),    0.0)
+        gk_mins              = _f(gk1.get("minutes"),              0.0)
+    else:
+        gk_save_pct_player = gk_clean_sheet_rate = 0.0
+        gk_goals_prevented = gk_psxg_per90 = gk_mins = 0.0
+
     # ── assemble result ───────────────────────────────────────────────────────
     return {
         # ── original features (unchanged names) ───────────────────────────
@@ -738,6 +691,12 @@ def _build_player_features(cache: DataCache, team_id: int, season_id: int) -> di
         "squad_avg_age":               squad_avg_age,
         "squad_depth":                 float(squad_depth),
         "minutes_concentration":       minutes_concentration,
+        # ── individual GK quality (primary keeper) ───────────────────────
+        "gk_save_pct_player":          gk_save_pct_player,
+        "gk_clean_sheet_rate_player":  gk_clean_sheet_rate,
+        "gk_goals_prevented":          gk_goals_prevented,
+        "gk_psxg_per90":               gk_psxg_per90,
+        "gk_mins":                     gk_mins,
     }
 
 
@@ -893,10 +852,8 @@ def _build_venue_stats(cache: DataCache, team_id: int, season_id: int) -> dict:
 def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_date, home_team_id: int, away_team_id: int, league_id: int) -> dict:
     feats = {}
     
-    # Missing Odds fallback values based on league baseline stats.
-    # Use _compute_league_style_before so the fallback rates only reflect
-    # matches played before this fixture — no future-result leakage.
-    style = _compute_league_style_before(cache, league_id, match_date)
+    # Missing Odds fallback values based on league baseline stats
+    style = cache.league_style.get(league_id, dict(_LEAGUE_STYLE_DEFAULTS))
     btts_rate = style.get("league_btts_rate", 0.50)
     hw_rate   = style.get("league_home_win_rate", 0.44)
     aw_rate   = style.get("league_away_win_rate", 0.31)
@@ -989,6 +946,86 @@ def _build_enrichment_features(cache: DataCache, match_id: Optional[int], match_
     feats["clubelo_away_prob"]   = ae_aw if ae_aw > 0 else (aw_rate/hw_sum)
     
     return feats
+
+
+# ─── Injury features ─────────────────────────────────────────────────────────
+
+def _build_injury_features(cache: DataCache, team_id: int,
+                            player_rows: List[dict]) -> dict:
+    """
+    Build injury-impact features from player_injuries table.
+
+    Cross-references active injuries against the team's top-25 player list
+    to estimate squad availability and key-player absence risk.
+
+    Features:
+      n_injuries          — raw count of active injured players
+      injury_severity     — weighted count (muscle/ligament = 1.5, minor = 0.5)
+      squad_availability  — % of usual starters expected to be available
+      key_player_injured  — 1.0 if top-3-by-minutes player is injured
+      gk_injured          — 1.0 if the first-choice GK is injured
+      attack_injured      — count of injured FW/attackers
+      mid_injured         — count of injured MF/midfielders
+    """
+    zero = {
+        "n_injuries":         0.0,
+        "injury_severity":    0.0,
+        "squad_availability": 1.0,
+        "key_player_injured": 0.0,
+        "gk_injured":         0.0,
+        "attack_injured":     0.0,
+        "mid_injured":        0.0,
+    }
+    injuries = cache.injuries.get(team_id, [])
+    if not injuries:
+        return zero
+
+    # Severity weights by injury type keyword
+    def _severity(inj_type: str) -> float:
+        t = str(inj_type or "").lower()
+        if any(k in t for k in ("acl", "ligament", "fracture", "surgery", "torn")):
+            return 2.0   # long-term
+        if any(k in t for k in ("muscle", "hamstring", "thigh", "calf", "groin")):
+            return 1.5   # medium-term
+        if any(k in t for k in ("knock", "minor", "illness", "doubt", "fitness")):
+            return 0.5   # short-term
+        return 1.0       # unknown/other
+
+    injured_names = {str(i["player_name"]).lower().strip() for i in injuries}
+    n_inj = len(injuries)
+    severity = sum(_severity(i.get("injury_type")) for i in injuries)
+
+    # Cross-reference with squad (top 25 by minutes)
+    key_injured   = 0.0
+    gk_injured    = 0.0
+    atk_injured   = 0.0
+    mid_injured   = 0.0
+    injured_mins  = 0.0
+    total_mins    = sum(_f(p.get("minutes")) for p in player_rows) or 1
+
+    for i, p in enumerate(player_rows):
+        pname = str(p.get("player_name") or "").lower().strip()
+        if pname not in injured_names:
+            continue
+        pos = _pos_bucket(p.get("position", ""))
+        mins = _f(p.get("minutes"))
+        injured_mins += mins
+        if i < 3:              key_injured   = 1.0   # top-3 by minutes = key player
+        if pos == "GK":        gk_injured    = 1.0
+        if pos == "FW":        atk_injured  += 1.0
+        if pos == "MF":        mid_injured  += 1.0
+
+    squad_availability = max(0.0, 1.0 - _safe_div(injured_mins, total_mins))
+
+    return {
+        "n_injuries":         float(n_inj),
+        "injury_severity":    severity,
+        "squad_availability": squad_availability,
+        "key_player_injured": key_injured,
+        "gk_injured":         gk_injured,
+        "attack_injured":     atk_injured,
+        "mid_injured":        mid_injured,
+    }
 
 
 # ─── Full team feature builder (in-memory) ────────────────────────────────────
@@ -1183,7 +1220,9 @@ def _build_team_features(cache: DataCache, team_id: int,
     )
 
     # 5. Player features
+    player_rows = cache.players.get((team_id, season_id), [])
     feats.update(_build_player_features(cache, team_id, season_id))
+    feats.update(_build_injury_features(cache, team_id, player_rows))
 
     # 6. Previous season
     feats.update(_build_prev_season_features(cache, team_id, league_id))
@@ -1240,11 +1279,9 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
             vector[k] = _f(v)
 
     # ── League-style context (6 features) ──────────────────────────────────
-    # Use _compute_league_style_before so training samples only see league
-    # history prior to the match date (no future-result leakage).
-    # At inference time (match_date=None) this falls through to the full-corpus
-    # cache.league_style, which is identical to the old behaviour.
-    style = _compute_league_style_before(cache, league_id, match_date)
+    # Mirrors feature_engineering.compute_league_style() — same keys so the
+    # trained model sees the same feature names at inference time.
+    style = cache.league_style.get(league_id, dict(_LEAGUE_STYLE_DEFAULTS))
     vector.update(style)
 
     # ── League-relative team strength (4 features) ─────────────────────────
@@ -1333,8 +1370,8 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
 
     # Domestic league strength proxy: avg goals/game in each team's home league.
     # Higher = more open/attacking league. Helps compare teams from different leagues.
-    home_dom_style = _compute_league_style_before(cache, home_domestic_lid, match_date) if home_domestic_lid else dict(_LEAGUE_STYLE_DEFAULTS)
-    away_dom_style = _compute_league_style_before(cache, away_domestic_lid, match_date) if away_domestic_lid else dict(_LEAGUE_STYLE_DEFAULTS)
+    home_dom_style = cache.league_style.get(home_domestic_lid, dict(_LEAGUE_STYLE_DEFAULTS)) if home_domestic_lid else dict(_LEAGUE_STYLE_DEFAULTS)
+    away_dom_style = cache.league_style.get(away_domestic_lid, dict(_LEAGUE_STYLE_DEFAULTS)) if away_domestic_lid else dict(_LEAGUE_STYLE_DEFAULTS)
 
     vector["home_domestic_league_goals_pg"]      = _f(home_dom_style.get("league_goals_pg", 2.70))
     vector["away_domestic_league_goals_pg"]      = _f(away_dom_style.get("league_goals_pg", 2.70))

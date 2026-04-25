@@ -19,9 +19,8 @@ import joblib
 
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import RobustScaler
+from scipy.stats import mstats
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.utils.class_weight import compute_sample_weight
@@ -54,10 +53,8 @@ class EnsemblePredictor:
 
     def __init__(self):
         self.feature_names_ = None
-        # scaler_ kept for backward-compat with saved models that used it directly;
-        # new code routes everything through self.pipeline_ instead.
-        self.scaler_ = StandardScaler()
-        self.pipeline_ = None   # set in train(); used for CV and final predict
+        self.scaler_ = RobustScaler(quantile_range=(5.0, 95.0))  # robust to outliers vs StandardScaler
+        self._winsor_limits: dict = {}  # per-feature (low, high) clips
         self.is_trained = False
         self.train_accuracy = None
         self.cv_accuracy = None
@@ -143,27 +140,31 @@ class EnsemblePredictor:
         X = np.array(X, dtype=float)
         y = np.array(y, dtype=int)
 
-        # Replace ±inf with nan so SimpleImputer can handle them uniformly.
-        # Do NOT compute global col_means here — that would leak test-fold
-        # statistics into CV.  Imputation is now part of the Pipeline and
-        # fits only on each fold's training split.
-        X[~np.isfinite(X)] = np.nan
+        # Replace inf/nan with column means
+        col_means = np.nanmean(np.where(np.isfinite(X), X, np.nan), axis=0)
+        col_means = np.nan_to_num(col_means, nan=0.0)
+        inds = np.where(~np.isfinite(X))
+        X[inds] = np.take(col_means, inds[1])
 
         self.feature_names_ = feature_names or [f"f{i}" for i in range(X.shape[1])]
         self.n_samples = len(y)
 
-        # Build the full preprocessing + model pipeline.
-        # Keeping imputer + scaler inside the Pipeline guarantees they are
-        # re-fit from scratch on each CV training fold, preventing any
-        # test-fold statistics from leaking into preprocessing.
-        self.pipeline_ = Pipeline([
-            ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler",  StandardScaler()),
-            ("model",   self.model),
-        ])
-        # Keep self.scaler_ in sync for predict_proba backward compat
-        # (old saved models without pipeline_ will still work via the
-        #  legacy branch in predict_proba below).
+        # ── Winsorize at 1st / 99th percentile per feature ─────────────────
+        # Clips extreme values (e.g. a 7-0 blowout skewing goals_for_pg,
+        # or ELO=2100 after a hot streak) without removing the match.
+        # Limits are stored and applied identically at inference time.
+        self._winsor_limits = {}
+        for col_idx in range(X.shape[1]):
+            col = X[:, col_idx]
+            finite_vals = col[np.isfinite(col)]
+            if len(finite_vals) == 0:
+                continue
+            lo = float(np.percentile(finite_vals, 1))
+            hi = float(np.percentile(finite_vals, 99))
+            self._winsor_limits[col_idx] = (lo, hi)
+            X[:, col_idx] = np.clip(col, lo, hi)
+
+        X_scaled = self.scaler_.fit_transform(X)
 
         # Balanced sample weights
         sample_weights = compute_sample_weight(class_weight="balanced", y=y)
@@ -237,8 +238,8 @@ class EnsemblePredictor:
             groups = None
 
         cv_kwargs = dict(
-            estimator=self.pipeline_,
-            X=X,           # raw (nan-replaced) — pipeline handles impute+scale per fold
+            estimator=self.model,
+            X=X_scaled,
             y=y,
             cv=cv_splitter,
             scoring="accuracy",
@@ -247,17 +248,13 @@ class EnsemblePredictor:
         if groups is not None:
             cv_kwargs["groups"] = groups
 
-        # Try sklearn >= 1.4 params= API, then fit_params=, then no weights.
-        # IMPORTANT: because cross_val_score wraps self.pipeline_ (not the bare
-        # model), the sample_weight key must be namespaced through the pipeline
-        # step name: "model__sample_weight", not bare "sample_weight".
-        # Using the bare key silently drops weights — they route nowhere.
+        # Try sklearn >= 1.4 params= API, then fit_params=, then no weights
         for params_key in ("params", "fit_params", None):
             try:
                 if params_key:
                     cv_scores = cross_val_score(
                         **cv_kwargs,
-                        **{params_key: {"model__sample_weight": sample_weights}},
+                        **{params_key: {"sample_weight": sample_weights}},
                     )
                 else:
                     cv_scores = cross_val_score(**cv_kwargs)
@@ -269,25 +266,18 @@ class EnsemblePredictor:
 
         self.cv_accuracy = float(np.mean(cv_scores))
 
-        # Final fit on all data using the pipeline (imputer + scaler + model).
-        # This is the only place fit_transform is called on the full dataset,
-        # which is correct — we're building the production model, not evaluating it.
-        self.pipeline_.fit(X, y, model__sample_weight=sample_weights)
+        # Final fit on all data — all estimators receive the full feature matrix
+        self.model.fit(X_scaled, y, sample_weight=sample_weights)
 
-        # Keep self.scaler_ pointing at the fitted scaler inside the pipeline
-        # so that old code paths / serialised models that reference scaler_ still work.
-        self.scaler_ = self.pipeline_.named_steps["scaler"]
-
-        y_pred = self.pipeline_.predict(X)
+        y_pred = self.model.predict(X_scaled)
         self.train_accuracy = float(accuracy_score(y, y_pred))
         self.is_trained = True
 
-        # Feature importances from XGBoost (accessed via pipeline's model step)
+        # Feature importances from XGBoost
         try:
-            voting_clf = self.pipeline_.named_steps["model"]
-            xgb_model = voting_clf.named_estimators_.get("xgb")
+            xgb_model = self.model.named_estimators_.get("xgb")
             if xgb_model is None:
-                xgb_model = voting_clf.estimators_[0]
+                xgb_model = self.model.estimators_[0]
             imps = xgb_model.feature_importances_
             self.feature_importances_ = {
                 name: float(imp)
@@ -308,22 +298,21 @@ class EnsemblePredictor:
             raise RuntimeError("Model not trained. Call train() or load() first.")
 
         X = np.array(x, dtype=float).reshape(1, -1)
-        X[~np.isfinite(X)] = np.nan
 
-        # Use pipeline when available (models trained after the leakage fix);
-        # fall back to the legacy bare-scaler path for older saved models.
-        if self.pipeline_ is not None:
-            proba = self.pipeline_.predict_proba(X)[0]
-            classes = self.pipeline_.named_steps["model"].classes_
-        else:
-            col_means = np.nan_to_num(
-                np.nanmean(np.where(np.isfinite(X), X, np.nan), axis=0), nan=0.0
-            )
-            inds = np.where(~np.isfinite(X))
-            X[inds] = np.take(col_means, inds[1])
-            X_scaled = self.scaler_.transform(X)
-            proba = self.model.predict_proba(X_scaled)[0]
-            classes = self.model.classes_
+        col_means = np.nan_to_num(
+            np.nanmean(np.where(np.isfinite(X), X, np.nan), axis=0), nan=0.0
+        )
+        inds = np.where(~np.isfinite(X))
+        X[inds] = np.take(col_means, inds[1])
+
+        # Apply same winsorization thresholds learned during training
+        for col_idx, (lo, hi) in self._winsor_limits.items():
+            if col_idx < X.shape[1]:
+                X[:, col_idx] = np.clip(X[:, col_idx], lo, hi)
+        X_scaled = self.scaler_.transform(X)
+        proba = self.model.predict_proba(X_scaled)[0]
+
+        classes = self.model.classes_
         prob_map = {int(c): float(p) for c, p in zip(classes, proba)}
         hw = prob_map.get(0, 0.33)
         dr = prob_map.get(1, 0.33)
