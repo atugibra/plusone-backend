@@ -303,7 +303,15 @@ class FeedbackCalibrator:
             return
         try:
             from database import get_connection
-            byte_data = pickle.dumps(self._cal)
+            # Pickle a full state dict so that load() can restore n_holdout and
+            # pre_accuracy — previously only the calibrator object was pickled,
+            # causing those fields to always come back as 0/None after a restart.
+            state = {
+                "cal":           self._cal,
+                "n_holdout":     self.n_holdout,
+                "pre_accuracy":  self.pre_accuracy,
+            }
+            byte_data = pickle.dumps(state)
             conn = get_connection()
             cur  = conn.cursor()
             # Store post_accuracy as positive when improvement, negative when not.
@@ -320,7 +328,8 @@ class FeedbackCalibrator:
             """, (self.DB_KEY, byte_data, self.n_samples, stored_acc))
             conn.commit()
             conn.close()
-            log.info("FeedbackCalibrator saved to DB (improvement=%s).", self.is_improvement)
+            log.info("FeedbackCalibrator saved to DB (improvement=%s, n_holdout=%d).",
+                     self.is_improvement, self.n_holdout)
         except Exception as exc:
             log.warning("FeedbackCalibrator.save() failed: %s", exc)
 
@@ -338,7 +347,21 @@ class FeedbackCalibrator:
             conn.close()
             if not row or not row["model_bytes"]:
                 return False
-            self._cal           = pickle.loads(row["model_bytes"])
+
+            unpickled = pickle.loads(row["model_bytes"])
+
+            # Backwards-compatible unpickling: new format is a state dict
+            # {cal, n_holdout, pre_accuracy}; old format is the raw calibrator object.
+            if isinstance(unpickled, dict):
+                self._cal         = unpickled.get("cal")
+                self.n_holdout    = int(unpickled.get("n_holdout") or 0)
+                self.pre_accuracy = unpickled.get("pre_accuracy")  # may be None for old rows
+            else:
+                # Old pickle format — just the _IsotonicCalibrator object
+                self._cal         = unpickled
+                self.n_holdout    = 0     # unknown from old format
+                self.pre_accuracy = None  # unknown from old format
+
             self.n_samples      = int(row["n_samples"] or 0)
             stored_acc          = float(row["cv_accuracy"] or 0)
             # Negative stored value means calibrator was saved but did not improve accuracy
@@ -349,8 +372,8 @@ class FeedbackCalibrator:
                 f"holdout_acc={self.post_accuracy*100:.1f}%, "
                 f"active={self.is_improvement}"
             )
-            log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%, improvement=%s)",
-                     self.n_samples, self.post_accuracy * 100, self.is_improvement)
+            log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%, holdout=%d, improvement=%s)",
+                     self.n_samples, self.post_accuracy * 100, self.n_holdout, self.is_improvement)
             return True
         except Exception as exc:
             # Silently skip on fresh deployments where ml_models table doesn't exist yet
@@ -387,14 +410,26 @@ def recalibrate_with_feedback():
     Fits the feedback calibrator from prediction_log and reloads the singleton.
     Silently skips if there aren't enough evaluated predictions yet.
     """
+    global _calibrator
     cal = FeedbackCalibrator()
     result = cal.fit_from_db()
     if result.get("success"):
         cal.save()
-        reset_calibrator()  # force singleton reload on next prediction
+        # BUG FIX: previously called reset_calibrator() here, which cleared the
+        # singleton and forced a DB reload on the next get_calibrator() call.
+        # The DB reload lost n_holdout and pre_accuracy (save() didn't persist
+        # them in the old format), so calibrator-debug showed nulls immediately
+        # after a successful recalibrate.
+        #
+        # Fix: assign the freshly fitted in-memory calibrator directly as the
+        # singleton.  It already has all fields populated correctly.  The DB
+        # state (now including n_holdout + pre_accuracy in the state dict) will
+        # be correct on the NEXT process restart too.
+        _calibrator = cal
         log.info(
-            "recalibrate_with_feedback: %d samples, %.1f%% → %.1f%%",
+            "recalibrate_with_feedback: %d samples, holdout=%d, %.1f%% → %.1f%%",
             cal.n_samples,
+            cal.n_holdout,
             result["pre_accuracy_pct"],
             result["post_accuracy_pct"],
         )
