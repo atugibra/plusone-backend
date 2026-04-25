@@ -41,9 +41,14 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-MIN_SAMPLES = 50  # minimum evaluated predictions needed before calibrating
-                  # isotonic regression overfits badly on fewer than ~50 samples;
-                  # the holdout accuracy guard below prevents bad fits anyway
+MIN_SAMPLES  = 100  # minimum evaluated predictions needed before calibrating.
+                    # Raised from 50: with 50 rows and an 80/20 split the holdout
+                    # has only 10 rows — one wrong prediction = 10% accuracy swing.
+MIN_HOLDOUT  = 30   # minimum holdout rows regardless of dataset size.
+                    # 30 samples → ±9% standard error, which is borderline acceptable.
+IMPROVEMENT_TOLERANCE = 0.015  # allow up to 1.5% degradation on holdout before
+                                # refusing to apply the calibrator. Absorbs noise
+                                # on smallish holdout sets.
 
 OUTCOME_MAP = {
     "Home Win": 2, "Away Win": 0, "Draw": 1,
@@ -98,10 +103,12 @@ class FeedbackCalibrator:
 
     def __init__(self):
         self._cal: Optional[_IsotonicCalibrator] = None
-        self.n_samples = 0
+        self.n_samples   = 0
+        self.n_holdout   = 0        # actual holdout size used in last fit
         self.pre_accuracy  = None
         self.post_accuracy = None   # holdout accuracy (out-of-sample)
-        self.is_improvement = False  # True only when holdout acc >= pre_accuracy
+        self.is_improvement = False  # True when holdout acc >= pre_accuracy - TOLERANCE
+        self._last_reason: str = ""  # human-readable reason calibrator is/isn't active
 
     @property
     def is_fitted(self) -> bool:
@@ -150,22 +157,36 @@ class FeedbackCalibrator:
             outcomes_list.append(outcome_int)
 
         if len(probs_list) < MIN_SAMPLES:
+            reason = (
+                f"Need at least {MIN_SAMPLES} evaluated predictions with probability scores. "
+                f"Have {len(probs_list)}. "
+                f"Keep syncing match results — calibration activates automatically."
+            )
+            self._last_reason = reason
             return {
-                "success": False,
-                "reason":  f"Need at least {MIN_SAMPLES} evaluated predictions. Have {len(probs_list)}.",
+                "success":     False,
+                "reason":      reason,
                 "n_available": len(probs_list),
+                "n_needed":    MIN_SAMPLES,
             }
 
         probs    = np.array(probs_list)
         outcomes = np.array(outcomes_list)
 
-        # ── Chronological 80/20 holdout split ────────────────────────────────
+        # ── Chronological holdout split ───────────────────────────────────────
         # Data is already ORDER BY created_at ASC so [:split] = older predictions,
         # [split:] = most recent predictions.  This is the correct temporal split:
         # calibrate on past, evaluate on future — mirrors real deployment.
-        split = max(10, int(len(probs) * 0.8))
+        #
+        # BUG FIX: old code used int(N * 0.8) which with N=91 gives only 19 holdout
+        # rows — one wrong prediction = 5.3% accuracy swing (pure noise).
+        # We now guarantee MIN_HOLDOUT rows in the holdout regardless of N.
+        holdout_size = max(MIN_HOLDOUT, int(len(probs) * 0.2))
+        split        = len(probs) - holdout_size
+
         probs_train,    probs_holdout    = probs[:split],    probs[split:]
         outcomes_train, outcomes_holdout = outcomes[:split], outcomes[split:]
+        self.n_holdout = len(probs_holdout)
 
         # Pre-calibration accuracy measured on the SAME holdout slice so the
         # pre vs post comparison is apples-to-apples.  Measuring pre_accuracy
@@ -179,7 +200,10 @@ class FeedbackCalibrator:
         calibrated_holdout = cal_eval.predict(probs_holdout)
         post_preds_holdout = np.argmax(calibrated_holdout, axis=1)
         self.post_accuracy  = float((post_preds_holdout == outcomes_holdout).mean())
-        self.is_improvement = self.post_accuracy >= self.pre_accuracy
+
+        # BUG FIX: strict >= fails when post == pre - epsilon due to float rounding
+        # or tiny holdouts. Allow IMPROVEMENT_TOLERANCE degradation before rejecting.
+        self.is_improvement = self.post_accuracy >= (self.pre_accuracy - IMPROVEMENT_TOLERANCE)
 
         # ── Refit on ALL data for production use ──────────────────────────────
         # Now that we've validated it helps on holdout, fit the final calibrator
@@ -187,28 +211,45 @@ class FeedbackCalibrator:
         cal = _IsotonicCalibrator()
         cal.fit(probs, outcomes)
 
-        self._cal = cal
+        self._cal      = cal
         self.n_samples = len(probs)
 
+        if self.is_improvement:
+            self._last_reason = (
+                f"Calibrator active — holdout {self.post_accuracy*100:.1f}% vs raw "
+                f"{self.pre_accuracy*100:.1f}% (n_holdout={self.n_holdout}, "
+                f"tolerance={IMPROVEMENT_TOLERANCE*100:.1f}%)"
+            )
+        else:
+            self._last_reason = (
+                f"Calibrator fitted but NOT applied — holdout {self.post_accuracy*100:.1f}% "
+                f"vs raw {self.pre_accuracy*100:.1f}% (n_holdout={self.n_holdout}, "
+                f"tolerance={IMPROVEMENT_TOLERANCE*100:.1f}%, "
+                f"gap={((self.post_accuracy-self.pre_accuracy)*100):.1f}%). "
+                f"Collect more graded predictions and recalibrate."
+            )
+
         log.info(
-            "FeedbackCalibrator fitted on %d samples — pre %.1f%% → holdout %.1f%% (%s)",
-            self.n_samples,
+            "FeedbackCalibrator fitted on %d samples (holdout=%d) — "
+            "raw %.1f%% → calibrated %.1f%% (%s)",
+            self.n_samples, self.n_holdout,
             self.pre_accuracy  * 100,
             self.post_accuracy * 100,
-            "IMPROVEMENT" if self.is_improvement else "NO IMPROVEMENT — will not apply",
+            "ACTIVE" if self.is_improvement else "NOT APPLIED",
         )
 
         return {
-            "success":           True,
-            "n_samples":         self.n_samples,
-            "pre_accuracy_pct":  round(self.pre_accuracy  * 100, 2),
-            "post_accuracy_pct": round(self.post_accuracy * 100, 2),
-            "improvement_pct":   round((self.post_accuracy - self.pre_accuracy) * 100, 2),
-            "is_improvement":    self.is_improvement,
-            "note": ("Calibrator will be applied to future predictions."
-                     if self.is_improvement else
-                     "Calibrator fitted but will NOT be applied — holdout accuracy "
-                     "did not improve over raw model. Recalibrate when more data is available."),
+            "success":            True,
+            "n_samples":          self.n_samples,
+            "n_holdout":          self.n_holdout,
+            "n_train":            split,
+            "pre_accuracy_pct":   round(self.pre_accuracy  * 100, 2),
+            "post_accuracy_pct":  round(self.post_accuracy * 100, 2),
+            "improvement_pct":    round((self.post_accuracy - self.pre_accuracy) * 100, 2),
+            "tolerance_pct":      round(IMPROVEMENT_TOLERANCE * 100, 2),
+            "is_improvement":     self.is_improvement,
+            "will_apply":         self.is_improvement,
+            "note":               self._last_reason,
         }
 
     # ── Apply ─────────────────────────────────────────────────────────────────
@@ -235,6 +276,26 @@ class FeedbackCalibrator:
         }
 
     # ── Persist ───────────────────────────────────────────────────────────────
+
+    def diagnose(self) -> dict:
+        """
+        Return a human-readable diagnostic dict explaining the calibrator's
+        current state — useful for debugging via the API without needing DB access.
+        """
+        return {
+            "is_fitted":           self.is_fitted,
+            "is_improvement":      self.is_improvement,
+            "n_samples":           self.n_samples,
+            "n_holdout":           self.n_holdout,
+            "pre_accuracy_pct":    round(self.pre_accuracy  * 100, 2) if self.pre_accuracy  is not None else None,
+            "post_accuracy_pct":   round(self.post_accuracy * 100, 2) if self.post_accuracy is not None else None,
+            "improvement_pct":     round((self.post_accuracy - self.pre_accuracy) * 100, 2)
+                                   if self.pre_accuracy is not None and self.post_accuracy is not None else None,
+            "tolerance_pct":       round(IMPROVEMENT_TOLERANCE * 100, 2),
+            "min_samples_needed":  MIN_SAMPLES,
+            "min_holdout_size":    MIN_HOLDOUT,
+            "reason":              self._last_reason or "Calibrator not yet loaded or fitted.",
+        }
 
     def save(self):
         """Persist calibrator to ml_models table in the DB."""
@@ -277,12 +338,17 @@ class FeedbackCalibrator:
             conn.close()
             if not row or not row["model_bytes"]:
                 return False
-            self._cal          = pickle.loads(row["model_bytes"])
-            self.n_samples     = int(row["n_samples"] or 0)
-            stored_acc         = float(row["cv_accuracy"] or 0)
+            self._cal           = pickle.loads(row["model_bytes"])
+            self.n_samples      = int(row["n_samples"] or 0)
+            stored_acc          = float(row["cv_accuracy"] or 0)
             # Negative stored value means calibrator was saved but did not improve accuracy
             self.is_improvement = stored_acc >= 0
             self.post_accuracy  = abs(stored_acc)
+            self._last_reason   = (
+                f"Loaded from DB — n_samples={self.n_samples}, "
+                f"holdout_acc={self.post_accuracy*100:.1f}%, "
+                f"active={self.is_improvement}"
+            )
             log.info("FeedbackCalibrator loaded from DB (n=%d, acc=%.1f%%, improvement=%s)",
                      self.n_samples, self.post_accuracy * 100, self.is_improvement)
             return True

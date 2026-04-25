@@ -14,8 +14,8 @@ Endpoints:
 """
 
 from fastapi import APIRouter, HTTPException, Depends, status
+from pydantic import BaseModel
 from typing import Optional
-import os
 
 from auth_utils import hash_password, verify_password, create_access_token  # root-level, not api.auth_utils
 from routes.deps import get_current_user, require_admin
@@ -148,16 +148,11 @@ def login(payload: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     token = create_access_token({"sub": user["email"], "role": user["role"]})
-    
-    # [ADMIN BYPASS FIX] If the user is an admin, securely push the Permanent Master Key to them
-    # so their browser extension can bypass 30-day JWT timeouts on huge scraping uploads.
-    api_key = os.getenv("ADMIN_API_KEY") if user["role"] == "admin" else None
-    
+
     return {
         "success": True,
         "token": token,
         "token_type": "bearer",
-        "api_key": api_key,
         "user": _user_row_to_dict(user),
     }
 

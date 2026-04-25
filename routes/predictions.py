@@ -172,9 +172,10 @@ def recalibrate(_admin: dict = Depends(require_admin)):
       4. POST /api/predictions/recalibrate   → THIS endpoint
          Calibrator learns from mistakes and adjusts future probabilities.
 
-    Requires at least 15 evaluated predictions.
+    Requires at least 100 evaluated predictions with stored probabilities.
     Safe to call repeatedly — each call refits on all available data.
     The calibrator is automatically applied to all future predictions.
+    Use GET /calibrator-debug to inspect why it may not be activating.
     """
     try:
         from ml.prediction_engine import recalibrate_from_log
@@ -186,6 +187,122 @@ def recalibrate(_admin: dict = Depends(require_admin)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/calibrator-debug")
+def calibrator_debug():
+    """
+    Detailed diagnostic report explaining exactly why the feedback calibrator
+    is or is not active, plus a data quality summary of prediction_log.
+
+    Use this when `calibrated: false` in /status to understand what's wrong:
+      - n_holdout too small → collect more graded predictions
+      - n_available < n_needed → sync more match results and re-evaluate
+      - post < pre - tolerance → calibrator would hurt; collect more data
+      - null_prob_rows > 0 → old predictions logged without probabilities
+
+    No admin auth required — safe to call from monitoring dashboards.
+    """
+    from ml.feedback_calibrator import get_calibrator, MIN_SAMPLES, MIN_HOLDOUT, IMPROVEMENT_TOLERANCE
+
+    cal = get_calibrator()
+    diag = cal.diagnose()
+
+    # ── Data quality audit from prediction_log ────────────────────────────────
+    data_quality: dict = {}
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+
+        # Total graded rows
+        cur.execute("SELECT COUNT(*) AS n FROM prediction_log WHERE actual IS NOT NULL")
+        total_graded = int((cur.fetchone() or {}).get("n", 0))
+
+        # Rows with all three probs stored (these feed the calibrator)
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM prediction_log
+            WHERE actual IS NOT NULL
+              AND home_win_prob IS NOT NULL
+              AND draw_prob     IS NOT NULL
+              AND away_win_prob IS NOT NULL
+        """)
+        rows_with_probs = int((cur.fetchone() or {}).get("n", 0))
+
+        # Rows missing at least one probability (cannot be used)
+        null_prob_rows = total_graded - rows_with_probs
+
+        # Outcome distribution of usable rows
+        cur.execute("""
+            SELECT actual, COUNT(*) AS n FROM prediction_log
+            WHERE actual IS NOT NULL
+              AND home_win_prob IS NOT NULL
+              AND draw_prob     IS NOT NULL
+              AND away_win_prob IS NOT NULL
+            GROUP BY actual ORDER BY n DESC
+        """)
+        outcome_dist = {r["actual"]: int(r["n"]) for r in cur.fetchall()}
+
+        # Most recent graded prediction date
+        cur.execute("""
+            SELECT MAX(evaluated_at) AS last_eval FROM prediction_log
+            WHERE actual IS NOT NULL
+        """)
+        row = cur.fetchone()
+        last_eval = row["last_eval"].isoformat() if row and row["last_eval"] else None
+
+        conn.close()
+
+        data_quality = {
+            "total_graded_rows":   total_graded,
+            "rows_with_probs":     rows_with_probs,
+            "null_prob_rows":      null_prob_rows,
+            "null_prob_note":      (
+                f"{null_prob_rows} rows are missing stored probabilities and cannot be used "
+                "for calibration. These are typically old predictions logged before probabilities "
+                "were persisted. They will be excluded automatically."
+            ) if null_prob_rows else "All graded rows have stored probabilities ✓",
+            "outcome_distribution": outcome_dist,
+            "last_evaluated_at":   last_eval,
+            "rows_needed_to_calibrate": max(0, MIN_SAMPLES - rows_with_probs),
+        }
+    except Exception as exc:
+        data_quality = {"error": str(exc)}
+
+    # ── Actionable recommendation ─────────────────────────────────────────────
+    rows_with_probs_n = data_quality.get("rows_with_probs", 0)
+    if rows_with_probs_n < MIN_SAMPLES:
+        action = (
+            f"You have {rows_with_probs_n}/{MIN_SAMPLES} usable graded predictions. "
+            f"Need {MIN_SAMPLES - rows_with_probs_n} more. "
+            "Keep syncing match results and running POST /api/prediction-log/evaluate."
+        )
+    elif not cal.is_fitted:
+        action = (
+            "Enough data available but calibrator not yet fitted. "
+            "Run POST /api/predictions/recalibrate."
+        )
+    elif not cal.is_improvement:
+        gap = round(
+            ((cal.post_accuracy or 0) - (cal.pre_accuracy or 0)) * 100, 1
+        ) if cal.pre_accuracy is not None else None
+        action = (
+            f"Calibrator fitted but not improving (gap={gap}%, tolerance={IMPROVEMENT_TOLERANCE*100:.1f}%). "
+            f"Holdout had only {cal.n_holdout} samples. "
+            f"Collect more graded predictions (target: {MIN_SAMPLES * 2}+) and recalibrate."
+        )
+    else:
+        action = "Calibrator is active and being applied to predictions ✓"
+
+    return {
+        "calibrator": diag,
+        "data_quality": data_quality,
+        "thresholds": {
+            "min_samples":          MIN_SAMPLES,
+            "min_holdout":          MIN_HOLDOUT,
+            "improvement_tolerance_pct": round(IMPROVEMENT_TOLERANCE * 100, 2),
+        },
+        "action": action,
+    }
 
 
 # ─── Auto-log helper ──────────────────────────────────────────────────────────
