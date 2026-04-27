@@ -242,6 +242,8 @@ def _auto_retrain_bg():
         _sync_log.exception("Auto-retrain thread error: %s", exc)
     finally:
         _retrain_lock.release()
+
+class TableData(BaseModel):
     headers: List[str] = []
     rows: List[List[Any]] = []
     rowCount: Optional[int] = None
