@@ -37,6 +37,9 @@ nixPkgs = [
   "alsa-lib",
 ]
 
+[variables]
+CHROME_BIN = "chromium"
+
 [phases.install]
 cmds = [
   "pip install -r requirements.txt",
