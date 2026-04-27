@@ -127,6 +127,38 @@ if _soccerdata_available:
     app.include_router(soccerdata_sync.router, prefix="/api/soccerdata", tags=["Soccerdata Sync"])
 
 
+# ─── Chrome/Chromium startup diagnostic ───────────────────────────────────────
+# Logs exactly where (or whether) Chrome is found at boot time so we can
+# debug Railway/Nixpacks browser availability without waiting for a sync call.
+import shutil as _shutil
+import subprocess as _sp
+import logging as _logging
+
+_diag = _logging.getLogger("chrome_diag")
+
+def _log_chrome_env() -> None:
+    _diag.info("=== Chrome diagnostic ===")
+    _diag.info("CHROME_BIN env    : %s", os.environ.get("CHROME_BIN", "(not set)"))
+    _diag.info("CHROMIUM_BIN env  : %s", os.environ.get("CHROMIUM_BIN", "(not set)"))
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        found = _shutil.which(name)
+        _diag.info("shutil.which(%r) : %s", name, found or "(not found)")
+    for cmd in ("chromium", "chromium-browser", "google-chrome"):
+        try:
+            out = _sp.check_output(["which", cmd], text=True, stderr=_sp.DEVNULL).strip()
+            _diag.info("shell which %s   : %s", cmd, out)
+        except Exception:
+            _diag.info("shell which %s   : (not found)", cmd)
+    try:
+        path_val = os.environ.get("PATH", "")
+        _diag.info("PATH: %s", path_val)
+    except Exception:
+        pass
+    _diag.info("=== end Chrome diagnostic ===")
+
+_log_chrome_env()
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 4000))
