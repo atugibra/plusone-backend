@@ -27,7 +27,10 @@ import csv
 import io
 import json
 import logging
-import os 
+import os
+import pathlib
+import shutil
+import subprocess
 import threading
 from typing import Any, Optional
 
@@ -177,10 +180,6 @@ def _ensure_league_dict() -> None:
 
     Call once at startup (or before the first sync of a non-Big-5 league).
     """
-    import os
-    import json
-    import pathlib
-
     soccerdata_dir = pathlib.Path(
         os.environ.get("SOCCERDATA_DIR", pathlib.Path.home() / "soccerdata")
     )
@@ -261,16 +260,72 @@ def _ensure_league_dict() -> None:
 
     logger.info("soccerdata league_dict.json written to %s", league_dict_path)
 
+
 # All leagues that will be synced by sync-all (Big-5 + extended)
 ALL_CONFIGURED_LEAGUES = list(ALL_LEAGUES.keys())
 
 
 def _canonical_season(s: str) -> str:
     """Convert '2024-2025' → '2024-25' for soccerdata. Pass-through if already short."""
-    # e.g. "2024-2025" → "2024-25"
     if len(s) == 9 and s[4] == "-" and s[5:].isdigit():
         return f"{s[:4]}-{s[7:]}"
     return s  # already "2024-25" or single-year "2024"
+
+
+def _find_chrome_binary() -> Optional[str]:
+    """
+    Locate the Chrome/Chromium binary on the current system.
+
+    Search order:
+      1. CHROME_BIN env var (explicit override)
+      2. CHROMIUM_BIN env var
+      3. shutil.which() for common binary names (covers Nixpacks PATH symlinks)
+      4. Common hard-coded paths (/usr/bin/chromium, etc.)
+      5. subprocess `which` as a last resort (resolves Nix store symlinks)
+
+    Returns the path as a string, or None if nothing is found.
+    """
+    # 1 & 2: explicit env overrides
+    for env_var in ("CHROME_BIN", "CHROMIUM_BIN"):
+        val = os.environ.get(env_var)
+        if val and pathlib.Path(val).exists():
+            logger.info("Chrome binary from env %s: %s", env_var, val)
+            return val
+
+    # 3: shutil.which covers binaries on PATH (including Nixpacks wrapper symlinks)
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        found = shutil.which(name)
+        if found and pathlib.Path(found).exists():
+            logger.info("Chrome binary via which('%s'): %s", name, found)
+            return found
+
+    # 4: hard-coded fallback paths
+    for candidate in (
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/local/bin/chromium",
+        "/usr/local/bin/google-chrome",
+    ):
+        if pathlib.Path(candidate).exists():
+            logger.info("Chrome binary at hard-coded path: %s", candidate)
+            return candidate
+
+    # 5: subprocess `which` as last resort (handles Nix store symlinks that
+    #    shutil.which misses when the Nix profile isn't fully on PATH)
+    for name in ("chromium", "chromium-browser", "google-chrome"):
+        try:
+            resolved = subprocess.check_output(
+                ["which", name], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            if resolved and pathlib.Path(resolved).exists():
+                logger.info("Chrome binary via subprocess which('%s'): %s", name, resolved)
+                return resolved
+        except Exception:
+            pass
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,7 +365,6 @@ def _df_to_records(df: pd.DataFrame) -> list[dict]:
     """Reset index, flatten columns, replace NaN with None, return list of dicts."""
     df = df.reset_index()
     df = _flatten_df(df)
-    # Replace NaN / NaT with None so downstream safe_num/safe_text don't choke
     df = df.where(pd.notna(df), None)
     return df.to_dict("records")
 
@@ -331,7 +385,6 @@ def _schedule_rows_to_fixtures(records: list[dict]) -> list[dict]:
         if not home or not away:
             continue
 
-        # Build score string from separate goal columns if present
         h_goals = _val(r, "home_goals", "score_home")
         a_goals = _val(r, "away_goals", "score_away")
         try:
@@ -378,16 +431,16 @@ def _team_stat_rows_to_squad_stats(records: list[dict]) -> list[dict]:
 
         extra = {k: v for k, v in r.items() if k not in CORE and v is not None}
         out.append({
-            "team":          team,
-            "players_used":  _val(r, "players_used"),
-            "avg_age":       _val(r, "avg_age"),
-            "possession":    _val(r, "possession"),
-            "games":         _val(r, "games", "mp"),
-            "games_starts":  _val(r, "games_starts", "starts"),
-            "minutes":       _val(r, "minutes", "min"),
-            "minutes_90s":   _val(r, "minutes_90s", "90s"),
-            "goals":         _val(r, "goals", "gls"),
-            "assists":       _val(r, "assists", "ast"),
+            "team":           team,
+            "players_used":   _val(r, "players_used"),
+            "avg_age":        _val(r, "avg_age"),
+            "possession":     _val(r, "possession"),
+            "games":          _val(r, "games", "mp"),
+            "games_starts":   _val(r, "games_starts", "starts"),
+            "minutes":        _val(r, "minutes", "min"),
+            "minutes_90s":    _val(r, "minutes_90s", "90s"),
+            "goals":          _val(r, "goals", "gls"),
+            "assists":        _val(r, "assists", "ast"),
             "standard_stats": extra,
         })
     return out
@@ -407,24 +460,23 @@ def _player_stat_rows_to_player_stats(records: list[dict]) -> list[dict]:
         if not name or name.lower() in ("player", ""):
             continue
 
-        # Nationality: soccerdata may give full country name; we just truncate
         raw_nat = str(_val(r, "nationality", "nation") or "").strip()
         nationality = raw_nat.split()[-1] if raw_nat else ""
 
         extra = {k: v for k, v in r.items() if k not in CORE and v is not None}
         out.append({
-            "player":        name,
-            "nationality":   nationality[:10],
-            "position":      str(_val(r, "position", "pos") or "")[:20],
-            "team":          str(_val(r, "team", "squad") or "").strip(),
-            "age":           safe_num(_val(r, "age")),
-            "birth_year":    safe_num(_val(r, "born", "birth_year")),
-            "games":         safe_num(_val(r, "games", "mp")),
-            "games_starts":  safe_num(_val(r, "games_starts", "starts")),
-            "minutes":       safe_num(_val(r, "minutes", "min")),
-            "minutes_90s":   safe_num(_val(r, "minutes_90s", "90s")),
-            "goals":         safe_num(_val(r, "goals", "gls")),
-            "assists":       safe_num(_val(r, "assists", "ast")),
+            "player":         name,
+            "nationality":    nationality[:10],
+            "position":       str(_val(r, "position", "pos") or "")[:20],
+            "team":           str(_val(r, "team", "squad") or "").strip(),
+            "age":            safe_num(_val(r, "age")),
+            "birth_year":     safe_num(_val(r, "born", "birth_year")),
+            "games":          safe_num(_val(r, "games", "mp")),
+            "games_starts":   safe_num(_val(r, "games_starts", "starts")),
+            "minutes":        safe_num(_val(r, "minutes", "min")),
+            "minutes_90s":    safe_num(_val(r, "minutes_90s", "90s")),
+            "goals":          safe_num(_val(r, "goals", "gls")),
+            "assists":        safe_num(_val(r, "assists", "ast")),
             "standard_stats": extra,
         })
     return out
@@ -450,16 +502,15 @@ def _fetch_clubelo_fixtures() -> list[dict]:
     reader = csv.DictReader(io.StringIO(response.text))
     rows = []
     for row in reader:
-        # Wrap in the envelope format sync_enrichment uses internally
         rows.append({
             "League": row.get("League", ""),
             "raw": {
-                "Home":      row.get("HomeTeam", row.get("Home", "")),
-                "Away":      row.get("AwayTeam", row.get("Away", "")),
-                "Date":      row.get("Date", ""),
-                "Home_Elo":  row.get("Home", ""),   # ClubElo Fixtures CSV: 'Home' col = home win prob / elo
-                "Away_Elo":  row.get("Away", ""),
-                **row,                               # keep all probability columns
+                "Home":     row.get("HomeTeam", row.get("Home", "")),
+                "Away":     row.get("AwayTeam", row.get("Away", "")),
+                "Date":     row.get("Date", ""),
+                "Home_Elo": row.get("Home", ""),
+                "Away_Elo": row.get("Away", ""),
+                **row,
             },
         })
     return rows
@@ -486,8 +537,6 @@ def _insert_clubelo_rows(cur, rows: list[dict]) -> int:
         if not home or not away or not target_date:
             continue
 
-        # ELO value: ClubElo Fixtures CSV stores home/away win probabilities
-        # in the "Home" and "Away" columns of the raw CSV row.
         home_elo = safe_num(raw.get("Home_Elo") or raw.get("Home_Prob"))
         away_elo = safe_num(raw.get("Away_Elo") or raw.get("Away_Prob"))
 
@@ -495,8 +544,6 @@ def _insert_clubelo_rows(cur, rows: list[dict]) -> int:
             if not team_name:
                 continue
 
-            # Resolve team by name across ALL leagues — do NOT trust ClubElo's
-            # country code (ENG covers PL + Championship + L1 + L2).
             clean = _normalize_team_name(team_name)
             cur.execute(
                 "SELECT id FROM teams WHERE name ILIKE %s LIMIT 1",
@@ -504,7 +551,6 @@ def _insert_clubelo_rows(cur, rows: list[dict]) -> int:
             )
             team_row = cur.fetchone()
 
-            # Fallback: try suffix-stripped name (e.g. "Arsenal FC" → "Arsenal")
             if not team_row:
                 stripped = _strip_affixes(clean)
                 if stripped and stripped != clean.lower():
@@ -588,49 +634,25 @@ def _do_sync_league(
     _ensure_league_dict()
 
     sd_season = _canonical_season(season_canonical)
-    logger.info("soccerdata sync: league=%s sd=%s season=%s types=%s",
-                league_canonical, sd_league, sd_season, data_types)
+    logger.info(
+        "soccerdata sync: league=%s sd=%s season=%s types=%s",
+        league_canonical, sd_league, sd_season, data_types,
+    )
 
-    # Resolve the Chromium binary for the Railway/Nixpacks environment.
-    # Nixpacks installs Chromium at a Nix store path; we probe common locations
-    # so the scraper can launch even without a system-wide `google-chrome` symlink.
-    import shutil, pathlib as _pl, subprocess as _sp
-        _chrome_candidates = [
-            os.environ.get("CHROME_BIN"),
-            os.environ.get("CHROMIUM_BIN"),
-            shutil.which("chromium"),
-            shutil.which("chromium-browser"),
-            shutil.which("google-chrome"),
-            shutil.which("google-chrome-stable"),
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/google-chrome",
-        ]
-        _chrome_path = next(
-            (_pl.Path(p) for p in _chrome_candidates if p and _pl.Path(p).exists()),
-            None,
-        )
-        # Last resort: ask the shell directly (handles Nix store symlinks)
-        if not _chrome_path:
-            for _cmd in ("chromium", "chromium-browser", "google-chrome"):
-                try:
-                    _resolved = _sp.check_output(["which", _cmd], text=True).strip()
-                    if _resolved:
-                        _chrome_path = _pl.Path(_resolved)
-                        break
-                except Exception:
-                    pass
-
-        if not _chrome_path:
+    # Locate Chrome/Chromium binary for the Railway/Nixpacks environment
+    chrome_bin = _find_chrome_binary()
+    if not chrome_bin:
         raise RuntimeError(
             "No Chrome/Chromium binary found on this server. "
-            "Ensure 'chromium' is in nixpacks.toml nixPkgs and CHROME_BIN is set."
+            "Ensure 'chromium' is listed in nixpacks.toml nixPkgs and/or "
+            "set the CHROME_BIN environment variable to its full path."
         )
-    
+    logger.info("Using Chrome binary: %s", chrome_bin)
+
     fbref = sd.FBref(
         leagues=[sd_league],
         seasons=[sd_season],
-        path_to_browser=str(_chrome_path),  # ← cast to str, not Path
+        path_to_browser=chrome_bin,  # str, not Path — seleniumbase requires it
         headless=True,
     )
 
@@ -653,8 +675,10 @@ def _do_sync_league(
                 )
                 logger.info("Fixtures inserted: %d", fixtures_inserted)
             except Exception as exc:
-                logger.warning("Fixtures fetch failed for %s %s: %s",
-                               league_canonical, sd_season, exc)
+                logger.warning(
+                    "Fixtures fetch failed for %s %s: %s",
+                    league_canonical, sd_season, exc,
+                )
 
         # ── Team squad stats ─────────────────────────────────────────────────
         if "stats" in data_types:
@@ -668,8 +692,10 @@ def _do_sync_league(
                     stats_inserted += n
                     logger.info("Squad stats [%s] inserted: %d", stat_type, n)
                 except Exception as exc:
-                    logger.warning("Squad stats [%s] failed for %s %s: %s",
-                                   stat_type, league_canonical, sd_season, exc)
+                    logger.warning(
+                        "Squad stats [%s] failed for %s %s: %s",
+                        stat_type, league_canonical, sd_season, exc,
+                    )
 
         # ── Player stats ─────────────────────────────────────────────────────
         if "player_stats" in data_types:
@@ -682,8 +708,10 @@ def _do_sync_league(
                 )
                 logger.info("Player stats inserted: %d", players_inserted)
             except Exception as exc:
-                logger.warning("Player stats failed for %s %s: %s",
-                               league_canonical, sd_season, exc)
+                logger.warning(
+                    "Player stats failed for %s %s: %s",
+                    league_canonical, sd_season, exc,
+                )
 
         total = fixtures_inserted + stats_inserted + players_inserted
         if total == 0:
@@ -719,8 +747,11 @@ def _do_sync_league(
 
     except Exception as exc:
         conn.rollback()
-        logger.error("soccerdata sync error [%s %s]: %s",
-                     league_canonical, season_canonical, exc, exc_info=True)
+        logger.error(
+            "soccerdata sync error [%s %s]: %s",
+            league_canonical, season_canonical, exc,
+            exc_info=True,
+        )
         raise
     finally:
         conn.close()
