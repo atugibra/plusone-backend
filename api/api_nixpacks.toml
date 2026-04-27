@@ -1,0 +1,54 @@
+# nixpacks.toml — Railway build configuration
+# NOTE: Railway root_dir is set to 'api/', so this file must live at api/nixpacks.toml
+# The file at the repo root is ignored because Railway only looks within root_dir.
+
+[phases.setup]
+nixPkgs = [
+  "chromium",
+  "chromedriver",
+  "nss",
+  "nspr",
+  "atk",
+  "at-spi2-atk",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libXtst",
+  "xorg.libxcb",
+  "xorg.libXcursor",
+  "xorg.libXi",
+  "libxkbcommon",
+  "mesa",
+  "expat",
+  "libdrm",
+  "dbus",
+  "cups",
+  "fontconfig",
+  "freetype",
+  "xorg.libXrender",
+  "pango",
+  "cairo",
+  "gdk-pixbuf",
+  "gtk3",
+  "glib",
+  "alsa-lib",
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+]
+
+[variables]
+# Nixpacks puts the Nix chromium wrapper on PATH as 'chromium'.
+# _find_chrome_binary() resolves bare names via shutil.which so this works
+# even though it's not an absolute path.
+CHROME_BIN = "chromium"
+# Required flags for headless Chromium inside a root-user container:
+CHROMIUM_FLAGS = "--no-sandbox --disable-dev-shm-usage --disable-gpu --headless"
+
+[start]
+cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
