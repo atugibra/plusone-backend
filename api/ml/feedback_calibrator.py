@@ -41,11 +41,13 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-MIN_SAMPLES  = 100  # minimum evaluated predictions needed before calibrating.
-                    # Raised from 50: with 50 rows and an 80/20 split the holdout
-                    # has only 10 rows — one wrong prediction = 10% accuracy swing.
-MIN_HOLDOUT  = 30   # minimum holdout rows regardless of dataset size.
-                    # 30 samples → ±9% standard error, which is borderline acceptable.
+MIN_SAMPLES  = 50   # minimum evaluated predictions needed before calibrating.
+                    # Lowered from 100: with 50 rows the calibrator can meaningfully
+                    # correct systematic overconfidence at medium-high probabilities.
+                    # Activates within ~5 weeks of a new season instead of ~10 weeks.
+MIN_HOLDOUT  = 20   # minimum holdout rows regardless of dataset size.
+                    # Lowered from 30 in tandem with MIN_SAMPLES so the split
+                    # remains valid (≥20 holdout rows → ±11% standard error).
 IMPROVEMENT_TOLERANCE = 0.015  # allow up to 1.5% degradation on holdout before
                                 # refusing to apply the calibrator. Absorbs noise
                                 # on smallish holdout sets.

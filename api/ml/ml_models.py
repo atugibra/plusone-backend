@@ -169,7 +169,19 @@ class EnsemblePredictor:
         # Balanced sample weights
         sample_weights = compute_sample_weight(class_weight="balanced", y=y)
 
-        # Exponential recency decay (2-year half-life)
+        # Exponential recency decay (~7-month half-life).
+        # Half-life = ln(2) / (1/210) ≈ 210 days.
+        # Shortened from the original 730-day (2-year) half-life which left
+        # matches from 12 months ago still carrying 61% weight — far too slow
+        # to adapt when squads, managers, or tactical identities change across
+        # a summer transfer window. A 7-month half-life means:
+        #   3 months ago  → 74% weight
+        #   7 months ago  → 50% weight
+        #   14 months ago → 25% weight
+        #   18 months ago → 8%  weight  (effectively ignored)
+        # This makes the model significantly more responsive to current-season
+        # form while still retaining enough historical signal for stable estimates.
+        _DECAY_HALF_LIFE_DAYS = 210.0
         if match_dates is not None and len(match_dates) == len(y):
             today = datetime.date.today()
             for i, d in enumerate(match_dates):
@@ -179,7 +191,7 @@ class EnsemblePredictor:
                     elif hasattr(d, "date"):
                         d = d.date()
                     days_ago = max((today - d).days, 0)
-                    recency = float(np.exp(-days_ago / 730.0))
+                    recency = float(np.exp(-days_ago / _DECAY_HALF_LIFE_DAYS))
                     sample_weights[i] *= recency
                 except Exception:
                     pass

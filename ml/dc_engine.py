@@ -38,7 +38,11 @@ log = logging.getLogger(__name__)
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 CFG = {
-    "dc_time_decay_xi":     0.0018,
+    # Time-decay xi for Dixon-Coles weighting: w = exp(-xi * days_ago).
+    # Half-life = ln(2) / xi.  0.003 → half-life ≈ 231 days (~7.5 months).
+    # Previously 0.0018 (~385-day half-life, ~13 months) which was too slow
+    # to reflect post-transfer-window squad changes.
+    "dc_time_decay_xi":     0.003,
     "dc_max_goals":         10,
     "elo_k_base":           40,
     "elo_home_advantage":   60,

@@ -149,7 +149,99 @@ def _auto_recalibrate_bg():
     finally:
         _recalibrate_lock.release()
 
-class TableData(BaseModel):
+# ── Auto-retrain ─────────────────────────────────────────────────────────────
+# Triggers a full ML ensemble retrain when enough new completed matches have
+# accumulated since the last training run, without ever blocking a sync response.
+
+_retrain_lock = threading.Lock()
+_MIN_NEW_MATCHES_FOR_RETRAIN = 50   # retrain when this many new completed matches
+                                     # have accumulated since the last training run
+_MIN_RETRAIN_INTERVAL_DAYS   = 7    # never retrain more frequently than once per week
+
+def _auto_retrain_bg():
+    """
+    Fire-and-forget: retrain the ML ensemble when enough new completed matches
+    have accumulated since the last training run.
+
+    Gates (both must pass before retraining fires):
+      1. At least _MIN_RETRAIN_INTERVAL_DAYS since last successful train.
+      2. At least _MIN_NEW_MATCHES_FOR_RETRAIN new completed matches in the DB
+         vs n_samples in the current trained model.
+
+    This guarantees the model stays current without running on every sync.
+    """
+    if not _retrain_lock.acquire(blocking=False):
+        _sync_log.debug("Auto-retrain already running. Skipping this trigger.")
+        return
+    try:
+        import datetime
+        from ml.prediction_engine import train_model
+        from ml.prediction_engine import _meta as _engine_meta
+
+        # ── Gate 1: minimum interval since last train ─────────────────────────
+        trained_at_str = _engine_meta.get("trained_at")
+        if trained_at_str:
+            try:
+                trained_at = datetime.datetime.fromisoformat(
+                    trained_at_str.replace("Z", "+00:00")
+                )
+                days_since = (
+                    datetime.datetime.now(datetime.timezone.utc) - trained_at
+                ).days
+                if days_since < _MIN_RETRAIN_INTERVAL_DAYS:
+                    _sync_log.debug(
+                        "Auto-retrain skipped: only %d days since last train (min %d).",
+                        days_since, _MIN_RETRAIN_INTERVAL_DAYS,
+                    )
+                    return
+            except Exception:
+                pass  # if date parse fails, proceed to gate 2
+
+        # ── Gate 2: enough new completed matches since last train ─────────────
+        n_trained = int(_engine_meta.get("n_samples") or 0)
+        try:
+            from database import get_connection as _gc
+            _conn = _gc()
+            _cur  = _conn.cursor()
+            _cur.execute(
+                "SELECT COUNT(*) AS n FROM matches WHERE home_score IS NOT NULL"
+            )
+            _row = _cur.fetchone()
+            _conn.close()
+            n_total = int(_row["n"] or 0) if _row else 0
+        except Exception as exc:
+            _sync_log.warning("Auto-retrain gate-2 check failed: %s", exc)
+            return
+
+        new_matches = n_total - n_trained
+        if new_matches < _MIN_NEW_MATCHES_FOR_RETRAIN:
+            _sync_log.debug(
+                "Auto-retrain skipped: only %d new completed matches since last "
+                "train (need %d).",
+                new_matches, _MIN_NEW_MATCHES_FOR_RETRAIN,
+            )
+            return
+
+        _sync_log.info(
+            "Auto-retrain triggered: %d new completed matches since last train "
+            "(%d total, %d trained on).",
+            new_matches, n_total, n_trained,
+        )
+        result = train_model()
+        if result.get("success"):
+            _sync_log.info(
+                "Auto-retrain completed: %d matches trained, CV accuracy %.1f%%.",
+                result.get("matches_trained", 0),
+                (result.get("cv_accuracy") or 0) * 100,
+            )
+        else:
+            _sync_log.warning(
+                "Auto-retrain completed with error: %s", result.get("error", "unknown")
+            )
+    except Exception as exc:
+        _sync_log.exception("Auto-retrain thread error: %s", exc)
+    finally:
+        _retrain_lock.release()
     headers: List[str] = []
     rows: List[List[Any]] = []
     rowCount: Optional[int] = None
@@ -360,6 +452,16 @@ def get_or_create_league(cur, name):
     clean = name.strip()
     if clean.isdigit():
         raise ValueError(f"Invalid league name '{clean}'")
+    # Reject OpenAPI/Swagger placeholder values that indicate an unfilled template
+    _PLACEHOLDER_NAMES = frozenset({
+        "string", "league", "leaguename", "example", "test",
+        "placeholder", "your_league", "insert_league",
+    })
+    if clean.lower() in _PLACEHOLDER_NAMES:
+        raise ValueError(
+            f"Invalid league name '{clean}' — looks like an unfilled API placeholder. "
+            f"Pass a real league name such as 'Premier League' or 'Bundesliga'."
+        )
     cur.execute("SELECT id FROM leagues WHERE name ILIKE %s LIMIT 1", (clean,))
     row = cur.fetchone()
     if row:
@@ -712,6 +814,11 @@ def sync_all(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         if evaluated > 0:
             threading.Thread(target=_auto_recalibrate_bg, daemon=True,
                              name="auto-recalibrate").start()
+        # Auto-retrain the ML ensemble when enough new matches have accumulated.
+        # Internal gates prevent this from firing more than once per week or
+        # before 50+ new completed matches are available.
+        threading.Thread(target=_auto_retrain_bg, daemon=True,
+                         name="auto-retrain").start()
         return {"success": True, "fixtures_inserted": fx, "stats_inserted": st, "players_inserted": pl, "standings_inserted": sd, "home_away_inserted": ha, "logos_updated": logos, "predictions_evaluated": evaluated, "recalibration_triggered": evaluated > 0}
 
     except Exception as e:
@@ -739,6 +846,8 @@ def sync_fixtures(payload: SyncPayload, _admin: dict = Depends(require_admin)):
         if evaluated > 0:
             threading.Thread(target=_auto_recalibrate_bg, daemon=True,
                              name="auto-recalibrate").start()
+        threading.Thread(target=_auto_retrain_bg, daemon=True,
+                         name="auto-retrain").start()
         return {"success": True, "matches_inserted": inserted, "predictions_evaluated": evaluated, "recalibration_triggered": evaluated > 0}
     except Exception as e:
         conn.rollback()
