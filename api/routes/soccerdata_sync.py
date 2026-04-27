@@ -594,34 +594,43 @@ def _do_sync_league(
     # Resolve the Chromium binary for the Railway/Nixpacks environment.
     # Nixpacks installs Chromium at a Nix store path; we probe common locations
     # so the scraper can launch even without a system-wide `google-chrome` symlink.
-    import shutil, pathlib as _pl
-    _chrome_candidates = [
-        os.environ.get("CHROME_BIN"),           # explicit env override
-        os.environ.get("CHROMIUM_BIN"),
-        shutil.which("chromium"),               # Nixpacks puts this on PATH
-        shutil.which("chromium-browser"),
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-    ]
-    _chrome_path = next(
-        (_pl.Path(p) for p in _chrome_candidates if p and _pl.Path(p).exists()),
-        None,
-    )
-    if _chrome_path:
-        logger.info("Using Chrome binary: %s", _chrome_path)
-    else:
-        logger.warning(
-            "No Chrome binary found. Scraping may fail. "
-            "Set CHROME_BIN env var or ensure 'chromium' is installed."
+    import shutil, pathlib as _pl, subprocess as _sp
+        _chrome_candidates = [
+            os.environ.get("CHROME_BIN"),
+            os.environ.get("CHROMIUM_BIN"),
+            shutil.which("chromium"),
+            shutil.which("chromium-browser"),
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+        ]
+        _chrome_path = next(
+            (_pl.Path(p) for p in _chrome_candidates if p and _pl.Path(p).exists()),
+            None,
         )
+        # Last resort: ask the shell directly (handles Nix store symlinks)
+        if not _chrome_path:
+            for _cmd in ("chromium", "chromium-browser", "google-chrome"):
+                try:
+                    _resolved = _sp.check_output(["which", _cmd], text=True).strip()
+                    if _resolved:
+                        _chrome_path = _pl.Path(_resolved)
+                        break
+                except Exception:
+                    pass
 
+        if not _chrome_path:
+        raise RuntimeError(
+            "No Chrome/Chromium binary found on this server. "
+            "Ensure 'chromium' is in nixpacks.toml nixPkgs and CHROME_BIN is set."
+        )
+    
     fbref = sd.FBref(
         leagues=[sd_league],
         seasons=[sd_season],
-        path_to_browser=_chrome_path,
+        path_to_browser=str(_chrome_path),  # ← cast to str, not Path
         headless=True,
     )
 
