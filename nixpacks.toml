@@ -37,13 +37,24 @@ nixPkgs = [
   "alsa-lib",
 ]
 
-[variables]
-CHROME_BIN = "chromium"
-
 [phases.install]
 cmds = [
   "pip install -r requirements.txt",
+  # Resolve the Nix store path for chromium and write it to /etc/environment
+  # so it survives into the runtime container as CHROME_BIN.
+  "which chromium && echo \"CHROME_BIN=$(which chromium)\" >> /etc/environment || true",
 ]
+
+[variables]
+# Nixpacks puts the Nix chromium wrapper on PATH as 'chromium'.
+# Setting CHROME_BIN here makes it available at runtime so _find_chrome_binary()
+# picks it up immediately without needing shutil.which or subprocess fallbacks.
+CHROME_BIN = "chromium"
+
+# Chromium flags required for headless operation inside a container:
+# --no-sandbox       : required when running as root (Railway containers run as root)
+# --disable-dev-shm-usage : /dev/shm is too small in most container envs; use /tmp instead
+CHROMIUM_FLAGS = "--no-sandbox --disable-dev-shm-usage --disable-gpu --headless"
 
 [start]
 cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"

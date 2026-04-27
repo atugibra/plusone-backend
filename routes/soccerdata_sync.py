@@ -277,29 +277,46 @@ def _find_chrome_binary() -> Optional[str]:
     Locate the Chrome/Chromium binary on the current system.
 
     Search order:
-      1. CHROME_BIN env var (explicit override)
-      2. CHROMIUM_BIN env var
-      3. shutil.which() for common binary names (covers Nixpacks PATH symlinks)
-      4. Common hard-coded paths (/usr/bin/chromium, etc.)
-      5. subprocess `which` as a last resort (resolves Nix store symlinks)
+      1. CHROME_BIN / CHROMIUM_BIN env vars — resolved via shutil.which if
+         the value is a bare name (e.g. "chromium") rather than an absolute path.
+      2. shutil.which() for common binary names (covers Nixpacks PATH symlinks).
+      3. Common hard-coded absolute paths (/usr/bin/chromium, etc.).
+      4. subprocess `which` as a last resort (resolves Nix store symlinks that
+         shutil.which misses when the Nix profile isn't fully on PATH).
 
-    Returns the path as a string, or None if nothing is found.
+    Returns the resolved absolute path as a string, or None if nothing is found.
     """
-    # 1 & 2: explicit env overrides
-    for env_var in ("CHROME_BIN", "CHROMIUM_BIN"):
-        val = os.environ.get(env_var)
-        if val and pathlib.Path(val).exists():
-            logger.info("Chrome binary from env %s: %s", env_var, val)
-            return val
+    def _resolve(val: str) -> Optional[str]:
+        """Return absolute path if val is an existing file, or resolve via which."""
+        p = pathlib.Path(val)
+        if p.is_absolute() and p.exists():
+            return str(p)
+        # bare name like "chromium" — resolve through PATH
+        resolved = shutil.which(val)
+        if resolved and pathlib.Path(resolved).exists():
+            return resolved
+        return None
 
-    # 3: shutil.which covers binaries on PATH (including Nixpacks wrapper symlinks)
+    # 1: explicit env overrides
+    for env_var in ("CHROME_BIN", "CHROMIUM_BIN"):
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            result = _resolve(val)
+            if result:
+                logger.info("Chrome binary from env %s: %s", env_var, result)
+                return result
+            logger.warning(
+                "Env var %s=%r set but binary not found; continuing search.", env_var, val
+            )
+
+    # 2: shutil.which covers binaries on PATH (including Nixpacks wrapper symlinks)
     for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
         found = shutil.which(name)
         if found and pathlib.Path(found).exists():
             logger.info("Chrome binary via which('%s'): %s", name, found)
             return found
 
-    # 4: hard-coded fallback paths
+    # 3: hard-coded fallback absolute paths
     for candidate in (
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
@@ -312,7 +329,7 @@ def _find_chrome_binary() -> Optional[str]:
             logger.info("Chrome binary at hard-coded path: %s", candidate)
             return candidate
 
-    # 5: subprocess `which` as last resort (handles Nix store symlinks that
+    # 4: subprocess `which` as last resort (handles Nix store symlinks that
     #    shutil.which misses when the Nix profile isn't fully on PATH)
     for name in ("chromium", "chromium-browser", "google-chrome"):
         try:
