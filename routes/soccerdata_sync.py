@@ -590,7 +590,39 @@ def _do_sync_league(
     logger.info("soccerdata sync: league=%s sd=%s season=%s types=%s",
                 league_canonical, sd_league, sd_season, data_types)
 
-    fbref = sd.FBref(leagues=[sd_league], seasons=[sd_season])
+    # Resolve the Chromium binary for the Railway/Nixpacks environment.
+    # Nixpacks installs Chromium at a Nix store path; we probe common locations
+    # so the scraper can launch even without a system-wide `google-chrome` symlink.
+    import shutil, pathlib as _pl
+    _chrome_candidates = [
+        os.environ.get("CHROME_BIN"),           # explicit env override
+        os.environ.get("CHROMIUM_BIN"),
+        shutil.which("chromium"),               # Nixpacks puts this on PATH
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+    ]
+    _chrome_path = next(
+        (_pl.Path(p) for p in _chrome_candidates if p and _pl.Path(p).exists()),
+        None,
+    )
+    if _chrome_path:
+        logger.info("Using Chrome binary: %s", _chrome_path)
+    else:
+        logger.warning(
+            "No Chrome binary found. Scraping may fail. "
+            "Set CHROME_BIN env var or ensure 'chromium' is installed."
+        )
+
+    fbref = sd.FBref(
+        leagues=[sd_league],
+        seasons=[sd_season],
+        path_to_browser=_chrome_path,
+        headless=True,
+    )
 
     fixtures_inserted = stats_inserted = players_inserted = 0
 

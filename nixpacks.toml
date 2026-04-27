@@ -1,0 +1,46 @@
+# nixpacks.toml — Railway build configuration
+# Installs Chromium + all system dependencies required by seleniumbase/undetected-chromedriver
+# so that soccerdata's FBref scraper can launch a headless browser on Railway.
+
+[phases.setup]
+nixPkgs = [
+  "chromium",
+  "chromedriver",
+  "nss",
+  "nspr",
+  "atk",
+  "at-spi2-atk",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libXtst",
+  "xorg.libxcb",
+  "xorg.libXcursor",
+  "xorg.libXi",
+  "libxkbcommon",
+  "mesa",
+  "expat",
+  "libdrm",
+  "dbus",
+  "cups",
+  "fontconfig",
+  "freetype",
+  "xorg.libXrender",
+  "pango",
+  "cairo",
+  "gdk-pixbuf",
+  "gtk3",
+  "glib",
+  "alsa-lib",
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+]
+
+[start]
+cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
