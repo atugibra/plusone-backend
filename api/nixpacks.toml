@@ -1,40 +1,23 @@
 # nixpacks.toml — Railway build configuration
-# NOTE: Railway root_dir is set to 'api/', so this file must live at api/nixpacks.toml
-# The file at the repo root is ignored because Railway only looks within root_dir.
 
 [phases.setup]
-nixPkgs = [
+aptPkgs = [
   "chromium",
-  "chromedriver",
-  "nss",
-  "nspr",
-  "atk",
-  "at-spi2-atk",
-  "xorg.libX11",
-  "xorg.libXcomposite",
-  "xorg.libXdamage",
-  "xorg.libXext",
-  "xorg.libXfixes",
-  "xorg.libXrandr",
-  "xorg.libXtst",
-  "xorg.libxcb",
-  "xorg.libXcursor",
-  "xorg.libXi",
-  "libxkbcommon",
-  "mesa",
-  "expat",
-  "libdrm",
-  "dbus",
-  "cups",
-  "fontconfig",
-  "freetype",
-  "xorg.libXrender",
-  "pango",
-  "cairo",
-  "gdk-pixbuf",
-  "gtk3",
-  "glib",
-  "alsa-lib",
+  "chromium-driver",
+  "xvfb",
+  "libnss3",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libcups2",
+  "libdrm2",
+  "libxkbcommon0",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxrandr2",
+  "libgbm1",
+  "libasound2",
+  "libpango-1.0-0",
+  "libcairo2"
 ]
 
 [phases.install]
@@ -43,11 +26,11 @@ cmds = [
 ]
 
 [variables]
-# Nixpacks puts the Nix chromium wrapper on PATH as 'chromium'.
-# _find_chrome_binary() resolves bare names via shutil.which so this works
-# even though it's not an absolute path.
 CHROME_BIN = "chromium"
-# Required flags for headless Chromium inside a root-user container:
+
+# Chromium flags required for headless operation inside a container:
+# --no-sandbox       : required when running as root (Railway containers run as root)
+# --disable-dev-shm-usage : /dev/shm is too small in most container envs; use /tmp instead
 CHROMIUM_FLAGS = "--no-sandbox --disable-dev-shm-usage --disable-gpu --headless"
 
 [start]
