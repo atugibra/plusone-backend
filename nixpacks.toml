@@ -1,54 +1,31 @@
 # nixpacks.toml — Railway build configuration
-# Installs Chromium + all system dependencies required by seleniumbase/undetected-chromedriver
-# so that soccerdata's FBref scraper can launch a headless browser on Railway.
 
 [phases.setup]
-nixPkgs = [
+aptPkgs = [
   "chromium",
-  "chromedriver",
-  "nss",
-  "nspr",
-  "atk",
-  "at-spi2-atk",
-  "xorg.libX11",
-  "xorg.libXcomposite",
-  "xorg.libXdamage",
-  "xorg.libXext",
-  "xorg.libXfixes",
-  "xorg.libXrandr",
-  "xorg.libXtst",
-  "xorg.libxcb",
-  "xorg.libXcursor",
-  "xorg.libXi",
-  "libxkbcommon",
-  "mesa",
-  "expat",
-  "libdrm",
-  "dbus",
-  "cups",
-  "fontconfig",
-  "freetype",
-  "xorg.libXrender",
-  "pango",
-  "cairo",
-  "gdk-pixbuf",
-  "gtk3",
-  "glib",
-  "alsa-lib",
+  "chromium-driver",
+  "xvfb",
+  "libnss3",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libcups2",
+  "libdrm2",
+  "libxkbcommon0",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxrandr2",
+  "libgbm1",
+  "libasound2",
+  "libpango-1.0-0",
+  "libcairo2"
 ]
 
 [phases.install]
 cmds = [
   "pip install -r requirements.txt",
-  # Resolve the Nix store path for chromium and write it to /etc/environment
-  # so it survives into the runtime container as CHROME_BIN.
-  "which chromium && echo \"CHROME_BIN=$(which chromium)\" >> /etc/environment || true",
 ]
 
 [variables]
-# Nixpacks puts the Nix chromium wrapper on PATH as 'chromium'.
-# Setting CHROME_BIN here makes it available at runtime so _find_chrome_binary()
-# picks it up immediately without needing shutil.which or subprocess fallbacks.
 CHROME_BIN = "chromium"
 
 # Chromium flags required for headless operation inside a container:
