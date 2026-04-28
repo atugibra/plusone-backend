@@ -342,6 +342,17 @@ def _find_chrome_binary() -> Optional[str]:
         except Exception:
             pass
 
+    # 5: Manually search the Nix store for Railway Nixpacks deployments
+    try:
+        nix_store = pathlib.Path("/nix/store")
+        if nix_store.exists():
+            for p in nix_store.glob("*-chromium-*/bin/chromium"):
+                if p.exists() and p.is_file():
+                    logger.info("Chrome binary found via Nix store glob: %s", str(p))
+                    return str(p)
+    except Exception as e:
+        logger.warning("Error searching Nix store: %s", e)
+
     return None
 
 
