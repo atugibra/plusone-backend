@@ -315,8 +315,8 @@ class XGModel:
     def fit(self, fixtures: pd.DataFrame):
         teams = set(fixtures.home_team) | set(fixtures.away_team)
         for team in teams:
-            hm = fixtures[fixtures.home_team == team].tail(self.window)
-            am = fixtures[fixtures.away_team == team].tail(self.window)
+            hm = fixtures[fixtures.home_team == team].head(self.window)
+            am = fixtures[fixtures.away_team == team].head(self.window)
             # Use home_xg/away_xg if available, else fall back to goals
             xg_for = (list(hm.get("home_xg", hm.home_goals)) +
                       list(am.get("away_xg", am.away_goals)))
@@ -333,8 +333,8 @@ class XGModel:
         if "league_id" in fixtures.columns:
             for lid, grp in fixtures.groupby("league_id"):
                 for team in set(grp.home_team) | set(grp.away_team):
-                    hm = grp[grp.home_team == team].tail(self.window)
-                    am = grp[grp.away_team == team].tail(self.window)
+                    hm = grp[grp.home_team == team].head(self.window)
+                    am = grp[grp.away_team == team].head(self.window)
                     if len(hm) + len(am) < 2:
                         continue  # not enough data in this competition
                     xf = list(hm.get("home_xg", hm.home_goals)) +                          list(am.get("away_xg", am.away_goals))
