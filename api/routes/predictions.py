@@ -93,6 +93,13 @@ class ConsensusRequest(BaseModel):
     season_id:    int
     match_id:     Optional[int] = None   # allows prediction_log grading after match completes
 
+class WhatIfRequest(BaseModel):
+    home_team_id: int
+    away_team_id: int
+    h2h_weight: float
+    outlier_threshold: float
+    home_advantage: float
+    manual_stats: Optional[dict] = None
 
 # ─── ML Routes ────────────────────────────────────────────────────────────────
 
@@ -1091,6 +1098,150 @@ async def generate_prediction(req: GenerateRequest):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ─── What-If Scenario Engine ──────────────────────────────────────────────────
+
+@router.post("/what-if")
+def what_if_predict(req: WhatIfRequest):
+    """
+    Advanced Calculator / What-If endpoint.
+    Recalculates match probabilities by applying manual overrides, H2H weights,
+    and an outlier detection filter on historical scorelines.
+    """
+    import numpy as np
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Gather team info
+        cur.execute("SELECT name FROM teams WHERE id = %s", (req.home_team_id,))
+        h_row = cur.fetchone()
+        home_name = h_row["name"] if h_row else f"Team {req.home_team_id}"
+
+        cur.execute("SELECT name FROM teams WHERE id = %s", (req.away_team_id,))
+        a_row = cur.fetchone()
+        away_name = a_row["name"] if a_row else f"Team {req.away_team_id}"
+
+        # 2. Fetch recent matches for both teams
+        cur.execute('''
+            SELECT home_team_id, away_team_id, home_score, away_score
+            FROM matches
+            WHERE (home_team_id = %s OR away_team_id = %s OR home_team_id = %s OR away_team_id = %s)
+              AND home_score IS NOT NULL
+            ORDER BY match_date DESC LIMIT 100
+        ''', (req.home_team_id, req.home_team_id, req.away_team_id, req.away_team_id))
+        rows = cur.fetchall()
+
+        # 3. Apply Outlier Detection
+        # Calculate standard deviation of goals scored/conceded across the dataset
+        all_goals = []
+        for r in rows:
+            all_goals.extend([r["home_score"], r["away_score"]])
+        
+        mean_g = float(np.mean(all_goals)) if all_goals else 1.5
+        std_g = float(np.std(all_goals)) if all_goals else 1.0
+        cutoff = mean_g + (req.outlier_threshold * std_g)
+
+        filtered_rows = []
+        outliers_removed = 0
+        for r in rows:
+            if r["home_score"] > cutoff or r["away_score"] > cutoff:
+                outliers_removed += 1
+            else:
+                filtered_rows.append(r)
+
+        # 4. Calculate Base xG from filtered history
+        home_gf, home_ga, home_gp = 0, 0, 0
+        away_gf, away_ga, away_gp = 0, 0, 0
+        
+        for r in filtered_rows:
+            if r["home_team_id"] == req.home_team_id:
+                home_gf += r["home_score"]; home_ga += r["away_score"]; home_gp += 1
+            elif r["away_team_id"] == req.home_team_id:
+                home_gf += r["away_score"]; home_ga += r["home_score"]; home_gp += 1
+                
+            if r["home_team_id"] == req.away_team_id:
+                away_gf += r["home_score"]; away_ga += r["away_score"]; away_gp += 1
+            elif r["away_team_id"] == req.away_team_id:
+                away_gf += r["away_score"]; away_ga += r["home_score"]; away_gp += 1
+
+        # Base xG per game
+        h_xg_base = (home_gf / max(1, home_gp)) if home_gp else 1.35
+        a_xg_base = (away_gf / max(1, away_gp)) if away_gp else 1.15
+
+        # 5. Apply Manual Overrides if provided
+        if req.manual_stats:
+            m_h = req.manual_stats.get("home", {})
+            m_a = req.manual_stats.get("away", {})
+            if m_h.get("matches", 0) > 0:
+                h_xg_base = (h_xg_base + (m_h.get("scored", 0) / m_h["matches"])) / 2.0
+            if m_a.get("matches", 0) > 0:
+                a_xg_base = (a_xg_base + (m_a.get("scored", 0) / m_a["matches"])) / 2.0
+
+        # 6. Apply H2H
+        h2h_h_win, h2h_draw, h2h_a_win = 0, 0, 0
+        h2h_rows = [r for r in filtered_rows if (r["home_team_id"] == req.home_team_id and r["away_team_id"] == req.away_team_id) or (r["home_team_id"] == req.away_team_id and r["away_team_id"] == req.home_team_id)]
+        
+        for r in h2h_rows:
+            if r["home_team_id"] == req.home_team_id:
+                gf, ga = r["home_score"], r["away_score"]
+            else:
+                gf, ga = r["away_score"], r["home_score"]
+            if gf > ga: h2h_h_win += 1
+            elif gf == ga: h2h_draw += 1
+            else: h2h_a_win += 1
+            
+        h2h_tot = h2h_h_win + h2h_draw + h2h_a_win
+        h2h_h_rate = h2h_h_win / max(1, h2h_tot)
+        h2h_d_rate = h2h_draw / max(1, h2h_tot)
+        h2h_a_rate = h2h_a_win / max(1, h2h_tot)
+
+        # Apply Home Advantage
+        h_xg = h_xg_base * req.home_advantage
+        a_xg = a_xg_base / req.home_advantage
+
+        # Base Probabilities from xG Strength Ratio
+        tot_xg = h_xg + a_xg + 0.01
+        base_h = h_xg / tot_xg
+        base_a = a_xg / tot_xg
+        base_d = 1.0 - (base_h + base_a)
+        if base_d < 0: base_d = 0.25; base_h *= 0.8; base_a *= 0.8
+
+        # Blend with H2H Weight
+        hw = req.h2h_weight
+        final_h = (base_h * (1 - hw)) + (h2h_h_rate * hw)
+        final_d = (base_d * (1 - hw)) + (h2h_d_rate * hw)
+        final_a = (base_a * (1 - hw)) + (h2h_a_rate * hw)
+
+        # Normalize
+        s = final_h + final_d + final_a
+        final_h, final_d, final_a = final_h/s, final_d/s, final_a/s
+
+        idx = int(np.argmax([final_h, final_d, final_a]))
+        outcome = ["Home Win", "Draw", "Away Win"][idx]
+
+        return {
+            "home_team": home_name,
+            "away_team": away_name,
+            "outliers_removed": outliers_removed,
+            "predicted_outcome": outcome,
+            "probabilities": {
+                "home_win": float(final_h),
+                "draw": float(final_d),
+                "away_win": float(final_a)
+            },
+            "expected_goals": {
+                "home_xg": round(float(h_xg), 2),
+                "away_xg": round(float(a_xg), 2),
+                "predicted_score": f"{int(round(h_xg))}-{int(round(a_xg))}"
+            }
+        }
+    except Exception as e:
+        log.error("What-If Engine Error: %s", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         cur.close()
         conn.close()
