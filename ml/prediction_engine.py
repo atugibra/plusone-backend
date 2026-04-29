@@ -207,8 +207,7 @@ def _compute_full_markets(h_xg: float, a_xg: float, calibrated_probs: dict) -> d
     return _override_1x2(markets, calibrated_probs)
 
 
-def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str,
-                       league_avg_ga: float = 1.35) -> float:
+def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str) -> float:
     if venue == "home":
         attack_rate  = attacker_feats.get("home_gf_pg", 0.0)
         defence_rate = defender_feats.get("away_ga_pg", 0.0)
@@ -220,18 +219,15 @@ def _compute_venue_xg(attacker_feats: dict, defender_feats: dict, venue: str,
     form_gf   = attacker_feats.get("form_gf_avg",  0.0)
 
     if attack_rate < 0.1:
-        attack_rate = season_gf if season_gf > 0.1 else (form_gf if form_gf > 0.1 else league_avg_ga)
+        attack_rate = season_gf if season_gf > 0.1 else (form_gf if form_gf > 0.1 else 1.35)
     if defence_rate < 0.1:
-        defence_rate = defender_feats.get("goals_against_pg", league_avg_ga)
+        defence_rate = defender_feats.get("goals_against_pg", 1.35)
 
     if form_gf > 0.1:
         attack_rate = 0.65 * attack_rate + 0.35 * form_gf
 
-    # Use the real per-league average so that xG is correctly scaled for each
-    # competition.  Serie A (~2.5 gpg), Bundesliga (~3.1 gpg) and League Two
-    # (~2.4 gpg) all produce systematically wrong defence_factor values when
-    # normalised against the old hardcoded global constant of 1.35.
-    defence_factor = defence_rate / league_avg_ga if defence_rate > 0 else 1.0
+    LEAGUE_AVG_GA = 1.35
+    defence_factor = defence_rate / LEAGUE_AVG_GA if defence_rate > 0 else 1.0
     xg = attack_rate * defence_factor
     return round(max(0.5, min(xg, 5.0)), 2)
 
@@ -387,11 +383,8 @@ def predict_match(home_team_id: int, away_team_id: int,
         # Re-derive outcome + confidence from calibrated probs
         predicted_outcome, confidence, confidence_score = _outcome_from_probs(calibrated)
 
-        # Use real per-league average goals/game for xG normalisation.
-        # Falls back to 1.35 when the league has no standings data yet.
-        league_avg_ga = cache.league_avgs.get((league_id, season_id), {}).get("avg_ga_pg", 1.35)
-        home_xg = _compute_venue_xg(home_feats, away_feats, "home", league_avg_ga)
-        away_xg = _compute_venue_xg(away_feats, home_feats, "away", league_avg_ga)
+        home_xg = _compute_venue_xg(home_feats, away_feats, "home")
+        away_xg = _compute_venue_xg(away_feats, home_feats, "away")
         
         # Align predicted score with predicted outcome
         pred_h = round(home_xg)
@@ -587,10 +580,8 @@ def predict_upcoming_fast(league_id: int = None, limit: int = 50) -> list:
                 calibrated = _apply_calibration(proba_dict)
                 predicted_outcome, confidence, confidence_score = _outcome_from_probs(calibrated)
 
-                home_xg = _compute_venue_xg(home_feats, away_feats, "home",
-                                            cache.league_avgs.get((lid, sid), {}).get("avg_ga_pg", 1.35))
-                away_xg = _compute_venue_xg(away_feats, home_feats, "away",
-                                            cache.league_avgs.get((lid, sid), {}).get("avg_ga_pg", 1.35))
+                home_xg = _compute_venue_xg(home_feats, away_feats, "home")
+                away_xg = _compute_venue_xg(away_feats, home_feats, "away")
                 
                 # Align predicted score
                 pred_h = round(home_xg)
