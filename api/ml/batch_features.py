@@ -21,6 +21,9 @@ import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+from scipy.stats import linregress
+
 log = logging.getLogger(__name__)
 
 
@@ -454,6 +457,132 @@ def _compute_form(cache: DataCache, team_id: int, venue: Optional[str] = None,
         "win_streak":          streak,
         "results":             results,
     }
+
+
+# ─── Multi-window form stats (FootballGPT rolling aggregates) ─────────────────
+
+def _compute_form_windows(
+    cache: "DataCache",
+    team_id: int,
+    venue: Optional[str] = None,
+    before_date=None,
+    league_id: int = None,
+) -> dict:
+    """
+    Compute rolling-window form statistics at three window sizes (3 / 5 / 7).
+
+    For each window and each core metric (points, goals_scored, goals_conceded)
+    this returns five statistics borrowed from the FootballGPT feature set:
+      - mean   : average performance over the window
+      - cv     : coefficient of variation (std / mean) — consistency / volatility
+      - trend  : linear regression slope (positive = improving, negative = fading)
+      - min    : floor performance in the window
+      - max    : ceiling performance in the window
+
+    Keys are prefixed form_w{N}_{metric}_{stat}, e.g.:
+      form_w3_pts_mean, form_w7_gf_trend, form_w5_ga_cv …
+
+    All values fall back to neutral defaults (0.0) when insufficient match data
+    exists, so teams with < 3 completed fixtures still produce a full feature
+    vector and no existing prediction breaks.
+
+    This function is ADDITIVE — it never replaces _compute_form().  Both are
+    called independently inside _build_team_features().
+    """
+    # ── Neutral fallback (returned when no data is available) ─────────────
+    _NEUTRAL: dict = {}
+    for _n in (3, 5, 7):
+        for _metric in ("pts", "gf", "ga"):
+            for _stat in ("mean", "cv", "trend", "min", "max"):
+                _NEUTRAL[f"form_w{_n}_{_metric}_{_stat}"] = 0.0
+
+    # ── Pull and filter matches (mirrors _compute_form logic exactly) ─────
+    matches = cache.matches_by_team.get(team_id, [])
+    matches = _filter_before(matches, before_date)
+
+    if venue == "home":
+        matches = [m for m in matches if m["home_team_id"] == team_id]
+    elif venue == "away":
+        matches = [m for m in matches if m["away_team_id"] == team_id]
+
+    # Competition-specific form: same rule as _compute_form
+    if league_id is not None:
+        comp_matches = [m for m in matches if m.get("league_id") == league_id]
+        if len(comp_matches) >= 2:
+            matches = comp_matches
+
+    # We only ever need the most recent 7 matches
+    matches = matches[:7]
+
+    if not matches:
+        return dict(_NEUTRAL)
+
+    # ── Build per-match pts / gf / ga lists (most-recent first) ──────────
+    pts_list: list = []
+    gf_list:  list = []
+    ga_list:  list = []
+
+    for r in matches:
+        is_home = r["home_team_id"] == team_id
+        gf = _f(r["home_score"] if is_home else r["away_score"])
+        ga = _f(r["away_score"] if is_home else r["home_score"])
+        if   gf > ga:  pts = 3
+        elif gf == ga: pts = 1
+        else:          pts = 0
+        pts_list.append(pts)
+        gf_list.append(gf)
+        ga_list.append(ga)
+
+    # ── Inner helper: 5-stat summary for a numeric list ───────────────────
+    def _window_stats(values: list) -> dict:
+        """
+        Returns mean / cv / trend / min / max for a list of floats.
+        trend is the linear regression slope fitted in chronological order
+        (oldest first), so a positive slope means the metric is rising.
+        """
+        n = len(values)
+        if n == 0:
+            return {"mean": 0.0, "cv": 0.0, "trend": 0.0, "min": 0.0, "max": 0.0}
+
+        arr = np.array(values, dtype=float)
+        mean_val = float(np.mean(arr))
+        std_val  = float(np.std(arr))
+
+        # Coefficient of variation — small epsilon avoids divide-by-zero
+        # when mean ≈ 0 (e.g. team on a losing streak with 0 pts per game).
+        cv_val = std_val / (mean_val + 1e-6)
+
+        # Trend: reverse list so index 0 = oldest, then fit slope.
+        if n >= 2:
+            chron = arr[::-1]
+            slope, *_ = linregress(np.arange(n, dtype=float), chron)
+            trend_val = float(slope)
+        else:
+            trend_val = 0.0
+
+        return {
+            "mean":  round(mean_val,              4),
+            "cv":    round(cv_val,                4),
+            "trend": round(trend_val,             4),
+            "min":   round(float(np.min(arr)),    4),
+            "max":   round(float(np.max(arr)),    4),
+        }
+
+    # ── Compute stats for each window × metric combination ────────────────
+    feats: dict = {}
+    for n in (3, 5, 7):
+        slice_pts = pts_list[:n]
+        slice_gf  = gf_list[:n]
+        slice_ga  = ga_list[:n]
+
+        # Compute regardless of whether len(slice) == n: if fewer matches
+        # exist than the window size, _window_stats handles short arrays fine.
+        for metric, data in (("pts", slice_pts), ("gf", slice_gf), ("ga", slice_ga)):
+            stats = _window_stats(data)
+            for stat_name, stat_val in stats.items():
+                feats[f"form_w{n}_{metric}_{stat_name}"] = stat_val
+
+    return feats
 
 
 # ─── H2H (in-memory) ──────────────────────────────────────────────────────────
@@ -1188,6 +1317,26 @@ def _build_team_features(cache: DataCache, team_id: int,
     feats["home_form_score"]      = form_home["form_score"]
     feats["away_form_score"]      = form_away["form_score"]
 
+    # ── Multi-window rolling stats (FootballGPT additions) ────────────────
+    # Appended after the existing form block — does NOT replace any of it.
+    # Adds 45 all-venue + 45 home-venue + 45 away-venue = 135 new per-team
+    # features.  _build_match_features() auto-generates the home_* / away_* /
+    # diff_* versions for the full match vector, so nothing extra is needed
+    # there for these window stats.
+    fw_all  = _compute_form_windows(cache, team_id, None,   before_date, league_id=league_id)
+    fw_home = _compute_form_windows(cache, team_id, "home", before_date, league_id=league_id)
+    fw_away = _compute_form_windows(cache, team_id, "away", before_date, league_id=league_id)
+
+    feats.update(fw_all)
+
+    # Venue-specific window features stored under separate prefixes so that
+    # _build_match_features() can later emit home_home_form_w* / away_away_form_w*
+    # and their differentials without any extra code.
+    for k, v in fw_home.items():
+        feats[f"home_{k}"] = v
+    for k, v in fw_away.items():
+        feats[f"away_{k}"] = v
+
     # Days since last completed match — rest/fatigue signal.
     # Computed relative to before_date when building training data (avoids leakage),
     # or relative to today when predicting upcoming matches.
@@ -1306,6 +1455,18 @@ def _build_match_features(cache: DataCache, home_team_id: int, away_team_id: int
     # ── ELO differential (1 strong feature) ──────────────────────────────
     # elo_diff > 0  → home team stronger, < 0 → away team stronger
     vector["elo_diff"] = home_feats.get("elo_proxy", 0.5) - away_feats.get("elo_proxy", 0.5)
+
+    # ── Table position differential (FootballGPT addition) ────────────────
+    # rank_norm: 1.0 = 1st place, 0.0 = last place (already in both feat dicts).
+    # Positive diff → home team sits higher in the table than the away team.
+    # Absolute value captures mismatch magnitude regardless of direction
+    # (large value = big quality gap = outcome easier to predict).
+    # Uses rank_norm which is computed in section 1 of _build_team_features()
+    # from league_standings — zero extra queries, zero new data dependencies.
+    _home_rank = home_feats.get("rank_norm", 0.5)
+    _away_rank = away_feats.get("rank_norm", 0.5)
+    vector["table_position_diff"]     = round(_home_rank - _away_rank, 4)
+    vector["table_position_diff_abs"] = round(abs(_home_rank - _away_rank), 4)
 
     # ── Interaction features (6 derived, zero extra DB queries) ───────────
     # The model sees home_attack_strength and away_defence_strength as separate
